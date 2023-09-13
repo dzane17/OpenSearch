@@ -680,7 +680,11 @@ public class AbstractSearchAsyncActionTests extends OpenSearchTestCase {
         );
         AtomicReference<Exception> exception = new AtomicReference<>();
         ActionListener<SearchResponse> listener = ActionListener.wrap(response -> fail("onResponse should not be called"), exception::set);
-
+        TransportSearchAction.SearchTimeProvider timeProvider = new TransportSearchAction.SearchTimeProvider(
+            0,
+            System.nanoTime(),
+            System::nanoTime
+        );
         return new SearchDfsQueryThenFetchAsyncAction(
             logger,
             null,
@@ -694,7 +698,7 @@ public class AbstractSearchAsyncActionTests extends OpenSearchTestCase {
             searchRequest,
             listener,
             shardsIter,
-            null,
+            timeProvider,
             null,
             task,
             SearchResponse.Clusters.EMPTY,
@@ -726,6 +730,11 @@ public class AbstractSearchAsyncActionTests extends OpenSearchTestCase {
         );
         AtomicReference<Exception> exception = new AtomicReference<>();
         ActionListener<SearchResponse> listener = ActionListener.wrap(response -> fail("onResponse should not be called"), exception::set);
+        TransportSearchAction.SearchTimeProvider timeProvider = new TransportSearchAction.SearchTimeProvider(
+            0,
+            System.nanoTime(),
+            System::nanoTime
+        );
         return new SearchQueryThenFetchAsyncAction(
             logger,
             null,
@@ -739,7 +748,7 @@ public class AbstractSearchAsyncActionTests extends OpenSearchTestCase {
             searchRequest,
             listener,
             shardsIter,
-            null,
+            timeProvider,
             null,
             task,
             SearchResponse.Clusters.EMPTY,
