@@ -118,7 +118,7 @@ public final class MockSearchPhaseContext implements SearchPhaseContext {
                 numSuccess.get(),
                 0,
                 0,
-                SearchResponse.PhaseTook.NULL,
+                SearchResponse.PhaseTook.EMPTY,
                 failures.toArray(ShardSearchFailure.EMPTY_ARRAY),
                 SearchResponse.Clusters.EMPTY,
                 searchContextId

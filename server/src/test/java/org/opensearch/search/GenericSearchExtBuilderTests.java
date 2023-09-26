@@ -264,7 +264,7 @@ public class GenericSearchExtBuilderTests extends OpenSearchTestCase {
             successfulShards,
             skippedShards,
             tookInMillis,
-            SearchResponse.PhaseTook.NULL,
+            SearchResponse.PhaseTook.EMPTY,
             shardSearchFailures,
             randomBoolean() ? randomClusters() : SearchResponse.Clusters.EMPTY,
             null

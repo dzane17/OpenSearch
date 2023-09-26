@@ -452,7 +452,7 @@ public class TransportSearchActionTests extends OpenSearchTestCase {
             1,
             0,
             100,
-            SearchResponse.PhaseTook.NULL,
+            SearchResponse.PhaseTook.EMPTY,
             ShardSearchFailure.EMPTY_ARRAY,
             SearchResponse.Clusters.EMPTY,
             null

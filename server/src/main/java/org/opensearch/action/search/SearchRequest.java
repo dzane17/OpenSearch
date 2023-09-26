@@ -626,6 +626,16 @@ public class SearchRequest extends ActionRequest implements IndicesRequest.Repla
         UNSET
     }
 
+    public static Boolean parseParamValue(Object str) {
+        if ("TRUE".equals(str)) {
+            return true;
+        } else if ("FALSE".equals(str)) {
+            return false;
+        } else {
+            return null;
+        }
+    }
+
     /**
      * Returns value of user-provided phase_took query parameter for this search request.
      * Defaults to <code>false</code>.
@@ -643,7 +653,7 @@ public class SearchRequest extends ActionRequest implements IndicesRequest.Repla
     /**
      * Sets value of phase_took query param if provided by user. Defaults to <code>null</code>.
      */
-    public void setPhaseTookQueryParamEnabled(boolean phaseTookQueryParamEnabled) {
+    public void setPhaseTookQueryParamEnabled(Boolean phaseTookQueryParamEnabled) {
         this.phaseTookQueryParamEnabled = phaseTookQueryParamEnabled;
     }
 

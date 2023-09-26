@@ -322,7 +322,7 @@ public class TransportSearchAction extends HandledTransportAction<SearchRequest,
                 }
                 return new SearchResponse.PhaseTook(phaseTookMap);
             } else {
-                return SearchResponse.PhaseTook.NULL;
+                return SearchResponse.PhaseTook.EMPTY;
             }
         }
 
@@ -341,6 +341,10 @@ public class TransportSearchAction extends HandledTransportAction<SearchRequest,
 
         @Override
         public void onPhaseFailure(SearchPhaseContext context) {}
+
+        public long getPhaseTookTime(SearchPhaseName searchPhaseName) {
+            return phaseStatsMap.get(searchPhaseName);
+        }
     }
 
     @Override
@@ -463,15 +467,8 @@ public class TransportSearchAction extends HandledTransportAction<SearchRequest,
             relativeStartNanos,
             System::nanoTime
         );
-        // 2nd executeRequest(), called by 1st executeRequest()
-        final List<SearchRequestOperationsListener> searchListenersList = createSearchListenerList();
 
-        if (originalSearchRequest.isPhaseTookQueryParamEnabled() == SearchRequest.ParamValue.TRUE
-            || (originalSearchRequest.isPhaseTookQueryParamEnabled() == SearchRequest.ParamValue.UNSET
-                && clusterService.getClusterSettings().get(TransportSearchAction.SEARCH_PHASE_TOOK_ENABLED))) {
-            timeProvider.setPhaseTookEnabled(true);
-            searchListenersList.add(timeProvider);
-        }
+        final List<SearchRequestOperationsListener> searchListenersList = createSearchListenerList(originalSearchRequest, timeProvider);
 
         final SearchRequestOperationsListener searchRequestOperationsListener;
         if (!CollectionUtils.isEmpty(searchListenersList)) {
@@ -1201,11 +1198,20 @@ public class TransportSearchAction extends HandledTransportAction<SearchRequest,
         );
     }
 
-    private List<SearchRequestOperationsListener> createSearchListenerList() {
+    private List<SearchRequestOperationsListener> createSearchListenerList(SearchRequest searchRequest, SearchTimeProvider timeProvider) {
         final List<SearchRequestOperationsListener> searchListenersList = new ArrayList<>();
+
         if (isRequestStatsEnabled) {
             searchListenersList.add(searchRequestStats);
         }
+
+        if (searchRequest.isPhaseTookQueryParamEnabled() == SearchRequest.ParamValue.TRUE
+            || (searchRequest.isPhaseTookQueryParamEnabled() == SearchRequest.ParamValue.UNSET
+                && clusterService.getClusterSettings().get(TransportSearchAction.SEARCH_PHASE_TOOK_ENABLED))) {
+            timeProvider.setPhaseTookEnabled(true);
+            searchListenersList.add(timeProvider);
+        }
+
         return searchListenersList;
     }
 
