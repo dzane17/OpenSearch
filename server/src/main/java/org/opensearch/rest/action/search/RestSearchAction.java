@@ -182,8 +182,8 @@ public class RestSearchAction extends BaseRestHandler {
 
         if (request.hasParam("phase_took")) {
             // only set if we have the parameter passed to override the cluster-level default
-            // else phaseTookQueryParamEnabled = null
-            searchRequest.setPhaseTookQueryParamEnabled(request.paramAsBoolean("phase_took", true));
+            // else phaseTook = null
+            searchRequest.setPhaseTook(request.paramAsBoolean("phase_took", true));
         }
 
         // do not allow 'query_and_fetch' or 'dfs_query_and_fetch' search types

@@ -328,7 +328,6 @@ public class SearchResponseTests extends OpenSearchTestCase {
                 0,
                 0,
                 0,
-                SearchResponse.PhaseTook.EMPTY,
                 ShardSearchFailure.EMPTY_ARRAY,
                 SearchResponse.Clusters.EMPTY,
                 null

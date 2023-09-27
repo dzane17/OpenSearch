@@ -275,7 +275,7 @@ public class TransportSearchAction extends HandledTransportAction<SearchRequest,
         private final long absoluteStartMillis;
         private final long relativeStartNanos;
         private final LongSupplier relativeCurrentNanosProvider;
-        private boolean phaseTookEnabled = false;
+        private boolean phaseTook = false;
 
         /**
          * Instantiates a new search time provider. The absolute start time is the real clock time
@@ -292,9 +292,6 @@ public class TransportSearchAction extends HandledTransportAction<SearchRequest,
             this.absoluteStartMillis = absoluteStartMillis;
             this.relativeStartNanos = relativeStartNanos;
             this.relativeCurrentNanosProvider = relativeCurrentNanosProvider;
-            for (SearchPhaseName searchPhaseName : SearchPhaseName.values()) {
-                phaseStatsMap.put(searchPhaseName, 0L);
-            }
         }
 
         long getAbsoluteStartMillis() {
@@ -305,24 +302,24 @@ public class TransportSearchAction extends HandledTransportAction<SearchRequest,
             return TimeUnit.NANOSECONDS.toMillis(relativeCurrentNanosProvider.getAsLong() - relativeStartNanos);
         }
 
-        public void setPhaseTookEnabled(boolean phaseTookEnabled) {
-            this.phaseTookEnabled = phaseTookEnabled;
+        public void setPhaseTook(boolean phaseTook) {
+            this.phaseTook = phaseTook;
         }
 
-        public boolean isPhaseTookEnabled() {
-            return phaseTookEnabled;
+        public boolean isPhaseTook() {
+            return phaseTook;
         }
 
         SearchResponse.PhaseTook getPhaseTook() {
-            if (phaseTookEnabled) {
+            if (phaseTook) {
                 Map<String, Long> phaseTookMap = new HashMap<>();
                 // Convert Map<SearchPhaseName, Long> to Map<String, Long> for SearchResponse()
-                for (SearchPhaseName searchPhaseName : SearchPhaseName.values()) {
+                for (SearchPhaseName searchPhaseName : phaseStatsMap.keySet()) {
                     phaseTookMap.put(searchPhaseName.getName(), phaseStatsMap.get(searchPhaseName));
                 }
                 return new SearchResponse.PhaseTook(phaseTookMap);
             } else {
-                return SearchResponse.PhaseTook.EMPTY;
+                return null;
             }
         }
 
@@ -342,7 +339,7 @@ public class TransportSearchAction extends HandledTransportAction<SearchRequest,
         @Override
         public void onPhaseFailure(SearchPhaseContext context) {}
 
-        public long getPhaseTookTime(SearchPhaseName searchPhaseName) {
+        public Long getPhaseTookTime(SearchPhaseName searchPhaseName) {
             return phaseStatsMap.get(searchPhaseName);
         }
     }
@@ -1205,11 +1202,21 @@ public class TransportSearchAction extends HandledTransportAction<SearchRequest,
             searchListenersList.add(searchRequestStats);
         }
 
-        if (searchRequest.isPhaseTookQueryParamEnabled() == SearchRequest.ParamValue.TRUE
-            || (searchRequest.isPhaseTookQueryParamEnabled() == SearchRequest.ParamValue.UNSET
-                && clusterService.getClusterSettings().get(TransportSearchAction.SEARCH_PHASE_TOOK_ENABLED))) {
-            timeProvider.setPhaseTookEnabled(true);
-            searchListenersList.add(timeProvider);
+        // phase_took is enabled with request param and/or cluster setting
+        // check cluster setting only when request param is unspecified
+        switch (searchRequest.isPhaseTook()) {
+            case TRUE:
+                timeProvider.setPhaseTook(true);
+                searchListenersList.add(timeProvider);
+                break;
+            case FALSE:
+                break;
+            case UNSET:
+                if (clusterService.getClusterSettings().get(TransportSearchAction.SEARCH_PHASE_TOOK_ENABLED)) {
+                    timeProvider.setPhaseTook(true);
+                    searchListenersList.add(timeProvider);
+                }
+                break;
         }
 
         return searchListenersList;

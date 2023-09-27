@@ -117,7 +117,7 @@ public class SearchRequest extends ActionRequest implements IndicesRequest.Repla
 
     private String pipeline;
 
-    private Boolean phaseTookQueryParamEnabled = null;
+    private Boolean phaseTook = null;
 
     public SearchRequest() {
         this.localClusterAlias = null;
@@ -211,7 +211,7 @@ public class SearchRequest extends ActionRequest implements IndicesRequest.Repla
         this.absoluteStartMillis = absoluteStartMillis;
         this.finalReduce = finalReduce;
         this.cancelAfterTimeInterval = searchRequest.cancelAfterTimeInterval;
-        this.phaseTookQueryParamEnabled = searchRequest.phaseTookQueryParamEnabled;
+        this.phaseTook = searchRequest.phaseTook;
     }
 
     /**
@@ -256,7 +256,9 @@ public class SearchRequest extends ActionRequest implements IndicesRequest.Repla
         if (in.getVersion().onOrAfter(Version.V_2_7_0)) {
             pipeline = in.readOptionalString();
         }
-        phaseTookQueryParamEnabled = in.readOptionalBoolean();
+        if (in.getVersion().onOrAfter(Version.V_3_0_0)) {
+            phaseTook = in.readOptionalBoolean();
+        }
     }
 
     @Override
@@ -288,7 +290,9 @@ public class SearchRequest extends ActionRequest implements IndicesRequest.Repla
         if (out.getVersion().onOrAfter(Version.V_2_7_0)) {
             out.writeOptionalString(pipeline);
         }
-        out.writeOptionalBoolean(phaseTookQueryParamEnabled);
+        if (out.getVersion().onOrAfter(Version.V_3_0_0)) {
+            out.writeOptionalBoolean(phaseTook);
+        }
     }
 
     @Override
@@ -640,10 +644,10 @@ public class SearchRequest extends ActionRequest implements IndicesRequest.Repla
      * Returns value of user-provided phase_took query parameter for this search request.
      * Defaults to <code>false</code>.
      */
-    public ParamValue isPhaseTookQueryParamEnabled() {
-        if (phaseTookQueryParamEnabled == null) {
+    public ParamValue isPhaseTook() {
+        if (phaseTook == null) {
             return ParamValue.UNSET;
-        } else if (phaseTookQueryParamEnabled == true) {
+        } else if (phaseTook == true) {
             return ParamValue.TRUE;
         } else {
             return ParamValue.FALSE;
@@ -653,8 +657,8 @@ public class SearchRequest extends ActionRequest implements IndicesRequest.Repla
     /**
      * Sets value of phase_took query param if provided by user. Defaults to <code>null</code>.
      */
-    public void setPhaseTookQueryParamEnabled(Boolean phaseTookQueryParamEnabled) {
-        this.phaseTookQueryParamEnabled = phaseTookQueryParamEnabled;
+    public void setPhaseTook(Boolean phaseTook) {
+        this.phaseTook = phaseTook;
     }
 
     /**
@@ -762,7 +766,7 @@ public class SearchRequest extends ActionRequest implements IndicesRequest.Repla
             && ccsMinimizeRoundtrips == that.ccsMinimizeRoundtrips
             && Objects.equals(cancelAfterTimeInterval, that.cancelAfterTimeInterval)
             && Objects.equals(pipeline, that.pipeline)
-            && Objects.equals(phaseTookQueryParamEnabled, that.phaseTookQueryParamEnabled);
+            && Objects.equals(phaseTook, that.phaseTook);
     }
 
     @Override
@@ -784,7 +788,7 @@ public class SearchRequest extends ActionRequest implements IndicesRequest.Repla
             absoluteStartMillis,
             ccsMinimizeRoundtrips,
             cancelAfterTimeInterval,
-            phaseTookQueryParamEnabled
+            phaseTook
         );
     }
 
@@ -827,8 +831,8 @@ public class SearchRequest extends ActionRequest implements IndicesRequest.Repla
             + cancelAfterTimeInterval
             + ", pipeline="
             + pipeline
-            + ", phaseTookQueryParamEnabled="
-            + phaseTookQueryParamEnabled
+            + ", phaseTook="
+            + phaseTook
             + "}";
     }
 }

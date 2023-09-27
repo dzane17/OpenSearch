@@ -27,9 +27,9 @@ public class SearchTimeProviderTests extends OpenSearchTestCase {
         for (SearchPhaseName searchPhaseName : SearchPhaseName.values()) {
             when(mockSearchPhase.getSearchPhaseName()).thenReturn(searchPhaseName);
             testTimeProvider.onPhaseStart(ctx);
-            assertEquals(0, testTimeProvider.getPhaseTookTime(searchPhaseName));
+            assertNull(testTimeProvider.getPhaseTookTime(searchPhaseName));
             testTimeProvider.onPhaseFailure(ctx);
-            assertEquals(0, testTimeProvider.getPhaseTookTime(searchPhaseName));
+            assertNull(testTimeProvider.getPhaseTookTime(searchPhaseName));
         }
     }
 
@@ -46,7 +46,7 @@ public class SearchTimeProviderTests extends OpenSearchTestCase {
             testTimeProvider.onPhaseStart(ctx);
             long startTime = System.nanoTime() - TimeUnit.MILLISECONDS.toNanos(tookTimeInMillis);
             when(mockSearchPhase.getStartTimeInNanos()).thenReturn(startTime);
-            assertEquals(0, testTimeProvider.getPhaseTookTime(searchPhaseName));
+            assertNull(testTimeProvider.getPhaseTookTime(searchPhaseName));
             testTimeProvider.onPhaseEnd(ctx);
             assertThat(testTimeProvider.getPhaseTookTime(searchPhaseName), greaterThanOrEqualTo(tookTimeInMillis));
         }

@@ -107,7 +107,6 @@ public class SearchRequestTests extends AbstractSearchTestCase {
         Version version = VersionUtils.randomVersion(random());
         SearchRequest deserializedRequest = copyWriteable(searchRequest, namedWriteableRegistry, SearchRequest::new, version);
         assertEquals(searchRequest.isCcsMinimizeRoundtrips(), deserializedRequest.isCcsMinimizeRoundtrips());
-        assertEquals(searchRequest.isPhaseTookQueryParamEnabled(), deserializedRequest.isPhaseTookQueryParamEnabled());
         assertEquals(searchRequest.getLocalClusterAlias(), deserializedRequest.getLocalClusterAlias());
         assertEquals(searchRequest.getAbsoluteStartMillis(), deserializedRequest.getAbsoluteStartMillis());
         assertEquals(searchRequest.isFinalReduce(), deserializedRequest.isFinalReduce());
@@ -245,9 +244,7 @@ public class SearchRequestTests extends AbstractSearchTestCase {
         );
         mutators.add(() -> mutation.source(randomValueOtherThan(searchRequest.source(), this::createSearchSourceBuilder)));
         mutators.add(() -> mutation.setCcsMinimizeRoundtrips(searchRequest.isCcsMinimizeRoundtrips() == false));
-        mutators.add(
-            () -> mutation.setPhaseTookQueryParamEnabled(searchRequest.isPhaseTookQueryParamEnabled() == SearchRequest.ParamValue.FALSE)
-        );
+        mutators.add(() -> mutation.setPhaseTook(searchRequest.isPhaseTook() == SearchRequest.ParamValue.FALSE));
         mutators.add(
             () -> mutation.setCancelAfterTimeInterval(
                 searchRequest.getCancelAfterTimeInterval() != null

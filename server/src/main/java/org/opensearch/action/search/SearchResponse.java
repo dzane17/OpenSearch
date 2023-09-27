@@ -116,9 +116,9 @@ public class SearchResponse extends ActionResponse implements StatusToXContentOb
         scrollId = in.readOptionalString();
         tookInMillis = in.readVLong();
         if (in.getVersion().onOrAfter(Version.V_3_0_0)) {
-            phaseTook = new PhaseTook(in);
+            phaseTook = in.readOptionalWriteable(PhaseTook::new);
         } else {
-            phaseTook = PhaseTook.EMPTY;
+            phaseTook = null;
         }
         skippedShards = in.readVInt();
         pointInTimeId = in.readOptionalString();
@@ -134,6 +134,20 @@ public class SearchResponse extends ActionResponse implements StatusToXContentOb
         ShardSearchFailure[] shardFailures,
         Clusters clusters
     ) {
+        this(internalResponse, scrollId, totalShards, successfulShards, skippedShards, tookInMillis, null, shardFailures, clusters, null);
+    }
+
+    public SearchResponse(
+        SearchResponseSections internalResponse,
+        String scrollId,
+        int totalShards,
+        int successfulShards,
+        int skippedShards,
+        long tookInMillis,
+        ShardSearchFailure[] shardFailures,
+        Clusters clusters,
+        String pointInTimeId
+    ) {
         this(
             internalResponse,
             scrollId,
@@ -141,10 +155,10 @@ public class SearchResponse extends ActionResponse implements StatusToXContentOb
             successfulShards,
             skippedShards,
             tookInMillis,
-            SearchResponse.PhaseTook.EMPTY,
+            null,
             shardFailures,
             clusters,
-            null
+            pointInTimeId
         );
     }
 
@@ -326,7 +340,7 @@ public class SearchResponse extends ActionResponse implements StatusToXContentOb
             builder.field(POINT_IN_TIME_ID.getPreferredName(), pointInTimeId);
         }
         builder.field(TOOK.getPreferredName(), tookInMillis);
-        if (phaseTook.equals(PhaseTook.EMPTY) == false) {
+        if (phaseTook != null) {
             phaseTook.toXContent(builder, params);
         }
         builder.field(TIMED_OUT.getPreferredName(), isTimedOut());
@@ -368,7 +382,7 @@ public class SearchResponse extends ActionResponse implements StatusToXContentOb
         Boolean terminatedEarly = null;
         int numReducePhases = 1;
         long tookInMillis = -1;
-        PhaseTook phaseTook = PhaseTook.EMPTY;
+        PhaseTook phaseTook = null;
         int successfulShards = -1;
         int totalShards = -1;
         int skippedShards = 0; // 0 for BWC
@@ -543,7 +557,7 @@ public class SearchResponse extends ActionResponse implements StatusToXContentOb
         out.writeOptionalString(scrollId);
         out.writeVLong(tookInMillis);
         if (out.getVersion().onOrAfter(Version.V_3_0_0)) {
-            phaseTook.writeTo(out);
+            out.writeOptionalWriteable(phaseTook);
         }
         out.writeVInt(skippedShards);
         out.writeOptionalString(pointInTimeId);
@@ -665,22 +679,11 @@ public class SearchResponse extends ActionResponse implements StatusToXContentOb
      * @opensearch.internal
      */
     public static class PhaseTook implements ToXContentFragment, Writeable {
-        public static final PhaseTook EMPTY = new PhaseTook();
-
         static final ParseField PHASE_TOOK = new ParseField("phase_took");
-        private final Map<String, Long> phaseStatsMap;
+        private final Map<String, Long> phaseTookMap;
 
-        // Private constructor for empty object
-        private PhaseTook() {
-            Map<String, Long> defaultPhaseTookMap = new HashMap<>();
-            for (SearchPhaseName searchPhaseName : SearchPhaseName.values()) {
-                defaultPhaseTookMap.put(searchPhaseName.getName(), (long) -1);
-            }
-            this.phaseStatsMap = defaultPhaseTookMap;
-        }
-
-        public PhaseTook(Map<String, Long> phaseStatsMap) {
-            this.phaseStatsMap = phaseStatsMap;
+        public PhaseTook(Map<String, Long> phaseTookMap) {
+            this.phaseTookMap = phaseTookMap;
         }
 
         private PhaseTook(StreamInput in) throws IOException {
@@ -689,7 +692,7 @@ public class SearchResponse extends ActionResponse implements StatusToXContentOb
 
         @Override
         public void writeTo(StreamOutput out) throws IOException {
-            out.writeMap(phaseStatsMap, StreamOutput::writeString, StreamOutput::writeLong);
+            out.writeMap(phaseTookMap, StreamOutput::writeString, StreamOutput::writeLong);
         }
 
         @Override
@@ -697,7 +700,11 @@ public class SearchResponse extends ActionResponse implements StatusToXContentOb
             builder.startObject(PHASE_TOOK.getPreferredName());
 
             for (SearchPhaseName searchPhaseName : SearchPhaseName.values()) {
-                builder.field(searchPhaseName.getName(), phaseStatsMap.get(searchPhaseName.getName()));
+                if (phaseTookMap.containsKey(searchPhaseName.getName())) {
+                    builder.field(searchPhaseName.getName(), phaseTookMap.get(searchPhaseName.getName()));
+                } else {
+                    builder.field(searchPhaseName.getName(), 0);
+                }
             }
             builder.endObject();
             return builder;
@@ -713,9 +720,8 @@ public class SearchResponse extends ActionResponse implements StatusToXContentOb
             }
             PhaseTook phaseTook = (PhaseTook) o;
 
-            for (SearchPhaseName searchPhaseName : SearchPhaseName.values()) {
-                String searchPhaseNameString = searchPhaseName.getName();
-                if (!phaseStatsMap.get(searchPhaseNameString).equals(phaseTook.phaseStatsMap.get(searchPhaseNameString))) {
+            for (String searchPhaseNameString : phaseTookMap.keySet()) {
+                if (!phaseTookMap.get(searchPhaseNameString).equals(phaseTook.phaseTookMap.get(searchPhaseNameString))) {
                     return false;
                 }
             }
@@ -724,7 +730,7 @@ public class SearchResponse extends ActionResponse implements StatusToXContentOb
 
         @Override
         public int hashCode() {
-            return Objects.hash(phaseStatsMap);
+            return Objects.hash(phaseTookMap);
         }
     }
 
@@ -746,7 +752,6 @@ public class SearchResponse extends ActionResponse implements StatusToXContentOb
             0,
             0,
             tookInMillisSupplier.get(),
-            PhaseTook.EMPTY,
             ShardSearchFailure.EMPTY_ARRAY,
             clusters,
             null

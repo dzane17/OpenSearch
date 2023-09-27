@@ -133,7 +133,6 @@ public class CreatePitControllerTests extends OpenSearchTestCase {
             3,
             0,
             100,
-            SearchResponse.PhaseTook.EMPTY,
             ShardSearchFailure.EMPTY_ARRAY,
             SearchResponse.Clusters.EMPTY,
             pitId
