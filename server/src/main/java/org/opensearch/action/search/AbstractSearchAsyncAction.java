@@ -440,6 +440,10 @@ abstract class AbstractSearchAsyncAction<Result extends SearchPhaseResult> exten
         this.searchRequestOperationsListener.ifPresent(searchRequestOperations -> { searchRequestOperations.onPhaseStart(this); });
     }
 
+    private void onRequestEnd() {
+        this.searchRequestOperationsListener.ifPresent(searchRequestOperations -> { searchRequestOperations.onRequestEnd(this); });
+    }
+
     private void executePhase(SearchPhase phase) {
         try {
             onPhaseStart(phase);
@@ -697,6 +701,7 @@ abstract class AbstractSearchAsyncAction<Result extends SearchPhaseResult> exten
             listener.onResponse(buildSearchResponse(internalSearchResponse, failures, scrollId, searchContextId));
         }
         onPhaseEnd();
+        onRequestEnd();
         setCurrentPhase(null);
     }
 

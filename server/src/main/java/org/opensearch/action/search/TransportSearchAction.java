@@ -339,6 +339,7 @@ public class TransportSearchAction extends HandledTransportAction<SearchRequest,
         } else {
             searchRequestOperationsListener = null;
         }
+        searchRequestOperationsListener.onRequestStart();
         executeRequest(task, searchRequest, new SearchAsyncActionProvider() {
             @Override
             public AbstractSearchAsyncAction<? extends SearchPhaseResult> asyncSearchAction(
@@ -1136,6 +1137,7 @@ public class TransportSearchAction extends HandledTransportAction<SearchRequest,
         if (isRequestStatsEnabled) {
             searchListenersList.add(searchRequestStats);
         }
+        searchListenersList.add(new SearchRequestSlowLog(clusterService));
         return searchListenersList;
     }
 
@@ -1162,6 +1164,7 @@ public class TransportSearchAction extends HandledTransportAction<SearchRequest,
         } else {
             searchRequestOperationsListener = null;
         }
+        searchRequestOperationsListener.onRequestStart();
         if (preFilter) {
             return new CanMatchPreFilterSearchPhase(
                 logger,

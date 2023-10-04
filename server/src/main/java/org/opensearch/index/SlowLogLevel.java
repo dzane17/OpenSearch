@@ -54,7 +54,7 @@ public enum SlowLogLevel {
         return valueOf(level.toUpperCase(Locale.ROOT));
     }
 
-    boolean isLevelEnabledFor(SlowLogLevel levelToBeUsed) {
+    public boolean isLevelEnabledFor(SlowLogLevel levelToBeUsed) {
         // example: this.info(2) tries to log with levelToBeUsed.warn(3) - should allow
         return this.specificity <= levelToBeUsed.specificity;
     }
