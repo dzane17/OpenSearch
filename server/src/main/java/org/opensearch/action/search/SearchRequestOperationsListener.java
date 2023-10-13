@@ -26,6 +26,10 @@ public interface SearchRequestOperationsListener {
 
     void onPhaseFailure(SearchPhaseContext context);
 
+    default void onRequestStart(long startTimeNanos) {};
+
+    default void onRequestEnd(SearchPhaseContext context) {};
+
     /**
      * Holder of Composite Listeners
      *
@@ -70,6 +74,28 @@ public interface SearchRequestOperationsListener {
                     listener.onPhaseFailure(context);
                 } catch (Exception e) {
                     logger.warn(() -> new ParameterizedMessage("onPhaseFailure listener [{}] failed", listener), e);
+                }
+            }
+        }
+
+        @Override
+        public void onRequestStart(long startTimeNanos) {
+            for (SearchRequestOperationsListener listener : listeners) {
+                try {
+                    listener.onRequestStart(startTimeNanos);
+                } catch (Exception e) {
+                    logger.warn(() -> new ParameterizedMessage("onRequestStart listener [{}] failed", listener), e);
+                }
+            }
+        }
+
+        @Override
+        public void onRequestEnd(SearchPhaseContext context) {
+            for (SearchRequestOperationsListener listener : listeners) {
+                try {
+                    listener.onRequestEnd(context);
+                } catch (Exception e) {
+                    logger.warn(() -> new ParameterizedMessage("onRequestEnd listener [{}] failed", listener), e);
                 }
             }
         }

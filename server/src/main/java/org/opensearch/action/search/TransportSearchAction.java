@@ -475,6 +475,7 @@ public class TransportSearchAction extends HandledTransportAction<SearchRequest,
         } else {
             searchRequestOperationsListener = null;
         }
+        searchRequestOperationsListener.onRequestStart(relativeStartNanos);
 
         PipelinedRequest searchRequest;
         ActionListener<SearchResponse> listener;
@@ -1215,6 +1216,8 @@ public class TransportSearchAction extends HandledTransportAction<SearchRequest,
             timeProvider.setPhaseTook(true);
             searchListenersList.add(timeProvider);
         }
+
+        searchListenersList.add(new SearchRequestSlowLog(clusterService));
 
         return searchListenersList;
     }
