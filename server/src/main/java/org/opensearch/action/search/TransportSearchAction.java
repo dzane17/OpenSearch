@@ -60,6 +60,7 @@ import org.opensearch.common.inject.Inject;
 import org.opensearch.common.settings.Setting;
 import org.opensearch.common.settings.Setting.Property;
 import org.opensearch.common.unit.TimeValue;
+import org.opensearch.common.util.FeatureFlags;
 import org.opensearch.common.util.concurrent.AtomicArray;
 import org.opensearch.common.util.concurrent.CountDown;
 import org.opensearch.core.action.ActionListener;
@@ -88,6 +89,7 @@ import org.opensearch.search.profile.SearchProfileShardResults;
 import org.opensearch.tasks.CancellableTask;
 import org.opensearch.tasks.Task;
 import org.opensearch.telemetry.metrics.MetricsRegistry;
+import org.opensearch.telemetry.tracing.Tracer;
 import org.opensearch.threadpool.ThreadPool;
 import org.opensearch.transport.RemoteClusterAware;
 import org.opensearch.transport.RemoteClusterService;
@@ -119,6 +121,7 @@ import java.util.stream.StreamSupport;
 import static org.opensearch.action.admin.cluster.node.tasks.get.GetTaskAction.TASKS_ORIGIN;
 import static org.opensearch.action.search.SearchType.DFS_QUERY_THEN_FETCH;
 import static org.opensearch.action.search.SearchType.QUERY_THEN_FETCH;
+import static org.opensearch.common.util.FeatureFlags.TELEMETRY;
 import static org.opensearch.search.sort.FieldSortBuilder.hasPrimaryFieldSort;
 
 /**
@@ -181,6 +184,7 @@ public class TransportSearchAction extends HandledTransportAction<SearchRequest,
     private final NamedWriteableRegistry namedWriteableRegistry;
     private final CircuitBreaker circuitBreaker;
     private final SearchPipelineService searchPipelineService;
+    private final Tracer tracer;
 
     private volatile boolean isRequestStatsEnabled;
 
@@ -209,7 +213,8 @@ public class TransportSearchAction extends HandledTransportAction<SearchRequest,
         SearchPipelineService searchPipelineService,
         SearchRequestStats searchRequestStats,
         SearchRequestSlowLog searchRequestSlowLog,
-        MetricsRegistry metricsRegistry
+        MetricsRegistry metricsRegistry,
+        Tracer tracer
     ) {
         super(SearchAction.NAME, transportService, actionFilters, (Writeable.Reader<SearchRequest>) SearchRequest::new);
         this.client = client;
@@ -232,6 +237,7 @@ public class TransportSearchAction extends HandledTransportAction<SearchRequest,
         this.searchQueryMetricsEnabled = clusterService.getClusterSettings().get(SEARCH_QUERY_METRICS_ENABLED_SETTING);
         clusterService.getClusterSettings()
             .addSettingsUpdateConsumer(SEARCH_QUERY_METRICS_ENABLED_SETTING, this::setSearchQueryMetricsEnabled);
+        this.tracer = tracer;
     }
 
     private void setSearchQueryMetricsEnabled(boolean searchQueryMetricsEnabled) {
@@ -352,7 +358,7 @@ public class TransportSearchAction extends HandledTransportAction<SearchRequest,
         Map<SearchPhaseName, Long> phaseStatsMap = new EnumMap<>(SearchPhaseName.class);
 
         @Override
-        void onPhaseStart(SearchPhaseContext context) {}
+        void onPhaseStart(SearchPhaseContext context, SearchRequestContext searchRequestContext) {}
 
         @Override
         void onPhaseEnd(SearchPhaseContext context, SearchRequestContext searchRequestContext) {
@@ -363,7 +369,7 @@ public class TransportSearchAction extends HandledTransportAction<SearchRequest,
         }
 
         @Override
-        void onPhaseFailure(SearchPhaseContext context) {}
+        void onPhaseFailure(SearchPhaseContext context, SearchRequestContext searchRequestContext) {}
 
         public Long getPhaseTookTime(SearchPhaseName searchPhaseName) {
             return phaseStatsMap.get(searchPhaseName);
@@ -1268,6 +1274,10 @@ public class TransportSearchAction extends HandledTransportAction<SearchRequest,
             || searchRequestSlowLog.getDebugThreshold() >= 0
             || searchRequestSlowLog.getTraceThreshold() >= 0) {
             searchListenersList.add(searchRequestSlowLog);
+        }
+
+        if (FeatureFlags.isEnabled(TELEMETRY)) {
+            searchListenersList.add(new SearchRequestCoordinatorTrace(tracer));
         }
 
         return searchListenersList;

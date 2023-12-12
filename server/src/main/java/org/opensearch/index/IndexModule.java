@@ -87,6 +87,7 @@ import org.opensearch.plugins.IndexStorePlugin;
 import org.opensearch.repositories.RepositoriesService;
 import org.opensearch.script.ScriptService;
 import org.opensearch.search.aggregations.support.ValuesSourceRegistry;
+import org.opensearch.telemetry.tracing.Tracer;
 import org.opensearch.threadpool.ThreadPool;
 
 import java.io.IOException;
@@ -296,6 +297,7 @@ public final class IndexModule {
     private final AtomicBoolean frozen = new AtomicBoolean(false);
     private final BooleanSupplier allowExpensiveQueries;
     private final Map<String, IndexStorePlugin.RecoveryStateFactory> recoveryStateFactories;
+    private final Tracer tracer;
 
     /**
      * Construct the index module for the index with the specified index settings. The index module contains extension points for plugins
@@ -314,7 +316,8 @@ public final class IndexModule {
         final Map<String, IndexStorePlugin.DirectoryFactory> directoryFactories,
         final BooleanSupplier allowExpensiveQueries,
         final IndexNameExpressionResolver expressionResolver,
-        final Map<String, IndexStorePlugin.RecoveryStateFactory> recoveryStateFactories
+        final Map<String, IndexStorePlugin.RecoveryStateFactory> recoveryStateFactories,
+        final Tracer tracer
     ) {
         this.indexSettings = indexSettings;
         this.analysisRegistry = analysisRegistry;
@@ -326,6 +329,7 @@ public final class IndexModule {
         this.allowExpensiveQueries = allowExpensiveQueries;
         this.expressionResolver = expressionResolver;
         this.recoveryStateFactories = recoveryStateFactories;
+        this.tracer = tracer;
     }
 
     /**
@@ -664,7 +668,8 @@ public final class IndexModule {
                 translogFactorySupplier,
                 clusterDefaultRefreshIntervalSupplier,
                 clusterRemoteTranslogBufferIntervalSupplier,
-                recoverySettings
+                recoverySettings,
+                tracer
             );
             success = true;
             return indexService;

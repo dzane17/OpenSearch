@@ -152,6 +152,7 @@ import org.opensearch.repositories.blobstore.BlobStoreTestUtil;
 import org.opensearch.repositories.blobstore.OpenSearchBlobStoreRepositoryIntegTestCase;
 import org.opensearch.repositories.fs.FsRepository;
 import org.opensearch.snapshots.Snapshot;
+import org.opensearch.telemetry.tracing.noop.NoopTracer;
 import org.opensearch.test.DummyShardLock;
 import org.opensearch.test.OpenSearchTestCase;
 import org.opensearch.threadpool.TestThreadPool;
@@ -703,7 +704,8 @@ public abstract class IndexShardTestCase extends OpenSearchTestCase {
                 remoteStoreStatsTrackerFactory,
                 () -> IndexSettings.DEFAULT_REMOTE_TRANSLOG_BUFFER_INTERVAL,
                 "dummy-node",
-                DefaultRecoverySettings.INSTANCE
+                DefaultRecoverySettings.INSTANCE,
+                NoopTracer.INSTANCE
             );
             indexShard.addShardFailureCallback(DEFAULT_SHARD_FAILURE_HANDLER);
             if (remoteStoreStatsTrackerFactory != null) {

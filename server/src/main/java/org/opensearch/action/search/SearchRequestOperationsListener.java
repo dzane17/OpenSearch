@@ -22,11 +22,11 @@ import java.util.List;
 @InternalApi
 abstract class SearchRequestOperationsListener {
 
-    abstract void onPhaseStart(SearchPhaseContext context);
+    abstract void onPhaseStart(SearchPhaseContext context, SearchRequestContext searchRequestContext);
 
     abstract void onPhaseEnd(SearchPhaseContext context, SearchRequestContext searchRequestContext);
 
-    abstract void onPhaseFailure(SearchPhaseContext context);
+    abstract void onPhaseFailure(SearchPhaseContext context, SearchRequestContext searchRequestContext);
 
     void onRequestStart(SearchRequestContext searchRequestContext) {}
 
@@ -48,10 +48,10 @@ abstract class SearchRequestOperationsListener {
         }
 
         @Override
-        void onPhaseStart(SearchPhaseContext context) {
+        void onPhaseStart(SearchPhaseContext context, SearchRequestContext searchRequestContext) {
             for (SearchRequestOperationsListener listener : listeners) {
                 try {
-                    listener.onPhaseStart(context);
+                    listener.onPhaseStart(context, searchRequestContext);
                 } catch (Exception e) {
                     logger.warn(() -> new ParameterizedMessage("onPhaseStart listener [{}] failed", listener), e);
                 }
@@ -70,10 +70,10 @@ abstract class SearchRequestOperationsListener {
         }
 
         @Override
-        void onPhaseFailure(SearchPhaseContext context) {
+        void onPhaseFailure(SearchPhaseContext context, SearchRequestContext searchRequestContext) {
             for (SearchRequestOperationsListener listener : listeners) {
                 try {
-                    listener.onPhaseFailure(context);
+                    listener.onPhaseFailure(context, searchRequestContext);
                 } catch (Exception e) {
                     logger.warn(() -> new ParameterizedMessage("onPhaseFailure listener [{}] failed", listener), e);
                 }

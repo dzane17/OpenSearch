@@ -91,6 +91,7 @@ import org.opensearch.common.metrics.MeanMetric;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.common.unit.TimeValue;
 import org.opensearch.common.util.BigArrays;
+import org.opensearch.common.util.FeatureFlags;
 import org.opensearch.common.util.concurrent.AbstractRunnable;
 import org.opensearch.common.util.concurrent.AsyncIOProcessor;
 import org.opensearch.common.util.concurrent.BufferedAsyncIOProcessor;
@@ -192,6 +193,7 @@ import org.opensearch.indices.replication.common.ReplicationTimer;
 import org.opensearch.repositories.RepositoriesService;
 import org.opensearch.repositories.Repository;
 import org.opensearch.search.suggest.completion.CompletionStats;
+import org.opensearch.telemetry.tracing.Tracer;
 import org.opensearch.threadpool.ThreadPool;
 
 import java.io.Closeable;
@@ -346,6 +348,7 @@ public class IndexShard extends AbstractIndexShardComponent implements IndicesCl
     private final List<ReferenceManager.RefreshListener> internalRefreshListener = new ArrayList<>();
     private final RemoteStoreFileDownloader fileDownloader;
     private final RecoverySettings recoverySettings;
+    private final Tracer tracer;
 
     public IndexShard(
         final ShardRouting shardRouting,
@@ -374,7 +377,8 @@ public class IndexShard extends AbstractIndexShardComponent implements IndicesCl
         final RemoteStoreStatsTrackerFactory remoteStoreStatsTrackerFactory,
         final Supplier<TimeValue> clusterRemoteTranslogBufferIntervalSupplier,
         final String nodeId,
-        final RecoverySettings recoverySettings
+        final RecoverySettings recoverySettings,
+        final Tracer tracer
     ) throws IOException {
         super(shardRouting.shardId(), indexSettings);
         assert shardRouting.initializing();
@@ -407,6 +411,9 @@ public class IndexShard extends AbstractIndexShardComponent implements IndicesCl
         this.retentionLeaseSyncer = Objects.requireNonNull(retentionLeaseSyncer);
         final List<SearchOperationListener> searchListenersList = new ArrayList<>(searchOperationListener);
         searchListenersList.add(searchStats);
+        if (FeatureFlags.isEnabled(FeatureFlags.TELEMETRY)) {
+            searchListenersList.add(new SearchShardTrace(tracer));
+        }
         this.searchOperationListener = new SearchOperationListener.CompositeListener(searchListenersList, logger);
         this.getService = new ShardGetService(indexSettings, this, mapperService);
         this.shardWarmerService = new ShardIndexWarmerService(shardId, indexSettings);
@@ -472,6 +479,7 @@ public class IndexShard extends AbstractIndexShardComponent implements IndicesCl
         this.remoteStoreStatsTrackerFactory = remoteStoreStatsTrackerFactory;
         this.recoverySettings = recoverySettings;
         this.fileDownloader = new RemoteStoreFileDownloader(shardRouting.shardId(), threadPool, recoverySettings);
+        this.tracer = tracer;
     }
 
     public ThreadPool getThreadPool() {

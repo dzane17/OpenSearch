@@ -2075,7 +2075,8 @@ public class SnapshotResiliencyTests extends OpenSearchTestCase {
                     fileCacheCleaner,
                     null,
                     new RemoteStoreStatsTrackerFactory(clusterService, settings),
-                    DefaultRecoverySettings.INSTANCE
+                    DefaultRecoverySettings.INSTANCE,
+                    NoopTracer.INSTANCE
                 );
                 final RecoverySettings recoverySettings = new RecoverySettings(settings, clusterSettings);
                 snapshotShardsService = new SnapshotShardsService(
@@ -2312,7 +2313,8 @@ public class SnapshotResiliencyTests extends OpenSearchTestCase {
                         ),
                         null,
                         new SearchRequestSlowLog(clusterService),
-                        NoopMetricsRegistry.INSTANCE
+                        NoopMetricsRegistry.INSTANCE,
+                        NoopTracer.INSTANCE
                     )
                 );
                 actions.put(

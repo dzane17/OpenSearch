@@ -160,6 +160,7 @@ import org.opensearch.search.internal.SearchContext;
 import org.opensearch.search.internal.ShardSearchRequest;
 import org.opensearch.search.query.QueryPhase;
 import org.opensearch.search.query.QuerySearchResult;
+import org.opensearch.telemetry.tracing.Tracer;
 import org.opensearch.threadpool.ThreadPool;
 
 import java.io.Closeable;
@@ -352,6 +353,7 @@ public class IndicesService extends AbstractLifecycleComponent
     private final FileCacheCleaner fileCacheCleaner;
 
     private final SearchRequestStats searchRequestStats;
+    private final Tracer tracer;
 
     @Override
     protected void doStart() {
@@ -385,7 +387,8 @@ public class IndicesService extends AbstractLifecycleComponent
         FileCacheCleaner fileCacheCleaner,
         SearchRequestStats searchRequestStats,
         @Nullable RemoteStoreStatsTrackerFactory remoteStoreStatsTrackerFactory,
-        RecoverySettings recoverySettings
+        RecoverySettings recoverySettings,
+        Tracer tracer
     ) {
         this.settings = settings;
         this.threadPool = threadPool;
@@ -483,6 +486,7 @@ public class IndicesService extends AbstractLifecycleComponent
         clusterService.getClusterSettings()
             .addSettingsUpdateConsumer(CLUSTER_REMOTE_TRANSLOG_BUFFER_INTERVAL_SETTING, this::setClusterRemoteTranslogBufferInterval);
         this.recoverySettings = recoverySettings;
+        this.tracer = tracer;
     }
 
     /**
@@ -851,7 +855,8 @@ public class IndicesService extends AbstractLifecycleComponent
             directoryFactories,
             () -> allowExpensiveQueries,
             indexNameExpressionResolver,
-            recoveryStateFactories
+            recoveryStateFactories,
+            tracer
         );
         for (IndexingOperationListener operationListener : indexingOperationListeners) {
             indexModule.addIndexOperationListener(operationListener);
@@ -941,7 +946,8 @@ public class IndicesService extends AbstractLifecycleComponent
             directoryFactories,
             () -> allowExpensiveQueries,
             indexNameExpressionResolver,
-            recoveryStateFactories
+            recoveryStateFactories,
+            tracer
         );
         pluginsService.onIndexModule(indexModule);
         return indexModule.newIndexMapperService(xContentRegistry, mapperRegistry, scriptService);

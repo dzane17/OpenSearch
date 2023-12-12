@@ -11,6 +11,7 @@ package org.opensearch.action.search;
 import org.apache.logging.log4j.LogManager;
 import org.apache.lucene.search.TotalHits;
 import org.opensearch.common.annotation.InternalApi;
+import org.opensearch.telemetry.tracing.Span;
 
 import java.util.EnumMap;
 import java.util.HashMap;
@@ -24,12 +25,14 @@ import java.util.Map;
  * @opensearch.internal
  */
 @InternalApi
-class SearchRequestContext {
+public class SearchRequestContext {
     private final SearchRequestOperationsListener searchRequestOperationsListener;
     private long absoluteStartNanos;
     private final Map<String, Long> phaseTookMap;
     private TotalHits totalHits;
     private final EnumMap<ShardStatsFieldNames, Integer> shardStats;
+    private Span requestSpan;
+    private Span phaseSpan;
 
     /**
      * This constructor is for testing only
@@ -76,7 +79,7 @@ class SearchRequestContext {
         this.totalHits = totalHits;
     }
 
-    TotalHits totalHits() {
+    public TotalHits totalHits() {
         return totalHits;
     }
 
@@ -87,7 +90,7 @@ class SearchRequestContext {
         this.shardStats.put(ShardStatsFieldNames.SEARCH_REQUEST_SLOWLOG_SHARD_FAILED, failed);
     }
 
-    String formattedShardStats() {
+    public String formattedShardStats() {
         if (shardStats.isEmpty()) {
             return "";
         } else {
@@ -104,6 +107,22 @@ class SearchRequestContext {
                 shardStats.get(ShardStatsFieldNames.SEARCH_REQUEST_SLOWLOG_SHARD_FAILED)
             );
         }
+    }
+
+    public void setRequestSpan(Span requestSpan) {
+        this.requestSpan = requestSpan;
+    }
+
+    public Span getRequestSpan() {
+        return requestSpan;
+    }
+
+    public void setPhaseSpan(Span phaseSpan) {
+        this.phaseSpan = phaseSpan;
+    }
+
+    public Span getPhaseSpan() {
+        return phaseSpan;
     }
 }
 

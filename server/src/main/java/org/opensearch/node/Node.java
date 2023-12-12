@@ -46,6 +46,7 @@ import org.opensearch.action.ActionType;
 import org.opensearch.action.admin.cluster.snapshots.status.TransportNodesSnapshotsStatus;
 import org.opensearch.action.search.SearchExecutionStatsCollector;
 import org.opensearch.action.search.SearchPhaseController;
+import org.opensearch.action.search.SearchRequestCoordinatorTrace;
 import org.opensearch.action.search.SearchRequestSlowLog;
 import org.opensearch.action.search.SearchRequestStats;
 import org.opensearch.action.search.SearchTransportService;
@@ -785,6 +786,7 @@ public class Node implements Closeable {
 
             final SearchRequestStats searchRequestStats = new SearchRequestStats();
             final SearchRequestSlowLog searchRequestSlowLog = new SearchRequestSlowLog(clusterService);
+            final SearchRequestCoordinatorTrace searchRequestCoordinatorTrace = new SearchRequestCoordinatorTrace(tracer);
 
             remoteStoreStatsTrackerFactory = new RemoteStoreStatsTrackerFactory(clusterService, settings);
             final IndicesService indicesService = new IndicesService(
@@ -813,7 +815,8 @@ public class Node implements Closeable {
                 fileCacheCleaner,
                 searchRequestStats,
                 remoteStoreStatsTrackerFactory,
-                recoverySettings
+                recoverySettings,
+                tracer
             );
 
             final IngestService ingestService = new IngestService(
@@ -1271,6 +1274,7 @@ public class Node implements Closeable {
                 b.bind(Tracer.class).toInstance(tracer);
                 b.bind(SearchRequestStats.class).toInstance(searchRequestStats);
                 b.bind(SearchRequestSlowLog.class).toInstance(searchRequestSlowLog);
+                b.bind(SearchRequestCoordinatorTrace.class).toInstance(searchRequestCoordinatorTrace);
                 b.bind(MetricsRegistry.class).toInstance(metricsRegistry);
                 b.bind(RemoteClusterStateService.class).toProvider(() -> remoteClusterStateService);
                 b.bind(PersistedStateRegistry.class).toInstance(persistedStateRegistry);

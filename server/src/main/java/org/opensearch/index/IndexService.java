@@ -102,6 +102,7 @@ import org.opensearch.indices.replication.checkpoint.SegmentReplicationCheckpoin
 import org.opensearch.plugins.IndexStorePlugin;
 import org.opensearch.script.ScriptService;
 import org.opensearch.search.aggregations.support.ValuesSourceRegistry;
+import org.opensearch.telemetry.tracing.Tracer;
 import org.opensearch.threadpool.ThreadPool;
 
 import java.io.Closeable;
@@ -182,6 +183,7 @@ public class IndexService extends AbstractIndexComponent implements IndicesClust
     private final Supplier<TimeValue> clusterDefaultRefreshIntervalSupplier;
     private final Supplier<TimeValue> clusterRemoteTranslogBufferIntervalSupplier;
     private final RecoverySettings recoverySettings;
+    private final Tracer tracer;
 
     public IndexService(
         IndexSettings indexSettings,
@@ -217,7 +219,8 @@ public class IndexService extends AbstractIndexComponent implements IndicesClust
         BiFunction<IndexSettings, ShardRouting, TranslogFactory> translogFactorySupplier,
         Supplier<TimeValue> clusterDefaultRefreshIntervalSupplier,
         Supplier<TimeValue> clusterRemoteTranslogBufferIntervalSupplier,
-        RecoverySettings recoverySettings
+        RecoverySettings recoverySettings,
+        Tracer tracer
     ) {
         super(indexSettings);
         this.allowExpensiveQueries = allowExpensiveQueries;
@@ -295,6 +298,7 @@ public class IndexService extends AbstractIndexComponent implements IndicesClust
         this.translogFactorySupplier = translogFactorySupplier;
         this.clusterRemoteTranslogBufferIntervalSupplier = clusterRemoteTranslogBufferIntervalSupplier;
         this.recoverySettings = recoverySettings;
+        this.tracer = tracer;
         updateFsyncTaskIfNecessary();
     }
 
@@ -528,7 +532,8 @@ public class IndexService extends AbstractIndexComponent implements IndicesClust
                 remoteStoreStatsTrackerFactory,
                 clusterRemoteTranslogBufferIntervalSupplier,
                 nodeEnv.nodeId(),
-                recoverySettings
+                recoverySettings,
+                tracer
             );
             eventListener.indexShardStateChanged(indexShard, null, indexShard.state(), "shard created");
             eventListener.afterIndexShardCreated(indexShard);

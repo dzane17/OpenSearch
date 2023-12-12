@@ -439,9 +439,9 @@ abstract class AbstractSearchAsyncAction<Result extends SearchPhaseResult> exten
         this.searchRequestContext.getSearchRequestOperationsListener().onPhaseEnd(this, searchRequestContext);
     }
 
-    private void onPhaseStart(SearchPhase phase) {
+    private void onPhaseStart(SearchPhase phase, SearchRequestContext searchRequestContext) {
         setCurrentPhase(phase);
-        this.searchRequestContext.getSearchRequestOperationsListener().onPhaseStart(this);
+        this.searchRequestContext.getSearchRequestOperationsListener().onPhaseStart(this, searchRequestContext);
     }
 
     private void onRequestEnd(SearchRequestContext searchRequestContext) {
@@ -450,7 +450,7 @@ abstract class AbstractSearchAsyncAction<Result extends SearchPhaseResult> exten
 
     private void executePhase(SearchPhase phase) {
         try {
-            onPhaseStart(phase);
+            onPhaseStart(phase, searchRequestContext);
             phase.recordAndRun();
         } catch (Exception e) {
             if (logger.isDebugEnabled()) {
@@ -714,7 +714,7 @@ abstract class AbstractSearchAsyncAction<Result extends SearchPhaseResult> exten
 
     @Override
     public final void onPhaseFailure(SearchPhase phase, String msg, Throwable cause) {
-        this.searchRequestContext.getSearchRequestOperationsListener().onPhaseFailure(this);
+        this.searchRequestContext.getSearchRequestOperationsListener().onPhaseFailure(this, searchRequestContext);
         raisePhaseFailure(new SearchPhaseExecutionException(phase.getName(), msg, cause, buildShardFailures()));
     }
 

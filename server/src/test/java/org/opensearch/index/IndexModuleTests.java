@@ -276,7 +276,8 @@ public class IndexModuleTests extends OpenSearchTestCase {
             Collections.emptyMap(),
             () -> true,
             new IndexNameExpressionResolver(new ThreadContext(Settings.EMPTY)),
-            Collections.emptyMap()
+            Collections.emptyMap(),
+            NoopTracer.INSTANCE
         );
         module.setReaderWrapper(s -> new Wrapper());
 
@@ -302,7 +303,8 @@ public class IndexModuleTests extends OpenSearchTestCase {
             indexStoreFactories,
             () -> true,
             new IndexNameExpressionResolver(new ThreadContext(Settings.EMPTY)),
-            Collections.emptyMap()
+            Collections.emptyMap(),
+            NoopTracer.INSTANCE
         );
 
         final IndexService indexService = newIndexService(module);
@@ -630,7 +632,8 @@ public class IndexModuleTests extends OpenSearchTestCase {
             Collections.emptyMap(),
             () -> true,
             new IndexNameExpressionResolver(new ThreadContext(Settings.EMPTY)),
-            recoveryStateFactories
+            recoveryStateFactories,
+            NoopTracer.INSTANCE
         );
 
         final IndexService indexService = newIndexService(module);
@@ -662,7 +665,8 @@ public class IndexModuleTests extends OpenSearchTestCase {
             Collections.emptyMap(),
             () -> true,
             new IndexNameExpressionResolver(new ThreadContext(Settings.EMPTY)),
-            Collections.emptyMap()
+            Collections.emptyMap(),
+            NoopTracer.INSTANCE
         );
     }
 

@@ -29,7 +29,7 @@ public class SearchRequestOperationsListenerTests extends OpenSearchTestCase {
         SearchRequestOperationsListener testListener = new SearchRequestOperationsListener() {
 
             @Override
-            public void onPhaseStart(SearchPhaseContext context) {
+            public void onPhaseStart(SearchPhaseContext context, SearchRequestContext searchRequestContext) {
                 searchPhaseMap.get(context.getCurrentPhase().getSearchPhaseName()).current.inc();
             }
 
@@ -40,7 +40,7 @@ public class SearchRequestOperationsListenerTests extends OpenSearchTestCase {
             }
 
             @Override
-            public void onPhaseFailure(SearchPhaseContext context) {
+            public void onPhaseFailure(SearchPhaseContext context, SearchRequestContext searchRequestContext) {
                 searchPhaseMap.get(context.getCurrentPhase().getSearchPhaseName()).current.dec();
             }
         };
@@ -58,11 +58,12 @@ public class SearchRequestOperationsListenerTests extends OpenSearchTestCase {
 
         SearchPhaseContext ctx = mock(SearchPhaseContext.class);
         SearchPhase searchPhase = mock(SearchPhase.class);
+        SearchRequestContext searchRequestContext = mock(SearchRequestContext.class);
 
         for (SearchPhaseName searchPhaseName : SearchPhaseName.values()) {
             when(ctx.getCurrentPhase()).thenReturn(searchPhase);
             when(searchPhase.getSearchPhaseName()).thenReturn(searchPhaseName);
-            compositeListener.onPhaseStart(ctx);
+            compositeListener.onPhaseStart(ctx, searchRequestContext);
             assertEquals(totalListeners, searchPhaseMap.get(searchPhaseName).current.count());
         }
     }

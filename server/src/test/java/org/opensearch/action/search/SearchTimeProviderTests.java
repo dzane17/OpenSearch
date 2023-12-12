@@ -22,13 +22,14 @@ public class SearchTimeProviderTests extends OpenSearchTestCase {
         TransportSearchAction.SearchTimeProvider testTimeProvider = new TransportSearchAction.SearchTimeProvider(0, 0, () -> 0);
         SearchPhaseContext ctx = mock(SearchPhaseContext.class);
         SearchPhase mockSearchPhase = mock(SearchPhase.class);
+        SearchRequestContext mockSearchRequestContext = mock(SearchRequestContext.class);
         when(ctx.getCurrentPhase()).thenReturn(mockSearchPhase);
 
         for (SearchPhaseName searchPhaseName : SearchPhaseName.values()) {
             when(mockSearchPhase.getSearchPhaseName()).thenReturn(searchPhaseName);
-            testTimeProvider.onPhaseStart(ctx);
+            testTimeProvider.onPhaseStart(ctx, mockSearchRequestContext);
             assertNull(testTimeProvider.getPhaseTookTime(searchPhaseName));
-            testTimeProvider.onPhaseFailure(ctx);
+            testTimeProvider.onPhaseFailure(ctx, mockSearchRequestContext);
             assertNull(testTimeProvider.getPhaseTookTime(searchPhaseName));
         }
     }
@@ -38,12 +39,13 @@ public class SearchTimeProviderTests extends OpenSearchTestCase {
 
         SearchPhaseContext ctx = mock(SearchPhaseContext.class);
         SearchPhase mockSearchPhase = mock(SearchPhase.class);
+        SearchRequestContext mockSearchRequestContext = mock(SearchRequestContext.class);
         when(ctx.getCurrentPhase()).thenReturn(mockSearchPhase);
 
         for (SearchPhaseName searchPhaseName : SearchPhaseName.values()) {
             when(mockSearchPhase.getSearchPhaseName()).thenReturn(searchPhaseName);
             long tookTimeInMillis = randomIntBetween(1, 100);
-            testTimeProvider.onPhaseStart(ctx);
+            testTimeProvider.onPhaseStart(ctx, mockSearchRequestContext);
             long startTime = System.nanoTime() - TimeUnit.MILLISECONDS.toNanos(tookTimeInMillis);
             when(mockSearchPhase.getStartTimeInNanos()).thenReturn(startTime);
             assertNull(testTimeProvider.getPhaseTookTime(searchPhaseName));

@@ -25,13 +25,14 @@ public class SearchRequestStatsTests extends OpenSearchTestCase {
         SearchRequestStats testRequestStats = new SearchRequestStats();
         SearchPhaseContext ctx = mock(SearchPhaseContext.class);
         SearchPhase mockSearchPhase = mock(SearchPhase.class);
+        SearchRequestContext mockSearchRequestContext = mock(SearchRequestContext.class);
         when(ctx.getCurrentPhase()).thenReturn(mockSearchPhase);
 
         for (SearchPhaseName searchPhaseName : SearchPhaseName.values()) {
             when(mockSearchPhase.getSearchPhaseName()).thenReturn(searchPhaseName);
-            testRequestStats.onPhaseStart(ctx);
+            testRequestStats.onPhaseStart(ctx, mockSearchRequestContext);
             assertEquals(1, testRequestStats.getPhaseCurrent(searchPhaseName));
-            testRequestStats.onPhaseFailure(ctx);
+            testRequestStats.onPhaseFailure(ctx, mockSearchRequestContext);
             assertEquals(0, testRequestStats.getPhaseCurrent(searchPhaseName));
         }
     }
@@ -41,16 +42,17 @@ public class SearchRequestStatsTests extends OpenSearchTestCase {
 
         SearchPhaseContext ctx = mock(SearchPhaseContext.class);
         SearchPhase mockSearchPhase = mock(SearchPhase.class);
+        SearchRequestContext mockSearchRequestContext = mock(SearchRequestContext.class);
         when(ctx.getCurrentPhase()).thenReturn(mockSearchPhase);
 
         for (SearchPhaseName searchPhaseName : SearchPhaseName.values()) {
             when(mockSearchPhase.getSearchPhaseName()).thenReturn(searchPhaseName);
             long tookTimeInMillis = randomIntBetween(1, 10);
-            testRequestStats.onPhaseStart(ctx);
+            testRequestStats.onPhaseStart(ctx, mockSearchRequestContext);
             long startTime = System.nanoTime() - TimeUnit.MILLISECONDS.toNanos(tookTimeInMillis);
             when(mockSearchPhase.getStartTimeInNanos()).thenReturn(startTime);
             assertEquals(1, testRequestStats.getPhaseCurrent(searchPhaseName));
-            testRequestStats.onPhaseEnd(ctx, new SearchRequestContext());
+            testRequestStats.onPhaseEnd(ctx, mockSearchRequestContext);
             assertEquals(0, testRequestStats.getPhaseCurrent(searchPhaseName));
             assertEquals(1, testRequestStats.getPhaseTotal(searchPhaseName));
             assertThat(testRequestStats.getPhaseMetric(searchPhaseName), greaterThanOrEqualTo(tookTimeInMillis));
@@ -59,6 +61,7 @@ public class SearchRequestStatsTests extends OpenSearchTestCase {
 
     public void testSearchRequestStatsOnPhaseStartConcurrently() throws InterruptedException {
         SearchRequestStats testRequestStats = new SearchRequestStats();
+        SearchRequestContext mockSearchRequestContext = mock(SearchRequestContext.class);
         int numTasks = randomIntBetween(5, 50);
         Thread[] threads = new Thread[numTasks * SearchPhaseName.values().length];
         Phaser phaser = new Phaser(numTasks * SearchPhaseName.values().length + 1);
@@ -71,7 +74,7 @@ public class SearchRequestStatsTests extends OpenSearchTestCase {
             for (int i = 0; i < numTasks; i++) {
                 threads[i] = new Thread(() -> {
                     phaser.arriveAndAwaitAdvance();
-                    testRequestStats.onPhaseStart(ctx);
+                    testRequestStats.onPhaseStart(ctx, mockSearchRequestContext);
                     countDownLatch.countDown();
                 });
                 threads[i].start();
@@ -86,6 +89,7 @@ public class SearchRequestStatsTests extends OpenSearchTestCase {
 
     public void testSearchRequestStatsOnPhaseEndConcurrently() throws InterruptedException {
         SearchRequestStats testRequestStats = new SearchRequestStats();
+        SearchRequestContext mockSearchRequestContext = mock(SearchRequestContext.class);
         int numTasks = randomIntBetween(5, 50);
         Thread[] threads = new Thread[numTasks * SearchPhaseName.values().length];
         Phaser phaser = new Phaser(numTasks * SearchPhaseName.values().length + 1);
@@ -102,7 +106,7 @@ public class SearchRequestStatsTests extends OpenSearchTestCase {
             for (int i = 0; i < numTasks; i++) {
                 threads[i] = new Thread(() -> {
                     phaser.arriveAndAwaitAdvance();
-                    testRequestStats.onPhaseEnd(ctx, new SearchRequestContext());
+                    testRequestStats.onPhaseEnd(ctx, mockSearchRequestContext);
                     countDownLatch.countDown();
                 });
                 threads[i].start();
@@ -122,6 +126,7 @@ public class SearchRequestStatsTests extends OpenSearchTestCase {
 
     public void testSearchRequestStatsOnPhaseFailureConcurrently() throws InterruptedException {
         SearchRequestStats testRequestStats = new SearchRequestStats();
+        SearchRequestContext mockSearchRequestContext = mock(SearchRequestContext.class);
         int numTasks = randomIntBetween(5, 50);
         Thread[] threads = new Thread[numTasks * SearchPhaseName.values().length];
         Phaser phaser = new Phaser(numTasks * SearchPhaseName.values().length + 1);
@@ -134,8 +139,8 @@ public class SearchRequestStatsTests extends OpenSearchTestCase {
             for (int i = 0; i < numTasks; i++) {
                 threads[i] = new Thread(() -> {
                     phaser.arriveAndAwaitAdvance();
-                    testRequestStats.onPhaseStart(ctx);
-                    testRequestStats.onPhaseFailure(ctx);
+                    testRequestStats.onPhaseStart(ctx, mockSearchRequestContext);
+                    testRequestStats.onPhaseFailure(ctx, mockSearchRequestContext);
                     countDownLatch.countDown();
                 });
                 threads[i].start();
