@@ -8,11 +8,14 @@
 
 package org.opensearch.action.search;
 
+import org.apache.logging.log4j.LogManager;
 import org.apache.lucene.search.TotalHits;
 import org.opensearch.common.annotation.InternalApi;
+import org.opensearch.telemetry.tracing.Span;
 
 import java.util.EnumMap;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 
@@ -23,20 +26,48 @@ import java.util.Map;
  */
 @InternalApi
 class SearchRequestContext {
+    private final SearchRequest searchRequest;
+    private SearchTask searchTask;
     private final SearchRequestOperationsListener searchRequestOperationsListener;
     private long absoluteStartNanos;
     private final Map<String, Long> phaseTookMap;
     private TotalHits totalHits;
     private final EnumMap<ShardStatsFieldNames, Integer> shardStats;
+    private Span requestSpan;
+    private Span phaseSpan;
 
-    private final SearchRequest searchRequest;
+    /**
+     * This constructor is for testing only
+     */
+    SearchRequestContext() {
+        this(new SearchRequest());
+    }
 
-    SearchRequestContext(final SearchRequestOperationsListener searchRequestOperationsListener, final SearchRequest searchRequest) {
+    /**
+     * This constructor is for testing only
+     */
+    SearchRequestContext(SearchRequest searchRequest) {
+        this(new SearchRequestOperationsListener.CompositeListener(List.of(), LogManager.getLogger()), searchRequest);
+    }
+
+    SearchRequestContext(SearchRequestOperationsListener searchRequestOperationsListener, SearchRequest searchRequest) {
         this.searchRequestOperationsListener = searchRequestOperationsListener;
         this.absoluteStartNanos = System.nanoTime();
         this.phaseTookMap = new HashMap<>();
         this.shardStats = new EnumMap<>(ShardStatsFieldNames.class);
         this.searchRequest = searchRequest;
+    }
+
+    public SearchRequest getSearchRequest() {
+        return searchRequest;
+    }
+
+    public void setSearchTask(SearchTask searchTask) {
+        this.searchTask = searchTask;
+    }
+
+    public SearchTask getSearchTask() {
+        return searchTask;
     }
 
     SearchRequestOperationsListener getSearchRequestOperationsListener() {
@@ -78,7 +109,7 @@ class SearchRequestContext {
         this.totalHits = totalHits;
     }
 
-    TotalHits totalHits() {
+    public TotalHits totalHits() {
         return totalHits;
     }
 
@@ -89,7 +120,7 @@ class SearchRequestContext {
         this.shardStats.put(ShardStatsFieldNames.SEARCH_REQUEST_SLOWLOG_SHARD_FAILED, failed);
     }
 
-    String formattedShardStats() {
+    public String formattedShardStats() {
         if (shardStats.isEmpty()) {
             return "";
         } else {
@@ -106,6 +137,22 @@ class SearchRequestContext {
                 shardStats.get(ShardStatsFieldNames.SEARCH_REQUEST_SLOWLOG_SHARD_FAILED)
             );
         }
+    }
+
+    public void setRequestSpan(Span requestSpan) {
+        this.requestSpan = requestSpan;
+    }
+
+    public Span getRequestSpan() {
+        return requestSpan;
+    }
+
+    public void setPhaseSpan(Span phaseSpan) {
+        this.phaseSpan = phaseSpan;
+    }
+
+    public Span getPhaseSpan() {
+        return phaseSpan;
     }
 }
 

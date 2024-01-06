@@ -220,6 +220,7 @@ abstract class AbstractSearchAsyncAction<Result extends SearchPhaseResult> exten
                     null
                 )
             );
+            searchRequestContext.getSearchRequestOperationsListener().onRequestEnd(searchRequestContext);
             return;
         }
         executePhase(this);
@@ -439,18 +440,18 @@ abstract class AbstractSearchAsyncAction<Result extends SearchPhaseResult> exten
         this.searchRequestContext.getSearchRequestOperationsListener().onPhaseEnd(this, searchRequestContext);
     }
 
-    private void onPhaseStart(SearchPhase phase) {
+    private void onPhaseStart(SearchPhase phase, SearchRequestContext searchRequestContext) {
         setCurrentPhase(phase);
-        this.searchRequestContext.getSearchRequestOperationsListener().onPhaseStart(this);
+        this.searchRequestContext.getSearchRequestOperationsListener().onPhaseStart(this, searchRequestContext);
     }
 
     private void onRequestEnd(SearchRequestContext searchRequestContext) {
-        this.searchRequestContext.getSearchRequestOperationsListener().onRequestEnd(this, searchRequestContext);
+        this.searchRequestContext.getSearchRequestOperationsListener().onRequestEnd(searchRequestContext);
     }
 
     private void executePhase(SearchPhase phase) {
         try {
-            onPhaseStart(phase);
+            onPhaseStart(phase, searchRequestContext);
             phase.recordAndRun();
         } catch (Exception e) {
             if (logger.isDebugEnabled()) {
@@ -703,6 +704,7 @@ abstract class AbstractSearchAsyncAction<Result extends SearchPhaseResult> exten
                     searchContextId = null;
                 }
             }
+            searchRequestContext.setSearchTask(getTask());
             searchRequestContext.setTotalHits(internalSearchResponse.hits().getTotalHits());
             searchRequestContext.setShardStats(results.getNumShards(), successfulOps.get(), skippedOps.get(), failures.length);
             onPhaseEnd(searchRequestContext);
@@ -714,7 +716,7 @@ abstract class AbstractSearchAsyncAction<Result extends SearchPhaseResult> exten
 
     @Override
     public final void onPhaseFailure(SearchPhase phase, String msg, Throwable cause) {
-        this.searchRequestContext.getSearchRequestOperationsListener().onPhaseFailure(this);
+        this.searchRequestContext.getSearchRequestOperationsListener().onPhaseFailure(this, searchRequestContext);
         raisePhaseFailure(new SearchPhaseExecutionException(phase.getName(), msg, cause, buildShardFailures()));
     }
 
