@@ -1170,7 +1170,8 @@ public class Node implements Closeable {
                 searchModule.getFetchPhase(),
                 responseCollectorService,
                 circuitBreakerService,
-                searchModule.getIndexSearcherExecutor(threadPool)
+                searchModule.getIndexSearcherExecutor(threadPool),
+                tracer
             );
 
             final List<PersistentTasksExecutor<?>> tasksExecutors = pluginsService.filterPlugins(PersistentTaskPlugin.class)
@@ -1805,7 +1806,8 @@ public class Node implements Closeable {
         FetchPhase fetchPhase,
         ResponseCollectorService responseCollectorService,
         CircuitBreakerService circuitBreakerService,
-        Executor indexSearcherExecutor
+        Executor indexSearcherExecutor,
+        Tracer tracer
     ) {
         return new SearchService(
             clusterService,
@@ -1817,7 +1819,8 @@ public class Node implements Closeable {
             fetchPhase,
             responseCollectorService,
             circuitBreakerService,
-            indexSearcherExecutor
+            indexSearcherExecutor,
+            tracer
         );
     }
 
