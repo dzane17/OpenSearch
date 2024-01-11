@@ -12,6 +12,8 @@ import org.apache.logging.log4j.LogManager;
 import org.apache.lucene.search.TotalHits;
 import org.opensearch.common.annotation.InternalApi;
 import org.opensearch.telemetry.tracing.Span;
+import org.opensearch.telemetry.tracing.Tracer;
+import org.opensearch.telemetry.tracing.noop.NoopTracer;
 
 import java.util.EnumMap;
 import java.util.HashMap;
@@ -33,6 +35,7 @@ class SearchRequestContext {
     private final Map<String, Long> phaseTookMap;
     private TotalHits totalHits;
     private final EnumMap<ShardStatsFieldNames, Integer> shardStats;
+    private Tracer tracer;
     private Span requestSpan;
     private Span phaseSpan;
 
@@ -50,12 +53,20 @@ class SearchRequestContext {
         this(new SearchRequestOperationsListener.CompositeListener(List.of(), LogManager.getLogger()), searchRequest);
     }
 
+    /**
+     * This constructor is for testing only
+     */
     SearchRequestContext(SearchRequestOperationsListener searchRequestOperationsListener, SearchRequest searchRequest) {
+        this(searchRequestOperationsListener, searchRequest, NoopTracer.INSTANCE);
+    }
+
+    SearchRequestContext(SearchRequestOperationsListener searchRequestOperationsListener, SearchRequest searchRequest, Tracer tracer) {
         this.searchRequestOperationsListener = searchRequestOperationsListener;
+        this.searchRequest = searchRequest;
+        this.tracer = tracer;
         this.absoluteStartNanos = System.nanoTime();
         this.phaseTookMap = new HashMap<>();
         this.shardStats = new EnumMap<>(ShardStatsFieldNames.class);
-        this.searchRequest = searchRequest;
     }
 
     public SearchRequest getSearchRequest() {
@@ -137,6 +148,10 @@ class SearchRequestContext {
                 shardStats.get(ShardStatsFieldNames.SEARCH_REQUEST_SLOWLOG_SHARD_FAILED)
             );
         }
+    }
+
+    public Tracer getTracer() {
+        return tracer;
     }
 
     public void setRequestSpan(Span requestSpan) {

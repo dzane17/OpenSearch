@@ -60,7 +60,6 @@ import org.opensearch.common.inject.Inject;
 import org.opensearch.common.settings.Setting;
 import org.opensearch.common.settings.Setting.Property;
 import org.opensearch.common.unit.TimeValue;
-import org.opensearch.common.util.FeatureFlags;
 import org.opensearch.common.util.concurrent.AtomicArray;
 import org.opensearch.common.util.concurrent.CountDown;
 import org.opensearch.core.action.ActionListener;
@@ -91,6 +90,7 @@ import org.opensearch.tasks.Task;
 import org.opensearch.telemetry.metrics.MetricsRegistry;
 import org.opensearch.telemetry.tracing.Span;
 import org.opensearch.telemetry.tracing.SpanBuilder;
+import org.opensearch.telemetry.tracing.SpanScope;
 import org.opensearch.telemetry.tracing.Tracer;
 import org.opensearch.telemetry.tracing.listener.TraceableActionListener;
 import org.opensearch.threadpool.ThreadPool;
@@ -123,7 +123,6 @@ import java.util.stream.StreamSupport;
 import static org.opensearch.action.admin.cluster.node.tasks.get.GetTaskAction.TASKS_ORIGIN;
 import static org.opensearch.action.search.SearchType.DFS_QUERY_THEN_FETCH;
 import static org.opensearch.action.search.SearchType.QUERY_THEN_FETCH;
-import static org.opensearch.common.util.FeatureFlags.TELEMETRY;
 import static org.opensearch.search.sort.FieldSortBuilder.hasPrimaryFieldSort;
 
 /**
@@ -442,18 +441,15 @@ public class TransportSearchAction extends HandledTransportAction<SearchRequest,
         }
         SearchRequestOperationsListener.CompositeListener requestOperationsListeners = searchRequestOperationsCompositeListenerFactory
             .buildCompositeListener(originalSearchRequest, logger);
-        SearchRequestContext searchRequestContext = new SearchRequestContext(requestOperationsListeners, originalSearchRequest);
+        SearchRequestContext searchRequestContext = new SearchRequestContext(requestOperationsListeners, originalSearchRequest, tracer);
         searchRequestContext.getSearchRequestOperationsListener().onRequestStart(searchRequestContext);
 
         PipelinedRequest searchRequest;
         ActionListener<SearchResponse> listener;
-        Span requestSpan;
 
-        if (FeatureFlags.isEnabled(TELEMETRY)) {
-            requestSpan = tracer.startSpan(SpanBuilder.from("coordinatorRequest"));
-            originalListener = TraceableActionListener.create(originalListener, requestSpan, tracer);
-            searchRequestContext.setRequestSpan(requestSpan);
-        }
+        Span requestSpan = tracer.startSpan(SpanBuilder.from("coordReq"));
+        originalListener = TraceableActionListener.create(originalListener, requestSpan, tracer);
+        searchRequestContext.setRequestSpan(requestSpan);
 
         try {
             searchRequest = searchPipelineService.resolvePipeline(originalSearchRequest);
@@ -490,7 +486,9 @@ public class TransportSearchAction extends HandledTransportAction<SearchRequest,
                 );
             }
         }, listener::onFailure);
-        searchRequest.transformRequest(requestTransformListener);
+        try (SpanScope spanScope = tracer.withSpanInScope(requestSpan)) {
+            searchRequest.transformRequest(requestTransformListener);
+        }
     }
 
     private ActionListener<SearchSourceBuilder> buildRewriteListener(

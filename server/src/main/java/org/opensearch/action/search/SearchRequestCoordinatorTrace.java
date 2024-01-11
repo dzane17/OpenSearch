@@ -12,7 +12,6 @@ import org.opensearch.telemetry.tracing.AttributeNames;
 import org.opensearch.telemetry.tracing.Span;
 import org.opensearch.telemetry.tracing.SpanBuilder;
 import org.opensearch.telemetry.tracing.SpanContext;
-import org.opensearch.telemetry.tracing.SpanScope;
 import org.opensearch.telemetry.tracing.Tracer;
 
 import static org.opensearch.core.common.Strings.capitalize;
@@ -37,24 +36,21 @@ public final class SearchRequestCoordinatorTrace extends SearchRequestOperations
         searchRequestContext.setPhaseSpan(
             tracer.startSpan(
                 SpanBuilder.from(
-                    "coordinator" + capitalize(context.getCurrentPhase().getName()),
+                    "coord" + capitalize(context.getCurrentPhase().getName()),
                     new SpanContext(searchRequestContext.getRequestSpan())
                 )
             )
         );
-        SpanScope spanScope = tracer.withSpanInScope(searchRequestContext.getPhaseSpan());
     }
 
     @Override
     void onPhaseEnd(SearchPhaseContext context, SearchRequestContext searchRequestContext) {
         searchRequestContext.getPhaseSpan().endSpan();
-        searchRequestContext.setPhaseSpan(null);
     }
 
     @Override
     void onPhaseFailure(SearchPhaseContext context, SearchRequestContext searchRequestContext) {
         searchRequestContext.getPhaseSpan().endSpan();
-        searchRequestContext.setPhaseSpan(null);
     }
 
     @Override
