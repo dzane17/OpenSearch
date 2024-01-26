@@ -30,9 +30,6 @@ public final class SearchRequestCoordinatorTrace extends SearchRequestOperations
 
     @Override
     void onPhaseStart(SearchPhaseContext context, SearchRequestContext searchRequestContext) {
-        if (searchRequestContext.getPhaseSpan() != null) {
-            searchRequestContext.getPhaseSpan().endSpan();
-        }
         searchRequestContext.setPhaseSpan(
             tracer.startSpan(
                 SpanBuilder.from(

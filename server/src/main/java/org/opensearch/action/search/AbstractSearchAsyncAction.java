@@ -443,7 +443,10 @@ abstract class AbstractSearchAsyncAction<Result extends SearchPhaseResult> exten
 
     private void onPhaseStart(SearchPhase phase, SearchRequestContext searchRequestContext) {
         setCurrentPhase(phase);
-        this.searchRequestContext.getSearchRequestOperationsListener().onPhaseStart(this, searchRequestContext);
+        try {
+            SearchPhaseName.valueOf(phase.getSearchPhaseName().toString());
+            this.searchRequestContext.getSearchRequestOperationsListener().onPhaseStart(this, searchRequestContext);
+        } catch (IllegalArgumentException ignored) {}
     }
 
     private void onRequestEnd(SearchRequestContext searchRequestContext) {

@@ -13,6 +13,7 @@ import org.apache.lucene.search.TotalHits;
 import org.opensearch.common.annotation.InternalApi;
 import org.opensearch.telemetry.tracing.Span;
 import org.opensearch.telemetry.tracing.Tracer;
+import org.opensearch.telemetry.tracing.noop.NoopSpan;
 import org.opensearch.telemetry.tracing.noop.NoopTracer;
 
 import java.util.EnumMap;
@@ -67,6 +68,9 @@ class SearchRequestContext {
         this.absoluteStartNanos = System.nanoTime();
         this.phaseTookMap = new HashMap<>();
         this.shardStats = new EnumMap<>(ShardStatsFieldNames.class);
+        this.tracer = tracer;
+        this.requestSpan = NoopSpan.INSTANCE;
+        this.phaseSpan = NoopSpan.INSTANCE;
     }
 
     public SearchRequest getSearchRequest() {
