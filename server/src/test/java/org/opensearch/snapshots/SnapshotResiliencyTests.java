@@ -2279,7 +2279,8 @@ public class SnapshotResiliencyTests extends OpenSearchTestCase {
                     new FetchPhase(Collections.emptyList()),
                     responseCollectorService,
                     new NoneCircuitBreakerService(),
-                    null
+                    null,
+                    NoopTracer.INSTANCE
                 );
                 SearchPhaseController searchPhaseController = new SearchPhaseController(
                     writableRegistry(),
@@ -2313,7 +2314,8 @@ public class SnapshotResiliencyTests extends OpenSearchTestCase {
                             client
                         ),
                         NoopMetricsRegistry.INSTANCE,
-                        searchRequestOperationsCompositeListenerFactory
+                        searchRequestOperationsCompositeListenerFactory,
+                        NoopTracer.INSTANCE
                     )
                 );
                 actions.put(
