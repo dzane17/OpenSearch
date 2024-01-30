@@ -14,6 +14,7 @@ import org.opensearch.common.annotation.InternalApi;
 import org.opensearch.core.common.Strings;
 import org.opensearch.http.HttpRequest;
 import org.opensearch.rest.RestRequest;
+import org.opensearch.search.internal.SearchContext;
 import org.opensearch.telemetry.tracing.attributes.Attributes;
 import org.opensearch.transport.TcpChannel;
 import org.opensearch.transport.Transport;
@@ -43,6 +44,15 @@ public final class SpanBuilder {
     }
 
     /**
+     * Creates {@link SpanCreationContext} from String
+     * @param spanName String.
+     * @return context.
+     */
+    public static SpanCreationContext from(String spanName) {
+        return SpanCreationContext.server().name(spanName);
+    }
+
+    /**
      * Creates {@link SpanCreationContext} from the {@link HttpRequest}
      * @param request Http request.
      * @return context.
@@ -67,7 +77,8 @@ public final class SpanBuilder {
      * @return context
      */
     public static SpanCreationContext from(String action, Transport.Connection connection) {
-        return SpanCreationContext.server().name(createSpanName(action, connection)).attributes(buildSpanAttributes(action, connection));
+        return SpanCreationContext.server().name(createSpanName(action, connection)).attributes(buildSpanAttributes(action, connection)); // this
+                                                                                                                                          // one
     }
 
     public static SpanCreationContext from(String spanName, String nodeId, ReplicatedWriteRequest request) {
@@ -167,6 +178,33 @@ public final class SpanBuilder {
         if (request instanceof BulkShardRequest) {
             attributes.addAttribute(AttributeNames.BULK_REQUEST_ITEMS, ((BulkShardRequest) request).items().length);
         }
+        return attributes;
+    }
+
+    /**
+     * Creates {@link SpanCreationContext} with parent set to specified SpanContext.
+     * @param spanName name of span.
+     * @param parentSpan target parent span.
+     * @return context
+     */
+    public static SpanCreationContext from(String spanName, SpanContext parentSpan) {
+        return SpanCreationContext.server().name(spanName).parent(parentSpan);
+    }
+
+    /**
+     * Creates {@link SpanCreationContext} from SearchRequest.
+     * @param spanName name of span.
+     * @param searchContext SearchRequest object.
+     * @return context
+     */
+    public static SpanCreationContext from(String spanName, SearchContext searchContext) {
+        return SpanCreationContext.server().name(spanName).attributes(buildSpanAttributes(searchContext));
+    }
+
+    private static Attributes buildSpanAttributes(SearchContext searchContext) {
+        Attributes attributes = Attributes.create()
+            .addAttribute(AttributeNames.SHARD_ID, searchContext.request().shardId().getId())
+            .addAttribute(AttributeNames.INDEX, searchContext.request().shardId().getIndexName());
         return attributes;
     }
 

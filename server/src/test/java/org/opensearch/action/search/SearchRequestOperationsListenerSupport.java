@@ -17,7 +17,7 @@ import java.util.List;
  */
 public interface SearchRequestOperationsListenerSupport {
     default void onPhaseStart(SearchRequestOperationsListener listener, SearchPhaseContext context) {
-        listener.onPhaseStart(context);
+        listener.onPhaseStart(context, new SearchRequestContext());
     }
 
     default void onPhaseEnd(SearchRequestOperationsListener listener, SearchPhaseContext context) {

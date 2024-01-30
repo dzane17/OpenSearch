@@ -34,9 +34,9 @@ public class SearchRequestStatsTests extends OpenSearchTestCase {
 
         for (SearchPhaseName searchPhaseName : SearchPhaseName.values()) {
             when(mockSearchPhase.getSearchPhaseName()).thenReturn(searchPhaseName);
-            testRequestStats.onPhaseStart(ctx);
+            testRequestStats.onPhaseStart(ctx, new SearchRequestContext());
             assertEquals(1, testRequestStats.getPhaseCurrent(searchPhaseName));
-            testRequestStats.onPhaseFailure(ctx);
+            testRequestStats.onPhaseFailure(ctx, new SearchRequestContext());
             assertEquals(0, testRequestStats.getPhaseCurrent(searchPhaseName));
         }
     }
@@ -52,7 +52,7 @@ public class SearchRequestStatsTests extends OpenSearchTestCase {
         for (SearchPhaseName searchPhaseName : SearchPhaseName.values()) {
             when(mockSearchPhase.getSearchPhaseName()).thenReturn(searchPhaseName);
             long tookTimeInMillis = randomIntBetween(1, 10);
-            testRequestStats.onPhaseStart(ctx);
+            testRequestStats.onPhaseStart(ctx, new SearchRequestContext());
             long startTime = System.nanoTime() - TimeUnit.MILLISECONDS.toNanos(tookTimeInMillis);
             when(mockSearchPhase.getStartTimeInNanos()).thenReturn(startTime);
             assertEquals(1, testRequestStats.getPhaseCurrent(searchPhaseName));
@@ -84,7 +84,7 @@ public class SearchRequestStatsTests extends OpenSearchTestCase {
             for (int i = 0; i < numTasks; i++) {
                 threads[i] = new Thread(() -> {
                     phaser.arriveAndAwaitAdvance();
-                    testRequestStats.onPhaseStart(ctx);
+                    testRequestStats.onPhaseStart(ctx, new SearchRequestContext());
                     countDownLatch.countDown();
                 });
                 threads[i].start();
@@ -155,8 +155,8 @@ public class SearchRequestStatsTests extends OpenSearchTestCase {
             for (int i = 0; i < numTasks; i++) {
                 threads[i] = new Thread(() -> {
                     phaser.arriveAndAwaitAdvance();
-                    testRequestStats.onPhaseStart(ctx);
-                    testRequestStats.onPhaseFailure(ctx);
+                    testRequestStats.onPhaseStart(ctx, new SearchRequestContext());
+                    testRequestStats.onPhaseFailure(ctx, new SearchRequestContext());
                     countDownLatch.countDown();
                 });
                 threads[i].start();

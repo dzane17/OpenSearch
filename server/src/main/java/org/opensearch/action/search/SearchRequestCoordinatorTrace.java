@@ -61,13 +61,11 @@ public final class SearchRequestCoordinatorTrace extends SearchRequestOperations
         );
         requestSpan.addAttribute(
             AttributeNames.SHARDS,
-            searchRequestContext.formattedShardStats().isEmpty() ? "no data" : searchRequestContext.formattedShardStats()
+            searchRequestContext.formattedShardStats().isEmpty() ? "null" : searchRequestContext.formattedShardStats()
         );
         requestSpan.addAttribute(
             AttributeNames.SOURCE,
-            searchRequestContext.getSearchRequest().source() == null
-                ? "no source"
-                : searchRequestContext.getSearchRequest().source().toString()
+            searchRequestContext.getSearchRequest().source() == null ? "null" : searchRequestContext.getSearchRequest().source().toString()
         );
     }
 }
