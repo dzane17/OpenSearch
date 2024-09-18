@@ -144,6 +144,7 @@ final class SearchResponseMerger {
         List<TopDocs> topDocsList = new ArrayList<>(searchResponses.size());
         Map<String, List<Suggest.Suggestion>> groupedSuggestions = new HashMap<>();
         Boolean trackTotalHits = null;
+        Map<String, Long> resultPhaseTookMap = new HashMap<>();
 
         SearchPhaseController.TopDocsStats topDocsStats = new SearchPhaseController.TopDocsStats(trackTotalHitsUpTo);
 
@@ -206,6 +207,9 @@ final class SearchResponseMerger {
                 // issues reconstructing the proper TopDocs instance and breaks mergeTopDocs which expects the same type for each result.
                 topDocsList.add(topDocs);
             }
+            for (Map.Entry<String, Long> entry : searchResponse.getPhaseTook().getPhaseTookMap().entrySet()) {
+                resultPhaseTookMap.merge(entry.getKey(), entry.getValue(), Long::sum);
+            }
         }
 
         // after going through all the hits and collecting all their distinct shards, we assign shardIndex and set it to the ScoreDocs
@@ -236,7 +240,7 @@ final class SearchResponseMerger {
             successfulShards,
             skippedShards,
             tookInMillis,
-            searchRequestContext.getPhaseTook(),
+            new SearchResponse.PhaseTook(resultPhaseTookMap),
             shardFailures,
             clusters,
             null

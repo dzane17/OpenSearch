@@ -736,6 +736,10 @@ public class SearchResponse extends ActionResponse implements StatusToXContentOb
         public int hashCode() {
             return Objects.hash(phaseTookMap);
         }
+
+        Map<String, Long> getPhaseTookMap() {
+            return phaseTookMap;
+        }
     }
 
     static SearchResponse empty(Supplier<Long> tookInMillisSupplier, Clusters clusters) {
