@@ -62,7 +62,7 @@ public class WorkloadGroupRequestOperationListenerTests extends OpenSearchTestCa
         Metadata mockMetaData = mock(Metadata.class);
         when(mockClusterState.metadata()).thenReturn(mockMetaData);
         workloadGroupService = mock(WorkloadGroupService.class);
-        sut = new WorkloadGroupRequestOperationListener(workloadGroupService, testThreadPool);
+        sut = new WorkloadGroupRequestOperationListener(workloadGroupService, testThreadPool, mockClusterService);
     }
 
     public void tearDown() throws Exception {
@@ -137,7 +137,7 @@ public class WorkloadGroupRequestOperationListenerTests extends OpenSearchTestCa
             Collections.emptySet()
         );
 
-        sut = new WorkloadGroupRequestOperationListener(workloadGroupService, testThreadPool);
+        sut = new WorkloadGroupRequestOperationListener(workloadGroupService, testThreadPool, mockClusterService);
 
         List<Thread> threads = new ArrayList<>();
         for (int i = 0; i < ITERATIONS; i++) {
@@ -255,7 +255,7 @@ public class WorkloadGroupRequestOperationListenerTests extends OpenSearchTestCa
                 Collections.emptySet(),
                 Collections.emptySet()
             );
-            sut = new WorkloadGroupRequestOperationListener(workloadGroupService, testThreadPool);
+            sut = new WorkloadGroupRequestOperationListener(workloadGroupService, testThreadPool, mockClusterService);
             sut.onRequestFailure(null, null);
 
             HashSet<String> set = new HashSet<>();

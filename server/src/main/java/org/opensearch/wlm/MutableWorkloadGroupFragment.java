@@ -8,6 +8,9 @@
 
 package org.opensearch.wlm;
 
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
+import org.opensearch.Version;
 import org.opensearch.cluster.AbstractDiffable;
 import org.opensearch.common.annotation.ExperimentalApi;
 import org.opensearch.core.common.io.stream.StreamInput;
@@ -31,17 +34,34 @@ public class MutableWorkloadGroupFragment extends AbstractDiffable<MutableWorklo
 
     public static final String RESILIENCY_MODE_STRING = "resiliency_mode";
     public static final String RESOURCE_LIMITS_STRING = "resource_limits";
+    public static final String SEARCH_SETTINGS_STRING = "search_settings";
     private ResiliencyMode resiliencyMode;
     private Map<ResourceType, Double> resourceLimits;
+    private Map<String, String> searchSettings;
 
-    public static final List<String> acceptedFieldNames = List.of(RESILIENCY_MODE_STRING, RESOURCE_LIMITS_STRING);
+    public static final List<String> acceptedFieldNames = List.of(RESILIENCY_MODE_STRING, RESOURCE_LIMITS_STRING, SEARCH_SETTINGS_STRING);
 
-    public MutableWorkloadGroupFragment() {}
+    public MutableWorkloadGroupFragment() {
+        this.searchSettings = new HashMap<>();
+    }
 
+    /**
+     * Constructor for tests only. Production code should use the full constructor below.
+     */
     public MutableWorkloadGroupFragment(ResiliencyMode resiliencyMode, Map<ResourceType, Double> resourceLimits) {
+        this(resiliencyMode, resourceLimits, new HashMap<>());
+    }
+
+    public MutableWorkloadGroupFragment(
+        ResiliencyMode resiliencyMode,
+        Map<ResourceType, Double> resourceLimits,
+        Map<String, String> searchSettings
+    ) {
         validateResourceLimits(resourceLimits);
+        WorkloadGroupSearchSettings.validateSearchSettings(searchSettings);
         this.resiliencyMode = resiliencyMode;
         this.resourceLimits = resourceLimits;
+        this.searchSettings = searchSettings;
     }
 
     public MutableWorkloadGroupFragment(StreamInput in) throws IOException {
@@ -52,6 +72,9 @@ public class MutableWorkloadGroupFragment extends AbstractDiffable<MutableWorklo
         }
         String updatedResiliencyMode = in.readOptionalString();
         resiliencyMode = updatedResiliencyMode == null ? null : ResiliencyMode.fromName(updatedResiliencyMode);
+        searchSettings = in.getVersion().onOrAfter(Version.V_3_5_0)
+            ? in.readMap(StreamInput::readOptionalString, StreamInput::readOptionalString)
+            : new HashMap<>();
     }
 
     interface FieldParser<T> {
@@ -80,14 +103,20 @@ public class MutableWorkloadGroupFragment extends AbstractDiffable<MutableWorklo
         }
     }
 
+    static class SearchSettingsParser implements FieldParser<Map<String, String>> {
+        public Map<String, String> parseField(XContentParser parser) throws IOException {
+            return parser.mapStrings();
+        }
+    }
+
     static class FieldParserFactory {
         static Optional<FieldParser<?>> fieldParserFor(String fieldName) {
-            if (fieldName.equals(RESOURCE_LIMITS_STRING)) {
-                return Optional.of(new ResourceLimitsParser());
-            } else if (fieldName.equals(RESILIENCY_MODE_STRING)) {
-                return Optional.of(new ResiliencyModeParser());
-            }
-            return Optional.empty();
+            return switch (fieldName) {
+                case RESILIENCY_MODE_STRING -> Optional.of(new ResiliencyModeParser());
+                case RESOURCE_LIMITS_STRING -> Optional.of(new ResourceLimitsParser());
+                case SEARCH_SETTINGS_STRING -> Optional.of(new SearchSettingsParser());
+                default -> Optional.empty();
+            };
         }
     }
 
@@ -111,23 +140,35 @@ public class MutableWorkloadGroupFragment extends AbstractDiffable<MutableWorklo
         } catch (IOException e) {
             throw new IllegalStateException("writing error encountered for the field " + RESOURCE_LIMITS_STRING);
         }
+    }, SEARCH_SETTINGS_STRING, (builder) -> {
+        try {
+            builder.startObject(SEARCH_SETTINGS_STRING);
+            for (String settingName : searchSettings.keySet()) {
+                builder.field(settingName, searchSettings.get(settingName));
+            }
+            builder.endObject();
+            return null;
+        } catch (IOException e) {
+            throw new IllegalStateException("writing error encountered for the field " + SEARCH_SETTINGS_STRING);
+        }
     });
 
     public static boolean shouldParse(String field) {
         return FieldParserFactory.fieldParserFor(field).isPresent();
     }
 
+    @SuppressWarnings("unchecked")
     public void parseField(XContentParser parser, String field) {
         FieldParserFactory.fieldParserFor(field).ifPresent(fieldParser -> {
             try {
                 Object value = fieldParser.parseField(parser);
-                if (field.equals(RESILIENCY_MODE_STRING)) {
-                    setResiliencyMode((ResiliencyMode) value);
-                } else if (field.equals(RESOURCE_LIMITS_STRING)) {
-                    setResourceLimits((Map<ResourceType, Double>) value);
+                switch (field) {
+                    case RESILIENCY_MODE_STRING -> setResiliencyMode((ResiliencyMode) value);
+                    case RESOURCE_LIMITS_STRING -> setResourceLimits((Map<ResourceType, Double>) value);
+                    case SEARCH_SETTINGS_STRING -> setSearchSettings((Map<String, String>) value);
                 }
             } catch (IOException e) {
-                throw new IllegalArgumentException("parsing error encountered for the field " + field);
+                throw new IllegalArgumentException(String.format("parsing error encountered for the field '%s'", field));
             }
         });
     }
@@ -145,6 +186,9 @@ public class MutableWorkloadGroupFragment extends AbstractDiffable<MutableWorklo
             out.writeMap(resourceLimits, ResourceType::writeTo, StreamOutput::writeDouble);
         }
         out.writeOptionalString(resiliencyMode == null ? null : resiliencyMode.getName());
+        if (out.getVersion().onOrAfter(Version.V_3_5_0)) {
+            out.writeMap(searchSettings, StreamOutput::writeOptionalString, StreamOutput::writeOptionalString);
+        }
     }
 
     public static void validateResourceLimits(Map<ResourceType, Double> resourceLimits) {
@@ -167,12 +211,14 @@ public class MutableWorkloadGroupFragment extends AbstractDiffable<MutableWorklo
         if (this == o) return true;
         if (o == null || getClass() != o.getClass()) return false;
         MutableWorkloadGroupFragment that = (MutableWorkloadGroupFragment) o;
-        return Objects.equals(resiliencyMode, that.resiliencyMode) && Objects.equals(resourceLimits, that.resourceLimits);
+        return Objects.equals(resiliencyMode, that.resiliencyMode)
+            && Objects.equals(resourceLimits, that.resourceLimits)
+            && Objects.equals(searchSettings, that.searchSettings);
     }
 
     @Override
     public int hashCode() {
-        return Objects.hash(resiliencyMode, resourceLimits);
+        return Objects.hash(resiliencyMode, resourceLimits, searchSettings);
     }
 
     public ResiliencyMode getResiliencyMode() {
@@ -181,6 +227,10 @@ public class MutableWorkloadGroupFragment extends AbstractDiffable<MutableWorklo
 
     public Map<ResourceType, Double> getResourceLimits() {
         return resourceLimits;
+    }
+
+    public Map<String, String> getSearchSettings() {
+        return searchSettings;
     }
 
     /**
@@ -214,12 +264,17 @@ public class MutableWorkloadGroupFragment extends AbstractDiffable<MutableWorklo
         }
     }
 
-    public void setResiliencyMode(ResiliencyMode resiliencyMode) {
+    void setResiliencyMode(ResiliencyMode resiliencyMode) {
         this.resiliencyMode = resiliencyMode;
     }
 
-    public void setResourceLimits(Map<ResourceType, Double> resourceLimits) {
+    void setResourceLimits(Map<ResourceType, Double> resourceLimits) {
         validateResourceLimits(resourceLimits);
         this.resourceLimits = resourceLimits;
+    }
+
+    void setSearchSettings(Map<String, String> searchSettings) {
+        WorkloadGroupSearchSettings.validateSearchSettings(searchSettings);
+        this.searchSettings = searchSettings;
     }
 }

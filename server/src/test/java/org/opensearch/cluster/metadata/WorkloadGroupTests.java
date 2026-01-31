@@ -127,7 +127,7 @@ public class WorkloadGroupTests extends AbstractSerializingTestCase<WorkloadGrou
     public void testWorkloadGroupInitiation() {
         WorkloadGroup workloadGroup = new WorkloadGroup(
             "analytics",
-            new MutableWorkloadGroupFragment(randomMode(), Map.of(ResourceType.MEMORY, 0.4))
+            new MutableWorkloadGroupFragment(randomMode(), Map.of(ResourceType.MEMORY, 0.4), Map.of("setting1", "true", "setting2", "100"))
         );
         assertNotNull(workloadGroup.getName());
         assertNotNull(workloadGroup.get_id());
@@ -136,6 +136,8 @@ public class WorkloadGroupTests extends AbstractSerializingTestCase<WorkloadGrou
         assertEquals(1, workloadGroup.getResourceLimits().size());
         assertTrue(allowedModes.contains(workloadGroup.getResiliencyMode()));
         assertTrue(workloadGroup.getUpdatedAtInMillis() != 0);
+        assertNotNull(workloadGroup.getSearchSettings());
+        assertEquals(workloadGroup.getSearchSettings(), Map.of("setting1", "true", "setting2", "100"));
     }
 
     public void testIllegalWorkloadGroupName() {

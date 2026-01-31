@@ -28,7 +28,7 @@ public class WorkloadManagementSettings {
     public static final double NODE_LEVEL_MEMORY_REJECTION_THRESHOLD_MAX_VALUE = 0.9;
     public static final double NODE_LEVEL_CPU_CANCELLATION_THRESHOLD_MAX_VALUE = 0.95;
     public static final double NODE_LEVEL_CPU_REJECTION_THRESHOLD_MAX_VALUE = 0.9;
-    public static final String DEFAULT_WLM_MODE = "monitor_only";
+    public static final String DEFAULT_WLM_MODE = "enabled";
 
     private Double nodeLevelMemoryCancellationThreshold;
     private Double nodeLevelMemoryRejectionThreshold;

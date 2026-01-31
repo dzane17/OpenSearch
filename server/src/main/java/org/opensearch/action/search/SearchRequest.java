@@ -650,6 +650,13 @@ public class SearchRequest extends ActionRequest implements IndicesRequest.Repla
     }
 
     /**
+     * Returns the raw internal value of maxConcurrentShardRequests without applying the default.
+     */
+    public int getMaxConcurrentShardRequestsRaw() {
+        return maxConcurrentShardRequests;
+    }
+
+    /**
      * Sets the number of shard requests that should be executed concurrently on a single node. This value should be used as a
      * protection mechanism to reduce the number of shard requests fired per high level search request. Searches that hit the entire
      * cluster can be throttled with this number to reduce the cluster load. The default is {@code 5}

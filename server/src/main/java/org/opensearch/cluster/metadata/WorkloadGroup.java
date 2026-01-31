@@ -63,6 +63,7 @@ public class WorkloadGroup extends AbstractDiffable<WorkloadGroup> implements To
         Objects.requireNonNull(name, "WorkloadGroup.name can't be null");
         Objects.requireNonNull(mutableWorkloadGroupFragment.getResourceLimits(), "WorkloadGroup.resourceLimits can't be null");
         Objects.requireNonNull(mutableWorkloadGroupFragment.getResiliencyMode(), "WorkloadGroup.resiliencyMode can't be null");
+        Objects.requireNonNull(mutableWorkloadGroupFragment.getSearchSettings(), "WorkloadGroup.searchSettings can't be null");
         Objects.requireNonNull(_id, "WorkloadGroup._id can't be null");
         validateName(name);
 
@@ -79,14 +80,13 @@ public class WorkloadGroup extends AbstractDiffable<WorkloadGroup> implements To
         this.updatedAtInMillis = updatedAt;
     }
 
+    /**
+     * Validates if the timestamp is within a valid range.
+     * @param updatedAt timestamp in milliseconds since epoch
+     * @return true if timestamp is non-negative and not in the future
+     */
     public static boolean isValid(long updatedAt) {
-        long minValidTimestamp = Instant.ofEpochMilli(0L).getMillis();
-
-        // Use Instant.now() to get the current time in seconds since epoch
-        long currentSeconds = Instant.now().getMillis();
-
-        // Check if the timestamp is within a reasonable range
-        return minValidTimestamp <= updatedAt && updatedAt <= currentSeconds;
+        return updatedAt >= 0 && updatedAt <= Instant.now().getMillis();
     }
 
     public WorkloadGroup(StreamInput in) throws IOException {
@@ -104,10 +104,15 @@ public class WorkloadGroup extends AbstractDiffable<WorkloadGroup> implements To
         }
         final ResiliencyMode mode = Optional.ofNullable(mutableWorkloadGroupFragment.getResiliencyMode())
             .orElse(existingGroup.getResiliencyMode());
+        // replace search_settings if present in mutableWorkloadGroupFragment
+        final Map<String, String> mutableFragmentSearchSettings = mutableWorkloadGroupFragment.getSearchSettings();
+        final Map<String, String> updatedSearchSettings = (mutableFragmentSearchSettings != null && !mutableFragmentSearchSettings.isEmpty())
+            ? new HashMap<>(mutableFragmentSearchSettings)
+            : new HashMap<>(existingGroup.getSearchSettings());
         return new WorkloadGroup(
             existingGroup.getName(),
             existingGroup.get_id(),
-            new MutableWorkloadGroupFragment(mode, updatedResourceLimits),
+            new MutableWorkloadGroupFragment(mode, updatedResourceLimits, updatedSearchSettings),
             Instant.now().getMillis()
         );
     }
@@ -121,8 +126,11 @@ public class WorkloadGroup extends AbstractDiffable<WorkloadGroup> implements To
     }
 
     public static void validateName(String name) {
-        if (name == null || name.isEmpty() || name.length() > MAX_CHARS_ALLOWED_IN_NAME) {
-            throw new IllegalArgumentException("WorkloadGroup.name shouldn't be null, empty or more than 50 chars long");
+        if (name == null || name.isEmpty()) {
+            throw new IllegalArgumentException("WorkloadGroup.name shouldn't be null or empty");
+        }
+        if (name.length() > MAX_CHARS_ALLOWED_IN_NAME) {
+            throw new IllegalArgumentException(String.format("WorkloadGroup.name shouldn't be more than %d chars long", MAX_CHARS_ALLOWED_IN_NAME));
         }
     }
 
@@ -177,6 +185,10 @@ public class WorkloadGroup extends AbstractDiffable<WorkloadGroup> implements To
 
     public Map<ResourceType, Double> getResourceLimits() {
         return getMutableWorkloadGroupFragment().getResourceLimits();
+    }
+
+    public Map<String, String> getSearchSettings() {
+        return getMutableWorkloadGroupFragment().getSearchSettings();
     }
 
     public String get_id() {

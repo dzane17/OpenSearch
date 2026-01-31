@@ -8,24 +8,41 @@
 
 package org.opensearch.wlm.listeners;
 
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
 import org.opensearch.action.search.SearchPhaseContext;
+import org.opensearch.action.search.SearchRequest;
 import org.opensearch.action.search.SearchRequestContext;
 import org.opensearch.action.search.SearchRequestOperationsListener;
+import org.opensearch.cluster.metadata.WorkloadGroup;
+import org.opensearch.cluster.metadata.WorkloadGroupMetadata;
+import org.opensearch.cluster.service.ClusterService;
+import org.opensearch.common.unit.TimeValue;
 import org.opensearch.threadpool.ThreadPool;
+import org.opensearch.wlm.WorkloadGroupSearchSettings;
 import org.opensearch.wlm.WorkloadGroupService;
 import org.opensearch.wlm.WorkloadGroupTask;
+
+import java.util.Map;
 
 /**
  * This listener is used to listen for request lifecycle events for a workloadGroup
  */
 public class WorkloadGroupRequestOperationListener extends SearchRequestOperationsListener {
 
+    private static final Logger logger = LogManager.getLogger(WorkloadGroupRequestOperationListener.class);
     private final WorkloadGroupService workloadGroupService;
     private final ThreadPool threadPool;
+    private final ClusterService clusterService;
 
-    public WorkloadGroupRequestOperationListener(WorkloadGroupService workloadGroupService, ThreadPool threadPool) {
+    public WorkloadGroupRequestOperationListener(
+        WorkloadGroupService workloadGroupService,
+        ThreadPool threadPool,
+        ClusterService clusterService
+    ) {
         this.workloadGroupService = workloadGroupService;
         this.threadPool = threadPool;
+        this.clusterService = clusterService;
     }
 
     /**
@@ -34,13 +51,76 @@ public class WorkloadGroupRequestOperationListener extends SearchRequestOperatio
      */
     @Override
     protected void onRequestStart(SearchRequestContext searchRequestContext) {
+        logger.warn("in onRequestStart");
         final String workloadGroupId = threadPool.getThreadContext().getHeader(WorkloadGroupTask.WORKLOAD_GROUP_ID_HEADER);
         workloadGroupService.rejectIfNeeded(workloadGroupId);
+        logger.warn("before isPhaseTook={}", searchRequestContext.getRequest().isPhaseTook());
+        applyWorkloadGroupSearchSettings(workloadGroupId, searchRequestContext.getRequest());
+        logger.warn("after isPhaseTook={}", searchRequestContext.getRequest().isPhaseTook());
     }
 
     @Override
     protected void onRequestFailure(SearchPhaseContext context, SearchRequestContext searchRequestContext) {
         final String workloadGroupId = threadPool.getThreadContext().getHeader(WorkloadGroupTask.WORKLOAD_GROUP_ID_HEADER);
         workloadGroupService.incrementFailuresFor(workloadGroupId);
+    }
+
+    /**
+     * Applies workload group-specific search settings to the search request.
+     * Settings are only applied for workload groups that exist in cluster state.
+     *
+     * @param workloadGroupId the workload group identifier from thread context
+     * @param searchRequest the search request to modify
+     */
+    private void applyWorkloadGroupSearchSettings(String workloadGroupId, SearchRequest searchRequest) {
+        // Skip if no workload group ID (default group is added later)
+        if (workloadGroupId == null) {
+            return;
+        }
+
+        WorkloadGroupMetadata metadata = clusterService.state().metadata().custom(WorkloadGroupMetadata.TYPE);
+        if (metadata == null) {
+            return;
+        }
+
+        // Get the workload group object by ID
+        WorkloadGroup workloadGroup = metadata.workloadGroups().get(workloadGroupId);
+        if (workloadGroup == null) {
+            return;
+        }
+
+        // Loop through WLM group search settings and apply them as needed
+        // WLM settings are applied only if the corresponding setting is not already set in the request
+        for (Map.Entry<String, String> entry : workloadGroup.getSearchSettings().entrySet()) {
+            try {
+                WorkloadGroupSearchSettings.Setting settingKey = WorkloadGroupSearchSettings.Setting.fromKey(entry.getKey());
+                if (settingKey == null) continue;
+
+                switch (settingKey) {
+                    case CANCEL_AFTER_TIME_INTERVAL:
+                        if (searchRequest.getCancelAfterTimeInterval() == null) {
+                            searchRequest.setCancelAfterTimeInterval(TimeValue.parseTimeValue(entry.getValue(), WorkloadGroupSearchSettings.Setting.CANCEL_AFTER_TIME_INTERVAL.getKey()));
+                        }
+                        break;
+                    case MAX_CONCURRENT_SHARD_REQUESTS:
+                        if (searchRequest.getMaxConcurrentShardRequestsRaw() == 0) {
+                            searchRequest.setMaxConcurrentShardRequests(Integer.parseInt(entry.getValue()));
+                        }
+                        break;
+                    case PHASE_TOOK:
+                        if (searchRequest.isPhaseTook() == null) {
+                            searchRequest.setPhaseTook(Boolean.parseBoolean(entry.getValue()));
+                        }
+                        break;
+                    case TIMEOUT:
+                        if (searchRequest.source() != null && searchRequest.source().timeout() == null) {
+                            searchRequest.source().timeout(TimeValue.parseTimeValue(entry.getValue(), WorkloadGroupSearchSettings.Setting.TIMEOUT.getKey()));
+                        }
+                        break;
+                }
+            } catch (Exception e) {
+                logger.error("Failed to apply workload group setting [{}={}]", entry.getKey(), entry.getValue(), e);
+            }
+        }
     }
 }
