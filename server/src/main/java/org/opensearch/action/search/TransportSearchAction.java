@@ -456,9 +456,6 @@ public class TransportSearchAction extends HandledTransportAction<SearchRequest,
             relativeStartNanos,
             System::nanoTime
         );
-        if (originalSearchRequest.isPhaseTook() == null) {
-            originalSearchRequest.setPhaseTook(clusterService.getClusterSettings().get(SEARCH_PHASE_TOOK_ENABLED));
-        }
 
         final Span requestSpan = tracer.startSpan(SpanBuilder.from(task, actionName));
         try (final SpanScope spanScope = tracer.withSpanInScope(requestSpan)) {
@@ -475,6 +472,10 @@ public class TransportSearchAction extends HandledTransportAction<SearchRequest,
                 taskResourceTrackingService::getTaskResourceUsageFromThreadContext
             );
             searchRequestContext.getSearchRequestOperationsListener().onRequestStart(searchRequestContext);
+
+            if (originalSearchRequest.isPhaseTook() == null) {
+                originalSearchRequest.setPhaseTook(clusterService.getClusterSettings().get(SEARCH_PHASE_TOOK_ENABLED));
+            }
 
             // At this point either the QUERY_GROUP_ID header will be present in ThreadContext either via ActionFilter
             // or HTTP header (HTTP header will be deprecated once ActionFilter is implemented)
