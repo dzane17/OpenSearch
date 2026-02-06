@@ -27,6 +27,7 @@ public class WorkloadGroupSearchSettingsTests extends OpenSearchTestCase {
         );
         assertEquals("phase_took", WorkloadGroupSearchSettings.WlmSearchSetting.PHASE_TOOK.getSettingName());
         assertEquals("timeout", WorkloadGroupSearchSettings.WlmSearchSetting.TIMEOUT.getSettingName());
+        assertEquals("max_buckets", WorkloadGroupSearchSettings.WlmSearchSetting.MAX_BUCKET.getSettingName());
     }
 
     public void testFromKeyValidSettings() {
@@ -47,6 +48,10 @@ public class WorkloadGroupSearchSettingsTests extends OpenSearchTestCase {
             WorkloadGroupSearchSettings.WlmSearchSetting.fromKey("phase_took")
         );
         assertEquals(WorkloadGroupSearchSettings.WlmSearchSetting.TIMEOUT, WorkloadGroupSearchSettings.WlmSearchSetting.fromKey("timeout"));
+        assertEquals(
+            WorkloadGroupSearchSettings.WlmSearchSetting.MAX_BUCKET,
+            WorkloadGroupSearchSettings.WlmSearchSetting.fromKey("max_buckets")
+        );
     }
 
     public void testFromKeyInvalidSetting() {
@@ -72,6 +77,8 @@ public class WorkloadGroupSearchSettingsTests extends OpenSearchTestCase {
     public void testValidatePositiveInt() {
         WorkloadGroupSearchSettings.WlmSearchSetting.MAX_CONCURRENT_SHARD_REQUESTS.validate("1");
         WorkloadGroupSearchSettings.WlmSearchSetting.MAX_CONCURRENT_SHARD_REQUESTS.validate("100");
+        WorkloadGroupSearchSettings.WlmSearchSetting.MAX_BUCKET.validate("1");
+        WorkloadGroupSearchSettings.WlmSearchSetting.MAX_BUCKET.validate("10000");
     }
 
     public void testValidateInvalidPositiveInt() {

@@ -495,13 +495,35 @@ public class WorkloadGroupRequestOperationListenerTests extends OpenSearchTestCa
         assertTrue(mockSearchRequest.isPhaseTook());
     }
 
+    public void testApplySearchSettings_MaxBucket_SetsHeader() {
+        String wgId = "test-wg";
+        WorkloadGroup wg = createWorkloadGroup(wgId, Map.of("max_buckets", "5000"));
+        setupWorkloadGroupMetadata(Map.of(wgId, wg));
+        testThreadPool.getThreadContext().putHeader(WorkloadGroupTask.WORKLOAD_GROUP_ID_HEADER, wgId);
+
+        sut.onRequestStart(mockSearchRequestContext);
+
+        assertEquals("5000", testThreadPool.getThreadContext().getHeader("max_buckets"));
+    }
+
     public void testApplySearchSettings_MultipleSettings() {
         mockSearchRequest.source(new SearchSourceBuilder());
 
         String wgId = "test-wg";
         WorkloadGroup wg = createWorkloadGroup(
             wgId,
-            Map.of("batched_reduce_size", "100", "max_concurrent_shard_requests", "5", "timeout", "30s", "phase_took", "true")
+            Map.of(
+                "batched_reduce_size",
+                "100",
+                "max_concurrent_shard_requests",
+                "5",
+                "timeout",
+                "30s",
+                "phase_took",
+                "true",
+                "max_buckets",
+                "10000"
+            )
         );
         setupWorkloadGroupMetadata(Map.of(wgId, wg));
         testThreadPool.getThreadContext().putHeader(WorkloadGroupTask.WORKLOAD_GROUP_ID_HEADER, wgId);
@@ -512,6 +534,7 @@ public class WorkloadGroupRequestOperationListenerTests extends OpenSearchTestCa
         assertEquals(5, mockSearchRequest.getMaxConcurrentShardRequests());
         assertEquals(TimeValue.timeValueSeconds(30), mockSearchRequest.source().timeout());
         assertTrue(mockSearchRequest.isPhaseTook());
+        assertEquals("10000", testThreadPool.getThreadContext().getHeader("max_buckets"));
     }
 
     private void setupWorkloadGroupMetadata(Map<String, WorkloadGroup> workloadGroups) {

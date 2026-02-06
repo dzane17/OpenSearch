@@ -26,6 +26,7 @@ import org.opensearch.wlm.WorkloadGroupTask;
 import java.util.Map;
 
 import static java.lang.Integer.min;
+import static org.opensearch.wlm.WorkloadGroupSearchSettings.WlmSearchSetting.MAX_BUCKET;
 
 /**
  * This listener is used to listen for request lifecycle events for a workloadGroup
@@ -148,6 +149,10 @@ public class WorkloadGroupRequestOperationListener extends SearchRequestOperatio
                         } else {
                             searchRequest.source().timeout(requestTimeout.millis() <= wlmTimeout.millis() ? requestTimeout : wlmTimeout);
                         }
+                        break;
+                    case MAX_BUCKET:
+                        // Store max_bucket as a request header so it propagates to data nodes
+                        threadPool.getThreadContext().putHeader(MAX_BUCKET.getSettingName(), entry.getValue());
                         break;
                 }
             } catch (Exception e) {

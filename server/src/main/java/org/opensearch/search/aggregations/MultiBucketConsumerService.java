@@ -218,4 +218,15 @@ public class MultiBucketConsumerService {
     public MultiBucketConsumer create() {
         return new MultiBucketConsumer(maxBucket, breaker);
     }
+
+    /**
+     * Creates a MultiBucketConsumer with a custom bucket limit.
+     * Used by WLM to override the cluster-level max_buckets setting for specific workload groups.
+     *
+     * @param limit the maximum number of buckets allowed
+     * @return a new MultiBucketConsumer with the specified limit
+     */
+    public MultiBucketConsumer create(int limit) {
+        return new MultiBucketConsumer(limit, breaker);
+    }
 }

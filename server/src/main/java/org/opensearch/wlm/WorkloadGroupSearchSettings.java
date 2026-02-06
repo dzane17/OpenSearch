@@ -41,7 +41,11 @@ public class WorkloadGroupSearchSettings {
         /** Setting for including phase timing information */
         PHASE_TOOK("phase_took", WorkloadGroupSearchSettings::validateBoolean),
         /** Setting for search request timeout */
-        TIMEOUT("timeout", WorkloadGroupSearchSettings::validateTimeValue);
+        TIMEOUT("timeout", WorkloadGroupSearchSettings::validateTimeValue),
+
+        // Cluster settings (applied at cluster level)
+        /** Setting for maximum number of aggregation buckets */
+        MAX_BUCKET("max_buckets", WorkloadGroupSearchSettings::validatePositiveInt);
 
         private final String settingName;
         private final Function<String, String> validator;

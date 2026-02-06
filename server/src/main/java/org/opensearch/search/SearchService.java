@@ -181,6 +181,7 @@ import static org.opensearch.common.unit.TimeValue.timeValueHours;
 import static org.opensearch.common.unit.TimeValue.timeValueMillis;
 import static org.opensearch.common.unit.TimeValue.timeValueMinutes;
 import static org.opensearch.search.internal.SearchContext.TRACK_TOTAL_HITS_DISABLED;
+import static org.opensearch.wlm.WorkloadGroupSearchSettings.WlmSearchSetting.MAX_BUCKET;
 
 /**
  * The main search service
@@ -1624,7 +1625,17 @@ public class SearchService extends AbstractLifecycleComponent implements IndexEv
         if (source.aggregations() != null && includeAggregations) {
             try {
                 AggregatorFactories factories = source.aggregations().build(queryShardContext, null);
-                context.aggregations(new SearchContextAggregations(factories, multiBucketConsumerService.create()));
+                // Check for WLM max_bucket override from request header.
+                String wlmMaxBucketStr = threadPool.getThreadContext().getHeader(MAX_BUCKET.getSettingName());
+                MultiBucketConsumerService.MultiBucketConsumer multiBucketConsumer = multiBucketConsumerService.create();
+                if (wlmMaxBucketStr != null) {
+                    try {
+                        multiBucketConsumer = multiBucketConsumerService.create(Integer.parseInt(wlmMaxBucketStr));
+                    } catch (NumberFormatException e) {
+                        logger.warn("Invalid WLM max_buckets header [{}]", wlmMaxBucketStr);
+                    }
+                }
+                context.aggregations(new SearchContextAggregations(factories, multiBucketConsumer));
             } catch (IOException e) {
                 throw new AggregationInitializationException("Failed to create aggregators", e);
             }
@@ -2025,12 +2036,17 @@ public class SearchService extends AbstractLifecycleComponent implements IndexEv
             @Override
             public ReduceContext forFinalReduction() {
                 PipelineTree pipelineTree = requestToPipelineTree(searchSourceBuilder);
-                return InternalAggregation.ReduceContext.forFinalReduction(
-                    bigArrays,
-                    scriptService,
-                    multiBucketConsumerService.create(),
-                    pipelineTree
-                );
+                // Check for WLM max_bucket override from request header.
+                String wlmMaxBucketStr = threadPool.getThreadContext().getHeader(MAX_BUCKET.getSettingName());
+                MultiBucketConsumerService.MultiBucketConsumer multiBucketConsumer = multiBucketConsumerService.create();
+                if (wlmMaxBucketStr != null) {
+                    try {
+                        multiBucketConsumer = multiBucketConsumerService.create(Integer.parseInt(wlmMaxBucketStr));
+                    } catch (NumberFormatException e) {
+                        logger.warn("Invalid WLM max_buckets header [{}]", wlmMaxBucketStr);
+                    }
+                }
+                return InternalAggregation.ReduceContext.forFinalReduction(bigArrays, scriptService, multiBucketConsumer, pipelineTree);
             }
         };
     }
