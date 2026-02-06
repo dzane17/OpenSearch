@@ -15,8 +15,10 @@ import org.opensearch.cluster.metadata.Metadata;
 import org.opensearch.cluster.metadata.WorkloadGroup;
 import org.opensearch.cluster.metadata.WorkloadGroupMetadata;
 import org.opensearch.cluster.service.ClusterService;
+import org.opensearch.common.unit.TimeValue;
 import org.opensearch.common.util.concurrent.ThreadContext;
 import org.opensearch.core.concurrency.OpenSearchRejectedExecutionException;
+import org.opensearch.search.builder.SearchSourceBuilder;
 import org.opensearch.test.OpenSearchTestCase;
 import org.opensearch.threadpool.TestThreadPool;
 import org.opensearch.threadpool.ThreadPool;
@@ -287,14 +289,18 @@ public class WorkloadGroupRequestOperationListenerTests extends OpenSearchTestCa
     // Tests for applyWorkloadGroupSearchSettings
 
     public void testApplySearchSettings_NullWorkloadGroupId() {
+        mockSearchRequest.setBatchedReduceSize(512);
+
         // No workload group ID in thread context
         sut.onRequestStart(mockSearchRequestContext);
 
         // Request should remain unchanged
-        assertNull(mockSearchRequest.isPhaseTook());
+        assertEquals(512, mockSearchRequest.getBatchedReduceSize());
     }
 
     public void testApplySearchSettings_NullMetadata() {
+        mockSearchRequest.setBatchedReduceSize(512);
+
         testThreadPool.getThreadContext().putHeader(WorkloadGroupTask.WORKLOAD_GROUP_ID_HEADER, "test-wg-id");
         ClusterState state = mock(ClusterState.class);
         Metadata metadata = mock(Metadata.class);
@@ -304,16 +310,176 @@ public class WorkloadGroupRequestOperationListenerTests extends OpenSearchTestCa
 
         sut.onRequestStart(mockSearchRequestContext);
 
-        assertNull(mockSearchRequest.isPhaseTook());
+        assertEquals(512, mockSearchRequest.getBatchedReduceSize());
     }
 
     public void testApplySearchSettings_WorkloadGroupNotFound() {
+        mockSearchRequest.setBatchedReduceSize(512);
+
         testThreadPool.getThreadContext().putHeader(WorkloadGroupTask.WORKLOAD_GROUP_ID_HEADER, "non-existent-id");
         setupWorkloadGroupMetadata(Map.of());
 
         sut.onRequestStart(mockSearchRequestContext);
 
-        assertNull(mockSearchRequest.isPhaseTook());
+        assertEquals(512, mockSearchRequest.getBatchedReduceSize());
+    }
+
+    public void testApplySearchSettings_BatchedReduceSize_WlmMoreRestrictive() {
+        mockSearchRequest.setBatchedReduceSize(512); // explicitly set by user
+
+        String wgId = "test-wg";
+        WorkloadGroup wg = createWorkloadGroup(wgId, Map.of("batched_reduce_size", "100"));
+        setupWorkloadGroupMetadata(Map.of(wgId, wg));
+        testThreadPool.getThreadContext().putHeader(WorkloadGroupTask.WORKLOAD_GROUP_ID_HEADER, wgId);
+
+        sut.onRequestStart(mockSearchRequestContext);
+
+        assertEquals(100, mockSearchRequest.getBatchedReduceSize()); // WLM wins (more restrictive)
+    }
+
+    public void testApplySearchSettings_BatchedReduceSize_RequestMoreRestrictive() {
+        mockSearchRequest.setBatchedReduceSize(50); // request is more restrictive
+
+        String wgId = "test-wg";
+        WorkloadGroup wg = createWorkloadGroup(wgId, Map.of("batched_reduce_size", "100"));
+        setupWorkloadGroupMetadata(Map.of(wgId, wg));
+        testThreadPool.getThreadContext().putHeader(WorkloadGroupTask.WORKLOAD_GROUP_ID_HEADER, wgId);
+
+        sut.onRequestStart(mockSearchRequestContext);
+
+        assertEquals(50, mockSearchRequest.getBatchedReduceSize()); // Request wins (more restrictive)
+    }
+
+    public void testApplySearchSettings_MaxConcurrentShardRequests_WlmOverridesDefault() {
+        // Request has default value (not explicitly set)
+        assertEquals(0, mockSearchRequest.getMaxConcurrentShardRequestsRaw());
+
+        String wgId = "test-wg";
+        WorkloadGroup wg = createWorkloadGroup(wgId, Map.of("max_concurrent_shard_requests", "10"));
+        setupWorkloadGroupMetadata(Map.of(wgId, wg));
+        testThreadPool.getThreadContext().putHeader(WorkloadGroupTask.WORKLOAD_GROUP_ID_HEADER, wgId);
+
+        sut.onRequestStart(mockSearchRequestContext);
+
+        assertEquals(10, mockSearchRequest.getMaxConcurrentShardRequests()); // WLM overrides default
+    }
+
+    public void testApplySearchSettings_MaxConcurrentShardRequests_WlmMoreRestrictive() {
+        mockSearchRequest.setMaxConcurrentShardRequests(20); // explicitly set by user
+
+        String wgId = "test-wg";
+        WorkloadGroup wg = createWorkloadGroup(wgId, Map.of("max_concurrent_shard_requests", "5"));
+        setupWorkloadGroupMetadata(Map.of(wgId, wg));
+        testThreadPool.getThreadContext().putHeader(WorkloadGroupTask.WORKLOAD_GROUP_ID_HEADER, wgId);
+
+        sut.onRequestStart(mockSearchRequestContext);
+
+        assertEquals(5, mockSearchRequest.getMaxConcurrentShardRequests()); // WLM wins (more restrictive)
+    }
+
+    public void testApplySearchSettings_MaxConcurrentShardRequests_RequestMoreRestrictive() {
+        mockSearchRequest.setMaxConcurrentShardRequests(3);
+
+        String wgId = "test-wg";
+        WorkloadGroup wg = createWorkloadGroup(wgId, Map.of("max_concurrent_shard_requests", "10"));
+        setupWorkloadGroupMetadata(Map.of(wgId, wg));
+        testThreadPool.getThreadContext().putHeader(WorkloadGroupTask.WORKLOAD_GROUP_ID_HEADER, wgId);
+
+        sut.onRequestStart(mockSearchRequestContext);
+
+        assertEquals(3, mockSearchRequest.getMaxConcurrentShardRequests()); // Request wins
+    }
+
+    public void testApplySearchSettings_CancelAfterTimeInterval_WlmAppliedWhenNull() {
+        assertNull(mockSearchRequest.getCancelAfterTimeInterval());
+
+        String wgId = "test-wg";
+        WorkloadGroup wg = createWorkloadGroup(wgId, Map.of("cancel_after_time_interval", "30s"));
+        setupWorkloadGroupMetadata(Map.of(wgId, wg));
+        testThreadPool.getThreadContext().putHeader(WorkloadGroupTask.WORKLOAD_GROUP_ID_HEADER, wgId);
+
+        sut.onRequestStart(mockSearchRequestContext);
+
+        assertEquals(TimeValue.timeValueSeconds(30), mockSearchRequest.getCancelAfterTimeInterval());
+    }
+
+    public void testApplySearchSettings_CancelAfterTimeInterval_RequestMoreRestrictive() {
+        mockSearchRequest.setCancelAfterTimeInterval(TimeValue.timeValueSeconds(10));
+
+        String wgId = "test-wg";
+        WorkloadGroup wg = createWorkloadGroup(wgId, Map.of("cancel_after_time_interval", "30s"));
+        setupWorkloadGroupMetadata(Map.of(wgId, wg));
+        testThreadPool.getThreadContext().putHeader(WorkloadGroupTask.WORKLOAD_GROUP_ID_HEADER, wgId);
+
+        sut.onRequestStart(mockSearchRequestContext);
+
+        assertEquals(TimeValue.timeValueSeconds(10), mockSearchRequest.getCancelAfterTimeInterval()); // Request wins
+    }
+
+    public void testApplySearchSettings_CancelAfterTimeInterval_WlmMoreRestrictive() {
+        mockSearchRequest.setCancelAfterTimeInterval(TimeValue.timeValueMinutes(5));
+
+        String wgId = "test-wg";
+        WorkloadGroup wg = createWorkloadGroup(wgId, Map.of("cancel_after_time_interval", "30s"));
+        setupWorkloadGroupMetadata(Map.of(wgId, wg));
+        testThreadPool.getThreadContext().putHeader(WorkloadGroupTask.WORKLOAD_GROUP_ID_HEADER, wgId);
+
+        sut.onRequestStart(mockSearchRequestContext);
+
+        assertEquals(TimeValue.timeValueSeconds(30), mockSearchRequest.getCancelAfterTimeInterval()); // WLM wins
+    }
+
+    public void testApplySearchSettings_Timeout_WlmAppliedWhenNull() {
+        mockSearchRequest.source(new SearchSourceBuilder());
+        assertNull(mockSearchRequest.source().timeout());
+
+        String wgId = "test-wg";
+        WorkloadGroup wg = createWorkloadGroup(wgId, Map.of("timeout", "1m"));
+        setupWorkloadGroupMetadata(Map.of(wgId, wg));
+        testThreadPool.getThreadContext().putHeader(WorkloadGroupTask.WORKLOAD_GROUP_ID_HEADER, wgId);
+
+        sut.onRequestStart(mockSearchRequestContext);
+
+        assertEquals(TimeValue.timeValueMinutes(1), mockSearchRequest.source().timeout());
+    }
+
+    public void testApplySearchSettings_Timeout_RequestMoreRestrictive() {
+        mockSearchRequest.source(new SearchSourceBuilder().timeout(TimeValue.timeValueSeconds(30)));
+
+        String wgId = "test-wg";
+        WorkloadGroup wg = createWorkloadGroup(wgId, Map.of("timeout", "2m"));
+        setupWorkloadGroupMetadata(Map.of(wgId, wg));
+        testThreadPool.getThreadContext().putHeader(WorkloadGroupTask.WORKLOAD_GROUP_ID_HEADER, wgId);
+
+        sut.onRequestStart(mockSearchRequestContext);
+
+        assertEquals(TimeValue.timeValueSeconds(30), mockSearchRequest.source().timeout()); // Request wins
+    }
+
+    public void testApplySearchSettings_Timeout_WlmMoreRestrictive() {
+        mockSearchRequest.source(new SearchSourceBuilder().timeout(TimeValue.timeValueMinutes(5)));
+
+        String wgId = "test-wg";
+        WorkloadGroup wg = createWorkloadGroup(wgId, Map.of("timeout", "30s"));
+        setupWorkloadGroupMetadata(Map.of(wgId, wg));
+        testThreadPool.getThreadContext().putHeader(WorkloadGroupTask.WORKLOAD_GROUP_ID_HEADER, wgId);
+
+        sut.onRequestStart(mockSearchRequestContext);
+
+        assertEquals(TimeValue.timeValueSeconds(30), mockSearchRequest.source().timeout()); // WLM wins
+    }
+
+    public void testApplySearchSettings_Timeout_NullSource() {
+        assertNull(mockSearchRequest.source());
+
+        String wgId = "test-wg";
+        WorkloadGroup wg = createWorkloadGroup(wgId, Map.of("timeout", "30s"));
+        setupWorkloadGroupMetadata(Map.of(wgId, wg));
+        testThreadPool.getThreadContext().putHeader(WorkloadGroupTask.WORKLOAD_GROUP_ID_HEADER, wgId);
+
+        sut.onRequestStart(mockSearchRequestContext);
+
+        assertNull(mockSearchRequest.source()); // Should not throw, source remains null
     }
 
     public void testApplySearchSettings_PhaseTook() {
@@ -326,6 +492,25 @@ public class WorkloadGroupRequestOperationListenerTests extends OpenSearchTestCa
 
         sut.onRequestStart(mockSearchRequestContext);
 
+        assertTrue(mockSearchRequest.isPhaseTook());
+    }
+
+    public void testApplySearchSettings_MultipleSettings() {
+        mockSearchRequest.source(new SearchSourceBuilder());
+
+        String wgId = "test-wg";
+        WorkloadGroup wg = createWorkloadGroup(
+            wgId,
+            Map.of("batched_reduce_size", "100", "max_concurrent_shard_requests", "5", "timeout", "30s", "phase_took", "true")
+        );
+        setupWorkloadGroupMetadata(Map.of(wgId, wg));
+        testThreadPool.getThreadContext().putHeader(WorkloadGroupTask.WORKLOAD_GROUP_ID_HEADER, wgId);
+
+        sut.onRequestStart(mockSearchRequestContext);
+
+        assertEquals(100, mockSearchRequest.getBatchedReduceSize());
+        assertEquals(5, mockSearchRequest.getMaxConcurrentShardRequests());
+        assertEquals(TimeValue.timeValueSeconds(30), mockSearchRequest.source().timeout());
         assertTrue(mockSearchRequest.isPhaseTook());
     }
 

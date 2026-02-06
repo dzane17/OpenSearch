@@ -17,12 +17,15 @@ import org.opensearch.action.search.SearchRequestOperationsListener;
 import org.opensearch.cluster.metadata.WorkloadGroup;
 import org.opensearch.cluster.metadata.WorkloadGroupMetadata;
 import org.opensearch.cluster.service.ClusterService;
+import org.opensearch.common.unit.TimeValue;
 import org.opensearch.threadpool.ThreadPool;
 import org.opensearch.wlm.WorkloadGroupSearchSettings;
 import org.opensearch.wlm.WorkloadGroupService;
 import org.opensearch.wlm.WorkloadGroupTask;
 
 import java.util.Map;
+
+import static java.lang.Integer.min;
 
 /**
  * This listener is used to listen for request lifecycle events for a workloadGroup
@@ -95,8 +98,56 @@ public class WorkloadGroupRequestOperationListener extends SearchRequestOperatio
                 if (settingKey == null) continue;
 
                 switch (settingKey) {
+                    case BATCHED_REDUCE_SIZE:
+                        // Raw value 0 means not explicitly set; WLM overrides default, else use more restrictive
+                        int wlmBatchedReduceSize = Integer.parseInt(entry.getValue());
+                        int requestBatchedReduceSize = searchRequest.getBatchedReduceSize();
+                        searchRequest.setBatchedReduceSize(min(wlmBatchedReduceSize, requestBatchedReduceSize));
+                        break;
+                    case CANCEL_AFTER_TIME_INTERVAL:
+                        // Null means not explicitly set; WLM overrides default, else use more restrictive
+                        TimeValue wlmValue = TimeValue.parseTimeValue(
+                            entry.getValue(),
+                            WorkloadGroupSearchSettings.WlmSearchSetting.CANCEL_AFTER_TIME_INTERVAL.getSettingName()
+                        );
+                        TimeValue requestValue = searchRequest.getCancelAfterTimeInterval();
+
+                        if (requestValue == null) {
+                            searchRequest.setCancelAfterTimeInterval(wlmValue);
+                        } else {
+                            searchRequest.setCancelAfterTimeInterval(requestValue.millis() <= wlmValue.millis() ? requestValue : wlmValue);
+                        }
+                        break;
+                    case MAX_CONCURRENT_SHARD_REQUESTS:
+                        // Raw value 0 means not explicitly set; WLM overrides default, else use more restrictive
+                        int wlmMaxConcurrent = Integer.parseInt(entry.getValue());
+                        int requestMaxConcurrent = searchRequest.getMaxConcurrentShardRequestsRaw();
+                        if (requestMaxConcurrent == 0) {
+                            searchRequest.setMaxConcurrentShardRequests(wlmMaxConcurrent);
+                        } else {
+                            searchRequest.setMaxConcurrentShardRequests(min(wlmMaxConcurrent, requestMaxConcurrent));
+                        }
+                        break;
                     case PHASE_TOOK:
                         searchRequest.setPhaseTook(Boolean.parseBoolean(entry.getValue()));
+                        break;
+                    case TIMEOUT:
+                        // Null means not explicitly set; WLM overrides default, else use more restrictive
+                        TimeValue wlmTimeout = TimeValue.parseTimeValue(
+                            entry.getValue(),
+                            WorkloadGroupSearchSettings.WlmSearchSetting.TIMEOUT.getSettingName()
+                        );
+
+                        if (searchRequest.source() == null) {
+                            break;
+                        }
+                        TimeValue requestTimeout = searchRequest.source().timeout();
+
+                        if (requestTimeout == null) {
+                            searchRequest.source().timeout(wlmTimeout);
+                        } else {
+                            searchRequest.source().timeout(requestTimeout.millis() <= wlmTimeout.millis() ? requestTimeout : wlmTimeout);
+                        }
                         break;
                 }
             } catch (Exception e) {
