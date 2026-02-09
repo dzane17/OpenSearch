@@ -8,14 +8,19 @@
 
 package org.opensearch.wlm.listeners;
 
+import org.opensearch.action.search.SearchRequest;
+import org.opensearch.action.search.SearchRequestContext;
 import org.opensearch.cluster.ClusterState;
 import org.opensearch.cluster.metadata.Metadata;
+import org.opensearch.cluster.metadata.WorkloadGroup;
+import org.opensearch.cluster.metadata.WorkloadGroupMetadata;
 import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.util.concurrent.ThreadContext;
 import org.opensearch.core.concurrency.OpenSearchRejectedExecutionException;
 import org.opensearch.test.OpenSearchTestCase;
 import org.opensearch.threadpool.TestThreadPool;
 import org.opensearch.threadpool.ThreadPool;
+import org.opensearch.wlm.MutableWorkloadGroupFragment;
 import org.opensearch.wlm.ResourceType;
 import org.opensearch.wlm.WorkloadGroupService;
 import org.opensearch.wlm.WorkloadGroupTask;
@@ -48,6 +53,8 @@ public class WorkloadGroupRequestOperationListenerTests extends OpenSearchTestCa
     Map<String, WorkloadGroupState> workloadGroupStateMap;
     String testWorkloadGroupId;
     WorkloadGroupRequestOperationListener sut;
+    SearchRequestContext mockSearchRequestContext;
+    SearchRequest mockSearchRequest;
 
     public void setUp() throws Exception {
         super.setUp();
@@ -62,7 +69,10 @@ public class WorkloadGroupRequestOperationListenerTests extends OpenSearchTestCa
         Metadata mockMetaData = mock(Metadata.class);
         when(mockClusterState.metadata()).thenReturn(mockMetaData);
         workloadGroupService = mock(WorkloadGroupService.class);
-        sut = new WorkloadGroupRequestOperationListener(workloadGroupService, testThreadPool);
+        sut = new WorkloadGroupRequestOperationListener(workloadGroupService, testThreadPool, mockClusterService);
+        mockSearchRequest = new SearchRequest();
+        mockSearchRequestContext = mock(SearchRequestContext.class);
+        when(mockSearchRequestContext.getRequest()).thenReturn(mockSearchRequest);
     }
 
     public void tearDown() throws Exception {
@@ -74,7 +84,7 @@ public class WorkloadGroupRequestOperationListenerTests extends OpenSearchTestCa
         final String testWorkloadGroupId = "asdgasgkajgkw3141_3rt4t";
         testThreadPool.getThreadContext().putHeader(WorkloadGroupTask.WORKLOAD_GROUP_ID_HEADER, testWorkloadGroupId);
         doThrow(OpenSearchRejectedExecutionException.class).when(workloadGroupService).rejectIfNeeded(testWorkloadGroupId);
-        assertThrows(OpenSearchRejectedExecutionException.class, () -> sut.onRequestStart(null));
+        assertThrows(OpenSearchRejectedExecutionException.class, () -> sut.onRequestStart(mockSearchRequestContext));
     }
 
     public void testNonRejectionCase() {
@@ -82,7 +92,7 @@ public class WorkloadGroupRequestOperationListenerTests extends OpenSearchTestCa
         testThreadPool.getThreadContext().putHeader(WorkloadGroupTask.WORKLOAD_GROUP_ID_HEADER, testWorkloadGroupId);
         doNothing().when(workloadGroupService).rejectIfNeeded(testWorkloadGroupId);
 
-        sut.onRequestStart(null);
+        sut.onRequestStart(mockSearchRequestContext);
     }
 
     public void testValidWorkloadGroupRequestFailure() throws IOException {
@@ -137,7 +147,7 @@ public class WorkloadGroupRequestOperationListenerTests extends OpenSearchTestCa
             Collections.emptySet()
         );
 
-        sut = new WorkloadGroupRequestOperationListener(workloadGroupService, testThreadPool);
+        sut = new WorkloadGroupRequestOperationListener(workloadGroupService, testThreadPool, mockClusterService);
 
         List<Thread> threads = new ArrayList<>();
         for (int i = 0; i < ITERATIONS; i++) {
@@ -255,7 +265,7 @@ public class WorkloadGroupRequestOperationListenerTests extends OpenSearchTestCa
                 Collections.emptySet(),
                 Collections.emptySet()
             );
-            sut = new WorkloadGroupRequestOperationListener(workloadGroupService, testThreadPool);
+            sut = new WorkloadGroupRequestOperationListener(workloadGroupService, testThreadPool, mockClusterService);
             sut.onRequestFailure(null, null);
 
             HashSet<String> set = new HashSet<>();
@@ -272,5 +282,73 @@ public class WorkloadGroupRequestOperationListenerTests extends OpenSearchTestCa
         when(mockClusterService.state()).thenReturn(state);
         when(state.metadata()).thenReturn(metadata);
         when(metadata.workloadGroups()).thenReturn(Collections.emptyMap());
+    }
+
+    // Tests for applyWorkloadGroupSearchSettings
+
+    public void testApplySearchSettings_NullWorkloadGroupId() {
+        // No workload group ID in thread context
+        sut.onRequestStart(mockSearchRequestContext);
+
+        // Request should remain unchanged
+        assertNull(mockSearchRequest.isPhaseTook());
+    }
+
+    public void testApplySearchSettings_NullMetadata() {
+        testThreadPool.getThreadContext().putHeader(WorkloadGroupTask.WORKLOAD_GROUP_ID_HEADER, "test-wg-id");
+        ClusterState state = mock(ClusterState.class);
+        Metadata metadata = mock(Metadata.class);
+        when(mockClusterService.state()).thenReturn(state);
+        when(state.metadata()).thenReturn(metadata);
+        when(metadata.custom(WorkloadGroupMetadata.TYPE)).thenReturn(null);
+
+        sut.onRequestStart(mockSearchRequestContext);
+
+        assertNull(mockSearchRequest.isPhaseTook());
+    }
+
+    public void testApplySearchSettings_WorkloadGroupNotFound() {
+        testThreadPool.getThreadContext().putHeader(WorkloadGroupTask.WORKLOAD_GROUP_ID_HEADER, "non-existent-id");
+        setupWorkloadGroupMetadata(Map.of());
+
+        sut.onRequestStart(mockSearchRequestContext);
+
+        assertNull(mockSearchRequest.isPhaseTook());
+    }
+
+    public void testApplySearchSettings_PhaseTook() {
+        assertNull(mockSearchRequest.isPhaseTook());
+
+        String wgId = "test-wg";
+        WorkloadGroup wg = createWorkloadGroup(wgId, Map.of("phase_took", "true"));
+        setupWorkloadGroupMetadata(Map.of(wgId, wg));
+        testThreadPool.getThreadContext().putHeader(WorkloadGroupTask.WORKLOAD_GROUP_ID_HEADER, wgId);
+
+        sut.onRequestStart(mockSearchRequestContext);
+
+        assertTrue(mockSearchRequest.isPhaseTook());
+    }
+
+    private void setupWorkloadGroupMetadata(Map<String, WorkloadGroup> workloadGroups) {
+        ClusterState state = mock(ClusterState.class);
+        Metadata metadata = mock(Metadata.class);
+        WorkloadGroupMetadata wgMetadata = new WorkloadGroupMetadata(workloadGroups);
+        when(mockClusterService.state()).thenReturn(state);
+        when(state.metadata()).thenReturn(metadata);
+        when(metadata.custom(WorkloadGroupMetadata.TYPE)).thenReturn(wgMetadata);
+        when(metadata.workloadGroups()).thenReturn(workloadGroups);
+    }
+
+    private WorkloadGroup createWorkloadGroup(String id, Map<String, String> searchSettings) {
+        return new WorkloadGroup(
+            "test-name",
+            id,
+            new MutableWorkloadGroupFragment(
+                MutableWorkloadGroupFragment.ResiliencyMode.SOFT,
+                Map.of(ResourceType.MEMORY, 0.5),
+                searchSettings
+            ),
+            System.currentTimeMillis()
+        );
     }
 }

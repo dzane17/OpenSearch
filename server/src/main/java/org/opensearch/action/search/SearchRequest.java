@@ -650,14 +650,19 @@ public class SearchRequest extends ActionRequest implements IndicesRequest.Repla
     }
 
     /**
+     * Returns the raw internal value of maxConcurrentShardRequests without applying the default.
+     */
+    public int getMaxConcurrentShardRequestsRaw() {
+        return maxConcurrentShardRequests;
+    }
+
+    /**
      * Sets the number of shard requests that should be executed concurrently on a single node. This value should be used as a
      * protection mechanism to reduce the number of shard requests fired per high level search request. Searches that hit the entire
      * cluster can be throttled with this number to reduce the cluster load. The default is {@code 5}
      */
     public void setMaxConcurrentShardRequests(int maxConcurrentShardRequests) {
-        if (maxConcurrentShardRequests < 1) {
-            throw new IllegalArgumentException("maxConcurrentShardRequests must be >= 1");
-        }
+        validatePositiveInteger(maxConcurrentShardRequests, "maxConcurrentShardRequests");
         this.maxConcurrentShardRequests = maxConcurrentShardRequests;
     }
 
@@ -675,9 +680,7 @@ public class SearchRequest extends ActionRequest implements IndicesRequest.Repla
      * </ul>
      */
     public void setPreFilterShardSize(int preFilterShardSize) {
-        if (preFilterShardSize < 1) {
-            throw new IllegalArgumentException("preFilterShardSize must be >= 1");
-        }
+        validatePositiveInteger(preFilterShardSize, "preFilterShardSize");
         this.preFilterShardSize = preFilterShardSize;
     }
 
@@ -733,6 +736,18 @@ public class SearchRequest extends ActionRequest implements IndicesRequest.Repla
         return source == null ? SearchContext.DEFAULT_TRACK_TOTAL_HITS_UP_TO
             : source.trackTotalHitsUpTo() == null ? SearchContext.DEFAULT_TRACK_TOTAL_HITS_UP_TO
             : source.trackTotalHitsUpTo();
+    }
+
+    /**
+     * Validates that an integer value is positive (>= 1).
+     * @param value the value to validate
+     * @param parameterName the name of the parameter for error messages
+     * @throws IllegalArgumentException if the value is not positive
+     */
+    public static void validatePositiveInteger(int value, String parameterName) {
+        if (value < 1) {
+            throw new IllegalArgumentException(parameterName + " must be >= 1");
+        }
     }
 
     public void setCancelAfterTimeInterval(TimeValue cancelAfterTimeInterval) {
