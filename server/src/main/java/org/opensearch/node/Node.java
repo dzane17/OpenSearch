@@ -1140,7 +1140,8 @@ public class Node implements Closeable {
 
             final WorkloadGroupRequestOperationListener workloadGroupRequestOperationListener = new WorkloadGroupRequestOperationListener(
                 workloadGroupService,
-                threadPool
+                threadPool,
+                clusterService
             );
 
             // register all standard SearchRequestOperationsCompositeListenerFactory to the SearchRequestOperationsCompositeListenerFactory
