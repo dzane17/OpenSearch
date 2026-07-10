@@ -4,7 +4,7 @@ on: [pull_request]
 jobs:
   validate:
     name: Validate
-    if: github.repository == 'opensearch-project/OpenSearch'
+    if: github.repository == 'opensearch-project/OpenSearch' || github.repository == 'dzane17/OpenSearch'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6

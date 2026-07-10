@@ -12,7 +12,7 @@ permissions:
 
 jobs:
   sandbox-check:
-    if: github.repository == 'opensearch-project/OpenSearch'
+    if: github.repository == 'opensearch-project/OpenSearch' || (github.repository == 'dzane17/OpenSearch' && github.event_name == 'pull_request')
     runs-on: ubuntu-latest
     continue-on-error: true
     timeout-minutes: 60

@@ -12,7 +12,7 @@ on:
 
 jobs:
   assemble:
-    if: github.repository == 'opensearch-project/OpenSearch'
+    if: github.repository == 'opensearch-project/OpenSearch' || github.repository == 'dzane17/OpenSearch'
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
