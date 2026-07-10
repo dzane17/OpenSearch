@@ -9,8 +9,10 @@
 package org.opensearch.cluster.metadata;
 
 import org.opensearch.common.UUIDs;
+import org.opensearch.common.io.stream.BytesStreamOutput;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.common.xcontent.json.JsonXContent;
+import org.opensearch.core.common.io.stream.StreamInput;
 import org.opensearch.core.common.io.stream.Writeable;
 import org.opensearch.core.xcontent.ToXContent;
 import org.opensearch.core.xcontent.XContentBuilder;
@@ -37,7 +39,34 @@ public class WorkloadGroupTests extends AbstractSerializingTestCase<WorkloadGrou
         String name = randomAlphaOfLength(10);
         Map<ResourceType, Double> resourceLimit = new HashMap<>();
         resourceLimit.put(ResourceType.MEMORY, randomDoubleBetween(0.0, 0.80, false));
-        return new WorkloadGroup(name, _id, new MutableWorkloadGroupFragment(randomMode(), resourceLimit), Instant.now().getMillis());
+        // Generate a valid throttle config: throttling is either fully off, or on with at least one
+        // positive limit (so the effective ceiling is >= 1) and an optional attribute.
+        String throttleAttribute = null;
+        Integer nodeThrottleLimit = null;
+        Integer sharedThrottleLimit = null;
+        if (randomBoolean()) {
+            if (randomBoolean()) {
+                nodeThrottleLimit = randomIntBetween(1, 100);
+                sharedThrottleLimit = randomBoolean() ? randomIntBetween(0, 100) : null;
+            } else {
+                sharedThrottleLimit = randomIntBetween(1, 100);
+                nodeThrottleLimit = randomBoolean() ? randomIntBetween(0, 100) : null;
+            }
+            throttleAttribute = randomBoolean() ? randomAlphaOfLength(8) : null;
+        }
+        return new WorkloadGroup(
+            name,
+            _id,
+            new MutableWorkloadGroupFragment(
+                randomMode(),
+                resourceLimit,
+                Settings.EMPTY,
+                throttleAttribute,
+                nodeThrottleLimit,
+                sharedThrottleLimit
+            ),
+            Instant.now().getMillis()
+        );
     }
 
     private static ResiliencyMode randomMode() {
@@ -374,6 +403,178 @@ public class WorkloadGroupTests extends AbstractSerializingTestCase<WorkloadGrou
         WorkloadGroup updated = WorkloadGroup.updateExistingWorkloadGroup(existing, updateFragment);
         assertEquals("1m", updated.getSettings().get("search.default_search_timeout"));
         assertEquals("true", updated.getSettings().get("override_request_values"));
+    }
+
+    public void testToXContentOmitsUnsetThrottleFields() throws IOException {
+        WorkloadGroup workloadGroup = new WorkloadGroup(
+            "test",
+            "test_id",
+            new MutableWorkloadGroupFragment(ResiliencyMode.ENFORCED, Map.of(ResourceType.MEMORY, 0.5), Settings.EMPTY),
+            System.currentTimeMillis()
+        );
+        XContentBuilder builder = JsonXContent.contentBuilder();
+        workloadGroup.toXContent(builder, ToXContent.EMPTY_PARAMS);
+        String json = builder.toString();
+        assertFalse(json.contains("throttle_attribute"));
+        assertFalse(json.contains("node_throttle_limit"));
+        assertFalse(json.contains("shared_throttle_limit"));
+    }
+
+    public void testToXContentEmitsSetThrottleFields() throws IOException {
+        long currentTimeInMillis = Instant.now().getMillis();
+        String workloadGroupId = UUIDs.randomBase64UUID();
+        WorkloadGroup workloadGroup = new WorkloadGroup(
+            "TestWorkloadGroup",
+            workloadGroupId,
+            new MutableWorkloadGroupFragment(ResiliencyMode.ENFORCED, Map.of(ResourceType.CPU, 0.30), Settings.EMPTY, "principal.username", 10, 20),
+            currentTimeInMillis
+        );
+        XContentBuilder builder = JsonXContent.contentBuilder();
+        workloadGroup.toXContent(builder, ToXContent.EMPTY_PARAMS);
+        String expected = String.format(
+            Locale.ROOT,
+            "{\"_id\":\"%s\",\"name\":\"TestWorkloadGroup\",\"resiliency_mode\":\"enforced\","
+                + "\"resource_limits\":{\"cpu\":0.3},"
+                + "\"settings\":{},"
+                + "\"throttle_attribute\":\"principal.username\","
+                + "\"node_throttle_limit\":10,"
+                + "\"shared_throttle_limit\":20,"
+                + "\"updated_at\":%d}",
+            workloadGroupId,
+            currentTimeInMillis
+        );
+        assertEquals(expected, builder.toString());
+    }
+
+    public void testNegativeThrottleLimitRejected() {
+        IllegalArgumentException exception = expectThrows(
+            IllegalArgumentException.class,
+            () -> new MutableWorkloadGroupFragment(ResiliencyMode.ENFORCED, Map.of(ResourceType.MEMORY, 0.5), Settings.EMPTY, null, -1, null)
+        );
+        assertTrue(exception.getMessage().contains("must be non-negative"));
+    }
+
+    public void testBlankThrottleAttributeRejected() {
+        IllegalArgumentException exception = expectThrows(
+            IllegalArgumentException.class,
+            () -> new MutableWorkloadGroupFragment(ResiliencyMode.ENFORCED, Map.of(ResourceType.MEMORY, 0.5), Settings.EMPTY, "  ", 5, null)
+        );
+        assertTrue(exception.getMessage().contains("can't be empty"));
+    }
+
+    public void testAttributeWithoutLimitRejected() {
+        IllegalArgumentException exception = expectThrows(
+            IllegalArgumentException.class,
+            () -> new WorkloadGroup(
+                "test",
+                "test_id",
+                new MutableWorkloadGroupFragment(ResiliencyMode.ENFORCED, Map.of(ResourceType.MEMORY, 0.5), Settings.EMPTY, "principal.username", null, null),
+                System.currentTimeMillis()
+            )
+        );
+        assertTrue(exception.getMessage().contains("must also have"));
+    }
+
+    public void testZeroEffectiveCeilingRejected() {
+        IllegalArgumentException exception = expectThrows(
+            IllegalArgumentException.class,
+            () -> new WorkloadGroup(
+                "test",
+                "test_id",
+                new MutableWorkloadGroupFragment(ResiliencyMode.ENFORCED, Map.of(ResourceType.MEMORY, 0.5), Settings.EMPTY, null, 0, null),
+                System.currentTimeMillis()
+            )
+        );
+        assertTrue(exception.getMessage().contains("Effective throttle ceiling is 0"));
+    }
+
+    public void testLimitWithoutAttributeIsValid() {
+        // No attribute with a positive limit is valid: the whole group is throttled as one bucket.
+        WorkloadGroup workloadGroup = new WorkloadGroup(
+            "test",
+            "test_id",
+            new MutableWorkloadGroupFragment(ResiliencyMode.ENFORCED, Map.of(ResourceType.MEMORY, 0.5), Settings.EMPTY, null, 5, null),
+            System.currentTimeMillis()
+        );
+        assertNull(workloadGroup.getMutableWorkloadGroupFragment().getThrottleAttribute());
+        assertEquals(Integer.valueOf(5), workloadGroup.getMutableWorkloadGroupFragment().getNodeThrottleLimit());
+    }
+
+    public void testUpdateMergesThrottleFields() {
+        WorkloadGroup existing = new WorkloadGroup(
+            "test",
+            "test_id",
+            new MutableWorkloadGroupFragment(ResiliencyMode.ENFORCED, Map.of(ResourceType.MEMORY, 0.5), Settings.EMPTY, "principal.username", 10, 20),
+            System.currentTimeMillis()
+        );
+
+        // Update only node_throttle_limit — attribute and shared limit should persist
+        MutableWorkloadGroupFragment updateFragment = new MutableWorkloadGroupFragment(null, Map.of(), Settings.EMPTY, null, 50, null);
+
+        WorkloadGroup updated = WorkloadGroup.updateExistingWorkloadGroup(existing, updateFragment);
+        assertEquals("principal.username", updated.getMutableWorkloadGroupFragment().getThrottleAttribute());
+        assertEquals(Integer.valueOf(50), updated.getMutableWorkloadGroupFragment().getNodeThrottleLimit());
+        assertEquals(Integer.valueOf(20), updated.getMutableWorkloadGroupFragment().getSharedThrottleLimit());
+    }
+
+    public void testUpdateWithNullClearsThrottleField() throws IOException {
+        WorkloadGroup existing = new WorkloadGroup(
+            "test",
+            "test_id",
+            new MutableWorkloadGroupFragment(ResiliencyMode.ENFORCED, Map.of(ResourceType.MEMORY, 0.5), Settings.EMPTY, "principal.username", 10, 20),
+            System.currentTimeMillis()
+        );
+
+        // Send explicit null for node_throttle_limit — should clear it, keep attribute and shared limit
+        String json = "{\"resource_limits\":{\"memory\":0.5},\"node_throttle_limit\":null}";
+        XContentParser parser = createParser(JsonXContent.jsonXContent, json);
+        MutableWorkloadGroupFragment updateFragment = WorkloadGroup.Builder.fromXContent(parser).getMutableWorkloadGroupFragment();
+
+        WorkloadGroup updated = WorkloadGroup.updateExistingWorkloadGroup(existing, updateFragment);
+        assertEquals("principal.username", updated.getMutableWorkloadGroupFragment().getThrottleAttribute());
+        assertNull(updated.getMutableWorkloadGroupFragment().getNodeThrottleLimit());
+        assertEquals(Integer.valueOf(20), updated.getMutableWorkloadGroupFragment().getSharedThrottleLimit());
+    }
+
+    public void testExplicitNullClearMarkerSurvivesSerialization() throws IOException {
+        // The "clear" marker is recorded on the coordinating node but consumed on the cluster-manager node,
+        // so it must survive writeTo/readFrom and still clear the field when merged.
+        String json = "{\"resource_limits\":{\"memory\":0.5},\"node_throttle_limit\":null}";
+        XContentParser parser = createParser(JsonXContent.jsonXContent, json);
+        MutableWorkloadGroupFragment updateFragment = WorkloadGroup.Builder.fromXContent(parser).getMutableWorkloadGroupFragment();
+
+        BytesStreamOutput out = new BytesStreamOutput();
+        updateFragment.writeTo(out);
+        MutableWorkloadGroupFragment deserialized = new MutableWorkloadGroupFragment(out.bytes().streamInput());
+        assertTrue(deserialized.isThrottleFieldExplicitlyNulled(MutableWorkloadGroupFragment.NODE_THROTTLE_LIMIT_STRING));
+        assertFalse(deserialized.isThrottleFieldExplicitlyNulled(MutableWorkloadGroupFragment.SHARED_THROTTLE_LIMIT_STRING));
+
+        WorkloadGroup existing = new WorkloadGroup(
+            "test",
+            "test_id",
+            new MutableWorkloadGroupFragment(ResiliencyMode.ENFORCED, Map.of(ResourceType.MEMORY, 0.5), Settings.EMPTY, "principal.username", 10, 20),
+            System.currentTimeMillis()
+        );
+        WorkloadGroup updated = WorkloadGroup.updateExistingWorkloadGroup(existing, deserialized);
+        assertNull(updated.getMutableWorkloadGroupFragment().getNodeThrottleLimit());
+        assertEquals(Integer.valueOf(20), updated.getMutableWorkloadGroupFragment().getSharedThrottleLimit());
+    }
+
+    public void testPersistedGroupDoesNotRetainClearMarkers() throws IOException {
+        // A create body that pairs a settings block with an explicit-null throttle field skips settings
+        // normalization; the constructor must still strip the request-phase "clear" marker before storing.
+        String json = "{\"resiliency_mode\":\"enforced\",\"resource_limits\":{\"memory\":0.5},"
+            + "\"settings\":{\"search.default_search_timeout\":\"30s\"},\"node_throttle_limit\":null}";
+        XContentParser parser = createParser(JsonXContent.jsonXContent, json);
+        WorkloadGroup workloadGroup = WorkloadGroup.Builder.fromXContent(parser)
+            .name("test")
+            ._id("test_id")
+            .updatedAt(System.currentTimeMillis())
+            .build();
+
+        assertFalse(
+            workloadGroup.getMutableWorkloadGroupFragment().isThrottleFieldExplicitlyNulled(MutableWorkloadGroupFragment.NODE_THROTTLE_LIMIT_STRING)
+        );
     }
 
     public void testSettingsNullFromXContentClearsSettings() throws IOException {

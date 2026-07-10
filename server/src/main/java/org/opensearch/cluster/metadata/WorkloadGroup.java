@@ -79,14 +79,60 @@ public class WorkloadGroup extends AbstractDiffable<WorkloadGroup> implements To
             mutableWorkloadGroupFragment = new MutableWorkloadGroupFragment(
                 mutableWorkloadGroupFragment.getResiliencyMode(),
                 mutableWorkloadGroupFragment.getResourceLimits(),
-                Settings.EMPTY
+                Settings.EMPTY,
+                mutableWorkloadGroupFragment.getThrottleAttribute(),
+                mutableWorkloadGroupFragment.getNodeThrottleLimit(),
+                mutableWorkloadGroupFragment.getSharedThrottleLimit()
             );
         }
+
+        validateThrottleConfiguration(mutableWorkloadGroupFragment);
+
+        // A persisted group has no pending "clear" intent, so drop any request-phase explicit-null markers before storing
+        mutableWorkloadGroupFragment.clearExplicitlyNulledThrottleFields();
 
         this.name = name;
         this._id = _id;
         this.mutableWorkloadGroupFragment = mutableWorkloadGroupFragment;
         this.updatedAtInMillis = updatedAt;
+    }
+
+    /**
+     * Cross-field validation for the throttle configuration on a fully-merged WorkloadGroup.
+     * Rules:
+     * 1. throttle_attribute set without any limit → reject (nothing to enforce).
+     * 2. If throttling is enabled (at least one limit non-null), the effective ceiling
+     *    {@code (node ?? 0) + (shared ?? 0)} must be ≥ 1 (both effectively zero → rejects everything).
+     */
+    private static void validateThrottleConfiguration(MutableWorkloadGroupFragment fragment) {
+        String attr = fragment.getThrottleAttribute();
+        Integer node = fragment.getNodeThrottleLimit();
+        Integer shared = fragment.getSharedThrottleLimit();
+
+        boolean hasAttribute = attr != null;
+        boolean hasAnyLimit = node != null || shared != null;
+
+        if (hasAttribute && !hasAnyLimit) {
+            throw new IllegalArgumentException(
+                "A workload group with throttle_attribute must also have node_throttle_limit and/or "
+                    + "shared_throttle_limit; the resulting configuration has throttle_attribute but neither limit"
+            );
+        }
+
+        if (hasAnyLimit) {
+            int effectiveNode = node != null ? node : 0;
+            int effectiveShared = shared != null ? shared : 0;
+            if (effectiveNode + effectiveShared < 1) {
+                throw new IllegalArgumentException(
+                    "Effective throttle ceiling is 0 (node_throttle_limit="
+                        + node
+                        + ", shared_throttle_limit="
+                        + shared
+                        + "); this would reject all requests. "
+                        + "At least one limit must be positive, or both must be unset to disable throttling"
+                );
+            }
+        }
     }
 
     public static boolean isValid(long updatedAt) {
@@ -114,10 +160,21 @@ public class WorkloadGroup extends AbstractDiffable<WorkloadGroup> implements To
         }
         final ResiliencyMode mode = Optional.ofNullable(mutableWorkloadGroupFragment.getResiliencyMode())
             .orElse(existingGroup.getResiliencyMode());
-        // Handle settings update with merge semantics:
-        // null settings = not specified in request (keep existing)
-        // empty Settings = clear all settings
-        // non-empty Settings = merge with existing; keys with null values are removed
+        final String throttleAttribute = mergeThrottleField(
+            mutableWorkloadGroupFragment.getThrottleAttribute(),
+            existingGroup.getMutableWorkloadGroupFragment().getThrottleAttribute(),
+            mutableWorkloadGroupFragment.isThrottleFieldExplicitlyNulled(MutableWorkloadGroupFragment.THROTTLE_ATTRIBUTE_STRING)
+        );
+        final Integer nodeThrottleLimit = mergeThrottleField(
+            mutableWorkloadGroupFragment.getNodeThrottleLimit(),
+            existingGroup.getMutableWorkloadGroupFragment().getNodeThrottleLimit(),
+            mutableWorkloadGroupFragment.isThrottleFieldExplicitlyNulled(MutableWorkloadGroupFragment.NODE_THROTTLE_LIMIT_STRING)
+        );
+        final Integer sharedThrottleLimit = mergeThrottleField(
+            mutableWorkloadGroupFragment.getSharedThrottleLimit(),
+            existingGroup.getMutableWorkloadGroupFragment().getSharedThrottleLimit(),
+            mutableWorkloadGroupFragment.isThrottleFieldExplicitlyNulled(MutableWorkloadGroupFragment.SHARED_THROTTLE_LIMIT_STRING)
+        );
         final Settings mutableFragmentSettings = mutableWorkloadGroupFragment.getSettings();
         final Settings updatedSettings;
         if (mutableFragmentSettings == null) {
@@ -143,7 +200,14 @@ public class WorkloadGroup extends AbstractDiffable<WorkloadGroup> implements To
         return new WorkloadGroup(
             existingGroup.getName(),
             existingGroup.get_id(),
-            new MutableWorkloadGroupFragment(mode, updatedResourceLimits, updatedSettings),
+            new MutableWorkloadGroupFragment(
+                mode,
+                updatedResourceLimits,
+                updatedSettings,
+                throttleAttribute,
+                nodeThrottleLimit,
+                sharedThrottleLimit
+            ),
             Instant.now().getMillis()
         );
     }
@@ -242,6 +306,13 @@ public class WorkloadGroup extends AbstractDiffable<WorkloadGroup> implements To
         return updatedAtInMillis;
     }
 
+    private static <T> T mergeThrottleField(T requestValue, T existingValue, boolean explicitlyNulled) {
+        if (explicitlyNulled) {
+            return null;
+        }
+        return requestValue != null ? requestValue : existingValue;
+    }
+
     /**
      * builder method for the {@link WorkloadGroup}
      * @return Builder object
@@ -298,8 +369,10 @@ public class WorkloadGroup extends AbstractDiffable<WorkloadGroup> implements To
                     }
                     mutableWorkloadGroupFragment1.parseField(parser, fieldName);
                 } else if (token == XContentParser.Token.VALUE_NULL) {
-                    if (fieldName.equals(MutableWorkloadGroupFragment.SETTINGS_STRING)) {
-                        // "settings": null means clear all settings
+                    if (fieldName.equals(MutableWorkloadGroupFragment.SETTINGS_STRING)
+                        || fieldName.equals(MutableWorkloadGroupFragment.THROTTLE_ATTRIBUTE_STRING)
+                        || fieldName.equals(MutableWorkloadGroupFragment.NODE_THROTTLE_LIMIT_STRING)
+                        || fieldName.equals(MutableWorkloadGroupFragment.SHARED_THROTTLE_LIMIT_STRING)) {
                         mutableWorkloadGroupFragment1.parseField(parser, fieldName);
                     }
                 }
