@@ -22,6 +22,7 @@ import org.opensearch.core.xcontent.XContentParser;
 import org.opensearch.wlm.MutableWorkloadGroupFragment;
 import org.opensearch.wlm.MutableWorkloadGroupFragment.ResiliencyMode;
 import org.opensearch.wlm.ResourceType;
+import org.opensearch.wlm.WorkloadGroupThrottleSettings;
 import org.joda.time.Instant;
 
 import java.io.IOException;
@@ -74,65 +75,26 @@ public class WorkloadGroup extends AbstractDiffable<WorkloadGroup> implements To
             throw new IllegalArgumentException("WorkloadGroup.updatedAtInMillis is not a valid epoch");
         }
 
-        // Normalize null settings to empty Settings for storage
-        if (mutableWorkloadGroupFragment.getSettings() == null) {
+        // Drop null-valued "clear" keys before storage (meaningful only during an update merge, not on create).
+        Settings normalizedSettings = stripClearMarkers(mutableWorkloadGroupFragment.getSettings());
+        Settings normalizedThrottling = stripClearMarkers(mutableWorkloadGroupFragment.getThrottling());
+        if (normalizedSettings.equals(mutableWorkloadGroupFragment.getSettings()) == false
+            || normalizedThrottling.equals(mutableWorkloadGroupFragment.getThrottling()) == false) {
             mutableWorkloadGroupFragment = new MutableWorkloadGroupFragment(
                 mutableWorkloadGroupFragment.getResiliencyMode(),
                 mutableWorkloadGroupFragment.getResourceLimits(),
-                Settings.EMPTY,
-                mutableWorkloadGroupFragment.getThrottleAttribute(),
-                mutableWorkloadGroupFragment.getNodeThrottleLimit(),
-                mutableWorkloadGroupFragment.getSharedThrottleLimit()
+                normalizedSettings,
+                normalizedThrottling
             );
         }
 
-        validateThrottleConfiguration(mutableWorkloadGroupFragment);
-
-        // A persisted group has no pending "clear" intent, so drop any request-phase explicit-null markers before storing
-        mutableWorkloadGroupFragment.clearExplicitlyNulledThrottleFields();
+        // Cross-field check on the fully-merged throttling config (an effective ceiling of 0 rejects all requests).
+        WorkloadGroupThrottleSettings.validateCeiling(mutableWorkloadGroupFragment.getThrottling());
 
         this.name = name;
         this._id = _id;
         this.mutableWorkloadGroupFragment = mutableWorkloadGroupFragment;
         this.updatedAtInMillis = updatedAt;
-    }
-
-    /**
-     * Cross-field validation for the throttle configuration on a fully-merged WorkloadGroup.
-     * Rules:
-     * 1. throttle_attribute set without any limit → reject (nothing to enforce).
-     * 2. If throttling is enabled (at least one limit non-null), the effective ceiling
-     *    {@code (node ?? 0) + (shared ?? 0)} must be ≥ 1 (both effectively zero → rejects everything).
-     */
-    private static void validateThrottleConfiguration(MutableWorkloadGroupFragment fragment) {
-        String attr = fragment.getThrottleAttribute();
-        Integer node = fragment.getNodeThrottleLimit();
-        Integer shared = fragment.getSharedThrottleLimit();
-
-        boolean hasAttribute = attr != null;
-        boolean hasAnyLimit = node != null || shared != null;
-
-        if (hasAttribute && !hasAnyLimit) {
-            throw new IllegalArgumentException(
-                "A workload group with throttle_attribute must also have node_throttle_limit and/or "
-                    + "shared_throttle_limit; the resulting configuration has throttle_attribute but neither limit"
-            );
-        }
-
-        if (hasAnyLimit) {
-            int effectiveNode = node != null ? node : 0;
-            int effectiveShared = shared != null ? shared : 0;
-            if (effectiveNode + effectiveShared < 1) {
-                throw new IllegalArgumentException(
-                    "Effective throttle ceiling is 0 (node_throttle_limit="
-                        + node
-                        + ", shared_throttle_limit="
-                        + shared
-                        + "); this would reject all requests. "
-                        + "At least one limit must be positive, or both must be unset to disable throttling"
-                );
-            }
-        }
     }
 
     public static boolean isValid(long updatedAt) {
@@ -160,56 +122,67 @@ public class WorkloadGroup extends AbstractDiffable<WorkloadGroup> implements To
         }
         final ResiliencyMode mode = Optional.ofNullable(mutableWorkloadGroupFragment.getResiliencyMode())
             .orElse(existingGroup.getResiliencyMode());
-        final String throttleAttribute = mergeThrottleField(
-            mutableWorkloadGroupFragment.getThrottleAttribute(),
-            existingGroup.getMutableWorkloadGroupFragment().getThrottleAttribute(),
-            mutableWorkloadGroupFragment.isThrottleFieldExplicitlyNulled(MutableWorkloadGroupFragment.THROTTLE_ATTRIBUTE_STRING)
+        final Settings updatedSettings = mergeSettings(existingGroup.getSettings(), mutableWorkloadGroupFragment.getSettings());
+        final Settings updatedThrottling = mergeSettings(
+            existingGroup.getMutableWorkloadGroupFragment().getThrottling(),
+            mutableWorkloadGroupFragment.getThrottling()
         );
-        final Integer nodeThrottleLimit = mergeThrottleField(
-            mutableWorkloadGroupFragment.getNodeThrottleLimit(),
-            existingGroup.getMutableWorkloadGroupFragment().getNodeThrottleLimit(),
-            mutableWorkloadGroupFragment.isThrottleFieldExplicitlyNulled(MutableWorkloadGroupFragment.NODE_THROTTLE_LIMIT_STRING)
-        );
-        final Integer sharedThrottleLimit = mergeThrottleField(
-            mutableWorkloadGroupFragment.getSharedThrottleLimit(),
-            existingGroup.getMutableWorkloadGroupFragment().getSharedThrottleLimit(),
-            mutableWorkloadGroupFragment.isThrottleFieldExplicitlyNulled(MutableWorkloadGroupFragment.SHARED_THROTTLE_LIMIT_STRING)
-        );
-        final Settings mutableFragmentSettings = mutableWorkloadGroupFragment.getSettings();
-        final Settings updatedSettings;
-        if (mutableFragmentSettings == null) {
-            // Not specified - keep existing
-            updatedSettings = Settings.builder().put(existingGroup.getSettings()).build();
-        } else if (mutableFragmentSettings.isEmpty()) {
-            // Explicitly empty - clear all settings
-            updatedSettings = Settings.EMPTY;
-        } else {
-            // Merge: start with existing settings, overlay new values, remove null-valued keys
-            Settings.Builder builder = Settings.builder().put(existingGroup.getSettings());
-            for (String key : mutableFragmentSettings.keySet()) {
-                String value = mutableFragmentSettings.get(key);
-                if (value == null) {
-                    // null value means "clear this setting"
-                    builder.remove(key);
-                } else {
-                    builder.put(key, value);
-                }
-            }
-            updatedSettings = builder.build();
-        }
         return new WorkloadGroup(
             existingGroup.getName(),
             existingGroup.get_id(),
-            new MutableWorkloadGroupFragment(
-                mode,
-                updatedResourceLimits,
-                updatedSettings,
-                throttleAttribute,
-                nodeThrottleLimit,
-                sharedThrottleLimit
-            ),
+            new MutableWorkloadGroupFragment(mode, updatedResourceLimits, updatedSettings, updatedThrottling),
             Instant.now().getMillis()
         );
+    }
+
+    /**
+     * Drops null-valued keys from a settings bag before storage. A null value is the API gesture for "clear this key",
+     * which only carries meaning during an update merge (which consumes it); any that reach a persisted group, e.g. a
+     * null sent on create where there is nothing to clear, are dropped so stored config never contains a null value.
+     *
+     * @param s the settings to normalize (may be null)
+     * @return the settings with all null-valued keys removed, or empty if {@code s} is null
+     */
+    private static Settings stripClearMarkers(Settings s) {
+        if (s == null) {
+            return Settings.EMPTY;
+        }
+        Settings.Builder builder = Settings.builder();
+        for (String key : s.keySet()) {
+            String value = s.get(key);
+            if (value != null) {
+                builder.put(key, value);
+            }
+        }
+        return builder.build();
+    }
+
+    /**
+     * Merges an incoming settings bag from an update request onto the existing one:
+     * a null incoming bag (field absent) keeps existing, an empty incoming bag clears all, and a non-empty bag overlays
+     * its values with a per-key null value clearing that key.
+     *
+     * @param existing the currently stored settings
+     * @param incoming the settings from the update request (may be null)
+     * @return the merged settings
+     */
+    private static Settings mergeSettings(Settings existing, Settings incoming) {
+        if (incoming == null) {
+            return Settings.builder().put(existing).build();
+        }
+        if (incoming.isEmpty()) {
+            return Settings.EMPTY;
+        }
+        Settings.Builder builder = Settings.builder().put(existing);
+        for (String key : incoming.keySet()) {
+            String value = incoming.get(key);
+            if (value == null) {
+                builder.remove(key);
+            } else {
+                builder.put(key, value);
+            }
+        }
+        return builder.build();
     }
 
     @Override
@@ -306,13 +279,6 @@ public class WorkloadGroup extends AbstractDiffable<WorkloadGroup> implements To
         return updatedAtInMillis;
     }
 
-    private static <T> T mergeThrottleField(T requestValue, T existingValue, boolean explicitlyNulled) {
-        if (explicitlyNulled) {
-            return null;
-        }
-        return requestValue != null ? requestValue : existingValue;
-    }
-
     /**
      * builder method for the {@link WorkloadGroup}
      * @return Builder object
@@ -370,9 +336,7 @@ public class WorkloadGroup extends AbstractDiffable<WorkloadGroup> implements To
                     mutableWorkloadGroupFragment1.parseField(parser, fieldName);
                 } else if (token == XContentParser.Token.VALUE_NULL) {
                     if (fieldName.equals(MutableWorkloadGroupFragment.SETTINGS_STRING)
-                        || fieldName.equals(MutableWorkloadGroupFragment.THROTTLE_ATTRIBUTE_STRING)
-                        || fieldName.equals(MutableWorkloadGroupFragment.NODE_THROTTLE_LIMIT_STRING)
-                        || fieldName.equals(MutableWorkloadGroupFragment.SHARED_THROTTLE_LIMIT_STRING)) {
+                        || fieldName.equals(MutableWorkloadGroupFragment.THROTTLING_STRING)) {
                         mutableWorkloadGroupFragment1.parseField(parser, fieldName);
                     }
                 }
