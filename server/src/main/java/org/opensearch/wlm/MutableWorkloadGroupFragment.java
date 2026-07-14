@@ -265,6 +265,7 @@ public class MutableWorkloadGroupFragment extends AbstractDiffable<MutableWorklo
         out.writeOptionalString(resiliencyMode == null ? null : resiliencyMode.getName());
         if (out.getVersion().onOrAfter(Version.V_3_7_0)) {
             Settings.writeOptionalSettingsToStream(settings, out);
+            // TODO: when upstreamed, gate throttling behind its own release version to support mixed-build clusters.
             Settings.writeOptionalSettingsToStream(throttling, out);
         } else if (out.getVersion().onOrAfter(Version.V_3_6_0)) {
             // Legacy 3.6 format: write empty map (experimental API, settings not preserved across versions)

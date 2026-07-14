@@ -26,8 +26,8 @@ public class WorkloadGroupThrottleSettings {
     /** Sentinel for an unset limit, matching the {@code -1 = not set} convention of {@code WLM_SEARCH_TIMEOUT}. */
     public static final int UNSET_LIMIT = -1;
 
-    /** Dimension the limit is keyed by: {@code group} (default, whole group) or per {@code username} / {@code role}. */
-    public static final Setting<String> ATTRIBUTE = Setting.simpleString("attribute", "group");
+    /** Dimension the limit is keyed by: {@code group} (whole group) or per {@code username} / {@code role}. No default: unset when absent. */
+    public static final Setting<String> ATTRIBUTE = Setting.simpleString("attribute");
 
     /** Per-node in-flight allowance admitted locally with no coordination. {@code -1} means unset. */
     public static final Setting<Integer> NODE_LIMIT = Setting.intSetting("node_limit", UNSET_LIMIT, UNSET_LIMIT);
@@ -54,8 +54,8 @@ public class WorkloadGroupThrottleSettings {
     /**
      * Per-key validation: every key must be registered, {@code attribute} must be an allowed value, and each limit
      * must be a non-negative integer ({@code -1} is the internal "unset" sentinel and is not user-settable). Safe to
-     * run on a partial fragment from an update request; the cross-field ceiling check lives in
-     * {@link #validateCeiling(Settings)}.
+     * run on a partial fragment from an update request; the cross-field checks live in
+     * {@link #validateMergedConfig(Settings)}.
      *
      * @param throttling the throttling settings to validate
      * @throws IllegalArgumentException if any key is unknown or any value is invalid
@@ -100,17 +100,26 @@ public class WorkloadGroupThrottleSettings {
     }
 
     /**
-     * Cross-field validation on a fully-merged throttling config: if throttling is configured, the effective ceiling
-     * {@code max(0, node_limit) + max(0, shared_limit)} must be at least 1, since a ceiling of 0 rejects every request.
-     * Must be called on the merged result, not a partial update fragment.
+     * Cross-field validation on a fully-merged throttling config. A limit may only be set alongside an attribute
+     * (a limit with no attribute is meaningless), and when throttling is configured the effective ceiling
+     * {@code max(0, node_limit) + max(0, shared_limit)} must be at least 1, since a ceiling of 0 rejects every
+     * request. Must be called on the merged result, not a partial update fragment.
      *
      * @param throttling the merged throttling settings
-     * @throws IllegalArgumentException if throttling is configured but its effective ceiling is 0
+     * @throws IllegalArgumentException if a limit is set without an attribute, or the effective ceiling is 0
      */
-    public static void validateCeiling(Settings throttling) {
+    public static void validateMergedConfig(Settings throttling) {
         if (throttling == null || throttling.isEmpty()) {
             return;
         }
+        boolean hasAttribute = throttling.hasValue(ATTRIBUTE.getKey());
+        boolean hasNode = throttling.hasValue(NODE_LIMIT.getKey());
+        boolean hasShared = throttling.hasValue(SHARED_LIMIT.getKey());
+
+        if ((hasNode || hasShared) && hasAttribute == false) {
+            throw new IllegalArgumentException("throttling.attribute is required when a throttle limit is set");
+        }
+
         int node = NODE_LIMIT.get(throttling);
         int shared = SHARED_LIMIT.get(throttling);
         if (Math.max(0, node) + Math.max(0, shared) < 1) {

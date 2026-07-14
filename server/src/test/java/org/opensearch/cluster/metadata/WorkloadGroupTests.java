@@ -38,10 +38,11 @@ public class WorkloadGroupTests extends AbstractSerializingTestCase<WorkloadGrou
         String name = randomAlphaOfLength(10);
         Map<ResourceType, Double> resourceLimit = new HashMap<>();
         resourceLimit.put(ResourceType.MEMORY, randomDoubleBetween(0.0, 0.80, false));
-        // Generate a valid throttling config: either disabled (empty), or enabled with at least one positive
-        // limit (so the effective ceiling is >= 1) and an optional attribute.
+        // Generate a valid throttling config: either disabled (empty), or enabled with a required attribute plus
+        // at least one positive limit (so the effective ceiling is >= 1).
         Settings.Builder throttling = Settings.builder();
         if (randomBoolean()) {
+            throttling.put("attribute", randomFrom("group", "username", "role"));
             if (randomBoolean()) {
                 throttling.put("node_limit", randomIntBetween(1, 100));
                 if (randomBoolean()) {
@@ -52,9 +53,6 @@ public class WorkloadGroupTests extends AbstractSerializingTestCase<WorkloadGrou
                 if (randomBoolean()) {
                     throttling.put("node_limit", randomIntBetween(0, 100));
                 }
-            }
-            if (randomBoolean()) {
-                throttling.put("attribute", randomFrom("group", "username", "role"));
             }
         }
         return new WorkloadGroup(
@@ -490,7 +488,7 @@ public class WorkloadGroupTests extends AbstractSerializingTestCase<WorkloadGrou
                     ResiliencyMode.ENFORCED,
                     Map.of(ResourceType.MEMORY, 0.5),
                     Settings.EMPTY,
-                    Settings.builder().put("node_limit", 0).build()
+                    Settings.builder().put("attribute", "username").put("node_limit", 0).build()
                 ),
                 System.currentTimeMillis()
             )
@@ -528,7 +526,7 @@ public class WorkloadGroupTests extends AbstractSerializingTestCase<WorkloadGrou
                 ResiliencyMode.ENFORCED,
                 Map.of(ResourceType.MEMORY, 0.5),
                 Settings.EMPTY,
-                Settings.builder().put("node_limit", 0).put("shared_limit", 10).build()
+                Settings.builder().put("attribute", "username").put("node_limit", 0).put("shared_limit", 10).build()
             ),
             System.currentTimeMillis()
         );
@@ -537,8 +535,27 @@ public class WorkloadGroupTests extends AbstractSerializingTestCase<WorkloadGrou
         assertEquals(Integer.valueOf(10), WorkloadGroupThrottleSettings.SHARED_LIMIT.get(throttling));
     }
 
-    public void testThrottlingWithoutAttributeDefaultsToGroup() {
-        // A limit with no attribute is valid; the attribute setting resolves to its "group" default.
+    public void testLimitWithoutAttributeRejected() {
+        // A throttle limit requires an attribute; a limit with no attribute is rejected.
+        IllegalArgumentException exception = expectThrows(
+            IllegalArgumentException.class,
+            () -> new WorkloadGroup(
+                "test",
+                "test_id",
+                new MutableWorkloadGroupFragment(
+                    ResiliencyMode.ENFORCED,
+                    Map.of(ResourceType.MEMORY, 0.5),
+                    Settings.EMPTY,
+                    Settings.builder().put("node_limit", 5).build()
+                ),
+                System.currentTimeMillis()
+            )
+        );
+        assertTrue(exception.getMessage().contains("throttling.attribute is required"));
+    }
+
+    public void testWholeGroupThrottleWithExplicitAttribute() {
+        // attribute has no default; whole-group throttling must be requested explicitly with attribute=group.
         WorkloadGroup workloadGroup = new WorkloadGroup(
             "test",
             "test_id",
@@ -546,7 +563,7 @@ public class WorkloadGroupTests extends AbstractSerializingTestCase<WorkloadGrou
                 ResiliencyMode.ENFORCED,
                 Map.of(ResourceType.MEMORY, 0.5),
                 Settings.EMPTY,
-                Settings.builder().put("node_limit", 5).build()
+                Settings.builder().put("attribute", "group").put("node_limit", 5).build()
             ),
             System.currentTimeMillis()
         );
@@ -635,7 +652,7 @@ public class WorkloadGroupTests extends AbstractSerializingTestCase<WorkloadGrou
         // all-null throttling object therefore collapses to empty (disabled) instead of hitting a ceiling error.
         WorkloadGroup partial = parseCreate(
             "{\"resiliency_mode\":\"enforced\",\"resource_limits\":{\"memory\":0.5},"
-                + "\"throttling\":{\"node_limit\":10,\"shared_limit\":null}}"
+                + "\"throttling\":{\"attribute\":\"username\",\"node_limit\":10,\"shared_limit\":null}}"
         );
         Settings throttling = partial.getMutableWorkloadGroupFragment().getThrottling();
         assertEquals(Integer.valueOf(10), WorkloadGroupThrottleSettings.NODE_LIMIT.get(throttling));

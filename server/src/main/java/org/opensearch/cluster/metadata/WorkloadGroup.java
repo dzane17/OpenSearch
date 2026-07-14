@@ -88,8 +88,8 @@ public class WorkloadGroup extends AbstractDiffable<WorkloadGroup> implements To
             );
         }
 
-        // Cross-field check on the fully-merged throttling config (an effective ceiling of 0 rejects all requests).
-        WorkloadGroupThrottleSettings.validateCeiling(mutableWorkloadGroupFragment.getThrottling());
+        // Cross-field checks on the merged throttling config (attribute required with a limit; ceiling must be >= 1).
+        WorkloadGroupThrottleSettings.validateMergedConfig(mutableWorkloadGroupFragment.getThrottling());
 
         this.name = name;
         this._id = _id;
