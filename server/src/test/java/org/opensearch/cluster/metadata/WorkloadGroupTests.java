@@ -430,7 +430,7 @@ public class WorkloadGroupTests extends AbstractSerializingTestCase<WorkloadGrou
             "{\"_id\":\"%s\",\"name\":\"TestWorkloadGroup\",\"resiliency_mode\":\"enforced\","
                 + "\"resource_limits\":{\"cpu\":0.3},"
                 + "\"settings\":{},"
-                + "\"throttling\":{\"attribute\":\"username\",\"node_limit\":\"10\",\"shared_limit\":\"20\"},"
+                + "\"throttling\":{\"attribute\":\"username\",\"node_limit\":10,\"shared_limit\":20},"
                 + "\"updated_at\":%d}",
             workloadGroupId,
             currentTimeInMillis
@@ -498,6 +498,27 @@ public class WorkloadGroupTests extends AbstractSerializingTestCase<WorkloadGrou
         assertTrue(exception.getMessage().contains("Effective throttle ceiling is 0"));
     }
 
+    public void testCeilingErrorDoesNotLeakUnsetSentinel() {
+        // attribute set but no limits: both resolve to the -1 sentinel; the message must show "unset", not -1.
+        IllegalArgumentException exception = expectThrows(
+            IllegalArgumentException.class,
+            () -> new WorkloadGroup(
+                "test",
+                "test_id",
+                new MutableWorkloadGroupFragment(
+                    ResiliencyMode.ENFORCED,
+                    Map.of(ResourceType.MEMORY, 0.5),
+                    Settings.EMPTY,
+                    Settings.builder().put("attribute", "username").build()
+                ),
+                System.currentTimeMillis()
+            )
+        );
+        assertTrue(exception.getMessage().contains("node_limit=unset"));
+        assertTrue(exception.getMessage().contains("shared_limit=unset"));
+        assertFalse(exception.getMessage().contains("-1"));
+    }
+
     public void testZeroLimitValidWhenOtherLimitPositive() {
         // node_limit=0 is fine as long as the effective ceiling is >= 1 (shared_limit carries it).
         WorkloadGroup workloadGroup = new WorkloadGroup(
@@ -512,8 +533,8 @@ public class WorkloadGroupTests extends AbstractSerializingTestCase<WorkloadGrou
             System.currentTimeMillis()
         );
         Settings throttling = workloadGroup.getMutableWorkloadGroupFragment().getThrottling();
-        assertEquals("0", throttling.get("node_limit"));
-        assertEquals("10", throttling.get("shared_limit"));
+        assertEquals(Integer.valueOf(0), WorkloadGroupThrottleSettings.NODE_LIMIT.get(throttling));
+        assertEquals(Integer.valueOf(10), WorkloadGroupThrottleSettings.SHARED_LIMIT.get(throttling));
     }
 
     public void testThrottlingWithoutAttributeDefaultsToGroup() {
@@ -557,9 +578,9 @@ public class WorkloadGroupTests extends AbstractSerializingTestCase<WorkloadGrou
 
         WorkloadGroup updated = WorkloadGroup.updateExistingWorkloadGroup(existing, updateFragment);
         Settings throttling = updated.getMutableWorkloadGroupFragment().getThrottling();
-        assertEquals("username", throttling.get("attribute"));
-        assertEquals("50", throttling.get("node_limit"));
-        assertEquals("20", throttling.get("shared_limit"));
+        assertEquals("username", WorkloadGroupThrottleSettings.ATTRIBUTE.get(throttling));
+        assertEquals(Integer.valueOf(50), WorkloadGroupThrottleSettings.NODE_LIMIT.get(throttling));
+        assertEquals(Integer.valueOf(20), WorkloadGroupThrottleSettings.SHARED_LIMIT.get(throttling));
     }
 
     public void testUpdateWithNullClearsThrottleKey() throws IOException {
@@ -582,9 +603,9 @@ public class WorkloadGroupTests extends AbstractSerializingTestCase<WorkloadGrou
 
         WorkloadGroup updated = WorkloadGroup.updateExistingWorkloadGroup(existing, updateFragment);
         Settings throttling = updated.getMutableWorkloadGroupFragment().getThrottling();
-        assertEquals("username", throttling.get("attribute"));
-        assertNull(throttling.get("node_limit"));
-        assertEquals("20", throttling.get("shared_limit"));
+        assertEquals("username", WorkloadGroupThrottleSettings.ATTRIBUTE.get(throttling));
+        assertNull(throttling.get("node_limit")); // raw check: cleared key is absent (typed getter would return the -1 default)
+        assertEquals(Integer.valueOf(20), WorkloadGroupThrottleSettings.SHARED_LIMIT.get(throttling));
     }
 
     public void testUpdateWithNullThrottlingObjectDisables() throws IOException {
@@ -617,8 +638,8 @@ public class WorkloadGroupTests extends AbstractSerializingTestCase<WorkloadGrou
                 + "\"throttling\":{\"node_limit\":10,\"shared_limit\":null}}"
         );
         Settings throttling = partial.getMutableWorkloadGroupFragment().getThrottling();
-        assertEquals("10", throttling.get("node_limit"));
-        assertFalse(throttling.keySet().contains("shared_limit"));
+        assertEquals(Integer.valueOf(10), WorkloadGroupThrottleSettings.NODE_LIMIT.get(throttling));
+        assertFalse(throttling.keySet().contains("shared_limit")); // raw check: null-valued key was dropped, not persisted
 
         WorkloadGroup allNull = parseCreate(
             "{\"resiliency_mode\":\"enforced\",\"resource_limits\":{\"memory\":0.5}," + "\"throttling\":{\"node_limit\":null}}"

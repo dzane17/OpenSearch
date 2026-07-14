@@ -116,11 +116,11 @@ public class WorkloadGroupThrottleSettings {
         if (Math.max(0, node) + Math.max(0, shared) < 1) {
             throw new IllegalArgumentException(
                 "Effective throttle ceiling is 0 (node_limit="
-                    + node
+                    + (node == UNSET_LIMIT ? "unset" : node)
                     + ", shared_limit="
-                    + shared
+                    + (shared == UNSET_LIMIT ? "unset" : shared)
                     + "); this would reject all requests. "
-                    + "Set at least one limit to a positive value, or send \"throttling\": null to disable throttling"
+                    + "Set at least one limit to a positive value, or set throttling as null to disable throttling"
             );
         }
     }

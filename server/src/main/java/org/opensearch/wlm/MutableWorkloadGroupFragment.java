@@ -199,7 +199,15 @@ public class MutableWorkloadGroupFragment extends AbstractDiffable<MutableWorklo
             Settings t = throttling != null ? throttling : Settings.EMPTY;
             if (t.isEmpty() == false) {
                 builder.startObject(THROTTLING_STRING);
-                writeSettingsFields(builder, t);
+                if (t.hasValue(WorkloadGroupThrottleSettings.ATTRIBUTE.getKey())) {
+                    builder.field(WorkloadGroupThrottleSettings.ATTRIBUTE.getKey(), WorkloadGroupThrottleSettings.ATTRIBUTE.get(t));
+                }
+                if (t.hasValue(WorkloadGroupThrottleSettings.NODE_LIMIT.getKey())) {
+                    builder.field(WorkloadGroupThrottleSettings.NODE_LIMIT.getKey(), WorkloadGroupThrottleSettings.NODE_LIMIT.get(t));
+                }
+                if (t.hasValue(WorkloadGroupThrottleSettings.SHARED_LIMIT.getKey())) {
+                    builder.field(WorkloadGroupThrottleSettings.SHARED_LIMIT.getKey(), WorkloadGroupThrottleSettings.SHARED_LIMIT.get(t));
+                }
                 builder.endObject();
             }
             return null;
