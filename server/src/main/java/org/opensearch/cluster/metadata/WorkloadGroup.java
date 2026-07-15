@@ -22,6 +22,7 @@ import org.opensearch.core.xcontent.XContentParser;
 import org.opensearch.wlm.MutableWorkloadGroupFragment;
 import org.opensearch.wlm.MutableWorkloadGroupFragment.ResiliencyMode;
 import org.opensearch.wlm.ResourceType;
+import org.opensearch.wlm.WorkloadGroupThrottleSettings;
 import org.joda.time.Instant;
 
 import java.io.IOException;
@@ -74,14 +75,21 @@ public class WorkloadGroup extends AbstractDiffable<WorkloadGroup> implements To
             throw new IllegalArgumentException("WorkloadGroup.updatedAtInMillis is not a valid epoch");
         }
 
-        // Normalize null settings to empty Settings for storage
-        if (mutableWorkloadGroupFragment.getSettings() == null) {
+        // Drop null-valued "clear" keys before storage (meaningful only during an update merge, not on create).
+        Settings normalizedSettings = stripClearMarkers(mutableWorkloadGroupFragment.getSettings());
+        Settings normalizedThrottling = stripClearMarkers(mutableWorkloadGroupFragment.getThrottling());
+        if (normalizedSettings.equals(mutableWorkloadGroupFragment.getSettings()) == false
+            || normalizedThrottling.equals(mutableWorkloadGroupFragment.getThrottling()) == false) {
             mutableWorkloadGroupFragment = new MutableWorkloadGroupFragment(
                 mutableWorkloadGroupFragment.getResiliencyMode(),
                 mutableWorkloadGroupFragment.getResourceLimits(),
-                Settings.EMPTY
+                normalizedSettings,
+                normalizedThrottling
             );
         }
+
+        // Cross-field checks on the merged throttling config (attribute required with a limit; ceiling must be >= 1).
+        WorkloadGroupThrottleSettings.validateMergedConfig(mutableWorkloadGroupFragment.getThrottling());
 
         this.name = name;
         this._id = _id;
@@ -114,38 +122,67 @@ public class WorkloadGroup extends AbstractDiffable<WorkloadGroup> implements To
         }
         final ResiliencyMode mode = Optional.ofNullable(mutableWorkloadGroupFragment.getResiliencyMode())
             .orElse(existingGroup.getResiliencyMode());
-        // Handle settings update with merge semantics:
-        // null settings = not specified in request (keep existing)
-        // empty Settings = clear all settings
-        // non-empty Settings = merge with existing; keys with null values are removed
-        final Settings mutableFragmentSettings = mutableWorkloadGroupFragment.getSettings();
-        final Settings updatedSettings;
-        if (mutableFragmentSettings == null) {
-            // Not specified - keep existing
-            updatedSettings = Settings.builder().put(existingGroup.getSettings()).build();
-        } else if (mutableFragmentSettings.isEmpty()) {
-            // Explicitly empty - clear all settings
-            updatedSettings = Settings.EMPTY;
-        } else {
-            // Merge: start with existing settings, overlay new values, remove null-valued keys
-            Settings.Builder builder = Settings.builder().put(existingGroup.getSettings());
-            for (String key : mutableFragmentSettings.keySet()) {
-                String value = mutableFragmentSettings.get(key);
-                if (value == null) {
-                    // null value means "clear this setting"
-                    builder.remove(key);
-                } else {
-                    builder.put(key, value);
-                }
-            }
-            updatedSettings = builder.build();
-        }
+        final Settings updatedSettings = mergeSettings(existingGroup.getSettings(), mutableWorkloadGroupFragment.getSettings());
+        final Settings updatedThrottling = mergeSettings(
+            existingGroup.getMutableWorkloadGroupFragment().getThrottling(),
+            mutableWorkloadGroupFragment.getThrottling()
+        );
         return new WorkloadGroup(
             existingGroup.getName(),
             existingGroup.get_id(),
-            new MutableWorkloadGroupFragment(mode, updatedResourceLimits, updatedSettings),
+            new MutableWorkloadGroupFragment(mode, updatedResourceLimits, updatedSettings, updatedThrottling),
             Instant.now().getMillis()
         );
+    }
+
+    /**
+     * Drops null-valued keys from a settings bag before storage. A null value is the API gesture for "clear this key",
+     * which only carries meaning during an update merge (which consumes it); any that reach a persisted group, e.g. a
+     * null sent on create where there is nothing to clear, are dropped so stored config never contains a null value.
+     *
+     * @param s the settings to normalize (may be null)
+     * @return the settings with all null-valued keys removed, or empty if {@code s} is null
+     */
+    private static Settings stripClearMarkers(Settings s) {
+        if (s == null) {
+            return Settings.EMPTY;
+        }
+        Settings.Builder builder = Settings.builder();
+        for (String key : s.keySet()) {
+            String value = s.get(key);
+            if (value != null) {
+                builder.put(key, value);
+            }
+        }
+        return builder.build();
+    }
+
+    /**
+     * Merges an incoming settings bag from an update request onto the existing one:
+     * a null incoming bag (field absent) keeps existing, an empty incoming bag clears all, and a non-empty bag overlays
+     * its values with a per-key null value clearing that key.
+     *
+     * @param existing the currently stored settings
+     * @param incoming the settings from the update request (may be null)
+     * @return the merged settings
+     */
+    private static Settings mergeSettings(Settings existing, Settings incoming) {
+        if (incoming == null) {
+            return Settings.builder().put(existing).build();
+        }
+        if (incoming.isEmpty()) {
+            return Settings.EMPTY;
+        }
+        Settings.Builder builder = Settings.builder().put(existing);
+        for (String key : incoming.keySet()) {
+            String value = incoming.get(key);
+            if (value == null) {
+                builder.remove(key);
+            } else {
+                builder.put(key, value);
+            }
+        }
+        return builder.build();
     }
 
     @Override
@@ -298,8 +335,8 @@ public class WorkloadGroup extends AbstractDiffable<WorkloadGroup> implements To
                     }
                     mutableWorkloadGroupFragment1.parseField(parser, fieldName);
                 } else if (token == XContentParser.Token.VALUE_NULL) {
-                    if (fieldName.equals(MutableWorkloadGroupFragment.SETTINGS_STRING)) {
-                        // "settings": null means clear all settings
+                    if (fieldName.equals(MutableWorkloadGroupFragment.SETTINGS_STRING)
+                        || fieldName.equals(MutableWorkloadGroupFragment.THROTTLING_STRING)) {
                         mutableWorkloadGroupFragment1.parseField(parser, fieldName);
                     }
                 }
