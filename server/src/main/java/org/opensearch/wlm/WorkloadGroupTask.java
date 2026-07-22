@@ -30,6 +30,13 @@ public class WorkloadGroupTask extends CancellableTask {
 
     private static final Logger logger = LogManager.getLogger(WorkloadGroupTask.class);
     public static final String WORKLOAD_GROUP_ID_HEADER = "workloadGroupId";
+    /**
+     * Carries the request's principal for username/role throttling: {@code subfield|value} tokens
+     * (e.g. {@code username|alice}) joined by {@link #WORKLOAD_GROUP_PRINCIPAL_VALUE_DELIMITER}. Only set when the
+     * security plugin's principal extractor is installed; absent otherwise (username/role throttling then fails open).
+     */
+    public static final String WORKLOAD_GROUP_PRINCIPAL_HEADER = "workloadGroupPrincipal";
+    public static final String WORKLOAD_GROUP_PRINCIPAL_VALUE_DELIMITER = ",";
     public static final Supplier<String> DEFAULT_WORKLOAD_GROUP_ID_SUPPLIER = () -> "DEFAULT_WORKLOAD_GROUP";
     private final LongSupplier nanoTimeSupplier;
     private String workloadGroupId;

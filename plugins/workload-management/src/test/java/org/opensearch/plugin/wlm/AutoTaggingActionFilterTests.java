@@ -18,6 +18,7 @@ import org.opensearch.common.util.concurrent.ThreadContext;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.action.ActionResponse;
 import org.opensearch.core.common.io.stream.StreamOutput;
+import org.opensearch.plugin.wlm.spi.AttributeExtractorExtension;
 import org.opensearch.rule.InMemoryRuleProcessingService;
 import org.opensearch.rule.RuleAttribute;
 import org.opensearch.rule.attribute_extractor.AttributeExtractor;
@@ -38,6 +39,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 
+import static org.opensearch.plugin.wlm.WorkloadManagementPlugin.PRINCIPAL_ATTRIBUTE_NAME;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.anyList;
 import static org.mockito.Mockito.doAnswer;
@@ -98,6 +100,91 @@ public class AutoTaggingActionFilterTests extends OpenSearchTestCase {
         autoTaggingActionFilter.apply(mock(Task.class), "Test", request, ActionRequestMetadata.empty(), null, mockFilterChain);
 
         verify(ruleProcessingService, times(0)).evaluateLabel(anyList());
+    }
+
+    public void testApplyStashesPrincipalHeaderWhenExtractorPresent() {
+        // A feature type that includes a "principal" attribute + a matching extractor extension in the map.
+        Attribute principalAttr = new Attribute() {
+            @Override
+            public String getName() {
+                return PRINCIPAL_ATTRIBUTE_NAME;
+            }
+
+            @Override
+            public void validateAttribute() {}
+
+            @Override
+            public void writeTo(StreamOutput out) throws IOException {}
+        };
+        FeatureType featureTypeWithPrincipal = new FeatureType() {
+            @Override
+            public String getName() {
+                return "wlm";
+            }
+
+            @Override
+            public Map<Attribute, Integer> getOrderedAttributes() {
+                return Map.of(principalAttr, 1);
+            }
+        };
+        AttributeExtractor<String> principalExtractor = new AttributeExtractor<>() {
+            @Override
+            public Attribute getAttribute() {
+                return principalAttr;
+            }
+
+            @Override
+            public Iterable<String> extract() {
+                return List.of("username|alice", "role|admin");
+            }
+
+            @Override
+            public LogicalOperator getLogicalOperator() {
+                return LogicalOperator.OR;
+            }
+        };
+        AttributeExtractorExtension extension = () -> principalExtractor;
+        Map<Attribute, AttributeExtractorExtension> extensions = Map.of(principalAttr, extension);
+
+        InMemoryRuleProcessingService svc = spy(
+            new InMemoryRuleProcessingService(
+                new AttributeValueStoreFactory(featureTypeWithPrincipal, DefaultAttributeValueStore::new),
+                null
+            )
+        );
+        AutoTaggingActionFilter filter = new AutoTaggingActionFilter(
+            svc,
+            threadPool,
+            extensions,
+            mock(WlmClusterSettingValuesProvider.class),
+            featureTypeWithPrincipal
+        );
+
+        SearchRequest request = mock(SearchRequest.class);
+        when(request.indices()).thenReturn(new String[] { "foo" });
+        ActionFilterChain<ActionRequest, ActionResponse> chain = mock(TestActionFilterChain.class);
+        try (ThreadContext.StoredContext ctx = threadPool.getThreadContext().stashContext()) {
+            when(svc.evaluateLabel(anyList())).thenReturn(Optional.of("QG"));
+            filter.apply(mock(Task.class), "Test", request, ActionRequestMetadata.empty(), null, chain);
+
+            // Both principal tokens are joined into the propagated header for core-side throttling.
+            assertEquals(
+                "username|alice,role|admin",
+                threadPool.getThreadContext().getHeader(WorkloadGroupTask.WORKLOAD_GROUP_PRINCIPAL_HEADER)
+            );
+        }
+    }
+
+    public void testApplyDoesNotStashPrincipalHeaderWhenNoExtractor() {
+        // Default filter from setUp has no principal attribute/extractor -> header must be absent.
+        SearchRequest request = mock(SearchRequest.class);
+        when(request.indices()).thenReturn(new String[] { "foo" });
+        ActionFilterChain<ActionRequest, ActionResponse> chain = mock(TestActionFilterChain.class);
+        try (ThreadContext.StoredContext ctx = threadPool.getThreadContext().stashContext()) {
+            when(ruleProcessingService.evaluateLabel(anyList())).thenReturn(Optional.of("QG"));
+            autoTaggingActionFilter.apply(mock(Task.class), "Test", request, ActionRequestMetadata.empty(), null, chain);
+            assertNull(threadPool.getThreadContext().getHeader(WorkloadGroupTask.WORKLOAD_GROUP_PRINCIPAL_HEADER));
+        }
     }
 
     public void testApplyForScrollRequestWithOriginalIndices() {

@@ -14,6 +14,7 @@ import org.opensearch.cluster.ClusterState;
 import org.opensearch.cluster.metadata.Metadata;
 import org.opensearch.cluster.metadata.WorkloadGroup;
 import org.opensearch.cluster.service.ClusterService;
+import org.opensearch.common.lease.Releasable;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.common.unit.TimeValue;
 import org.opensearch.common.util.concurrent.ThreadContext;
@@ -477,6 +478,110 @@ public class WorkloadGroupServiceTests extends OpenSearchTestCase {
         when(clusterState.metadata()).thenReturn(metadata);
         when(metadata.workloadGroups()).thenReturn(Collections.emptyMap());
         assertNull(workloadGroupService.getCurrentWorkloadGroup());
+    }
+
+    private void stubClusterStateWithGroup(WorkloadGroup wg) {
+        ClusterState clusterState = Mockito.mock(ClusterState.class);
+        Metadata metadata = Mockito.mock(Metadata.class);
+        when(mockClusterService.state()).thenReturn(clusterState);
+        when(clusterState.metadata()).thenReturn(metadata);
+        when(metadata.workloadGroups()).thenReturn(Map.of(wg.get_id(), wg));
+    }
+
+    private WorkloadGroup throttledGroup(String id, Settings throttling) {
+        return new WorkloadGroup(
+            id + "-name",
+            id,
+            new MutableWorkloadGroupFragment(
+                MutableWorkloadGroupFragment.ResiliencyMode.ENFORCED,
+                Map.of(ResourceType.MEMORY, 0.5),
+                Settings.EMPTY,
+                throttling
+            ),
+            1L
+        );
+    }
+
+    public void testAcquireThrottleReturnsNullWhenNodeLimitUnset() {
+        when(mockWorkloadManagementSettings.getWlmMode()).thenReturn(WlmMode.ENABLED);
+        mockWorkloadGroupsStateAccessor.addNewWorkloadGroup("wg-1");
+        stubClusterStateWithGroup(throttledGroup("wg-1", Settings.EMPTY)); // throttling not configured
+        assertNull(workloadGroupService.acquireThrottleOrReject("wg-1", null));
+    }
+
+    public void testAcquireThrottleReturnsNullWhenWlmDisabled() {
+        when(mockWorkloadManagementSettings.getWlmMode()).thenReturn(WlmMode.DISABLED);
+        assertNull(workloadGroupService.acquireThrottleOrReject("wg-1", null));
+    }
+
+    public void testAcquireThrottleRejectsAtLimitAndIncrementsStat() {
+        when(mockWorkloadManagementSettings.getWlmMode()).thenReturn(WlmMode.ENABLED);
+        mockWorkloadGroupsStateAccessor.addNewWorkloadGroup("wg-1");
+        Settings throttling = Settings.builder().put("attribute", "group").put("node_limit", 1).build();
+        stubClusterStateWithGroup(throttledGroup("wg-1", throttling));
+
+        Releasable permit = workloadGroupService.acquireThrottleOrReject("wg-1", null); // first admit succeeds
+        assertNotNull(permit);
+        // second admit hits node_limit of 1 -> 429 + total_throttled incremented
+        expectThrows(OpenSearchRejectedExecutionException.class, () -> workloadGroupService.acquireThrottleOrReject("wg-1", null));
+        assertEquals(1, mockWorkloadGroupsStateAccessor.getWorkloadGroupState("wg-1").getTotalThrottled());
+
+        // releasing the first permit frees the slot so a subsequent acquire succeeds
+        permit.close();
+        assertNotNull(workloadGroupService.acquireThrottleOrReject("wg-1", null));
+    }
+
+    public void testAcquireThrottleUsernameKeepsPerUserBuckets() {
+        when(mockWorkloadManagementSettings.getWlmMode()).thenReturn(WlmMode.ENABLED);
+        mockWorkloadGroupsStateAccessor.addNewWorkloadGroup("wg-1");
+        Settings throttling = Settings.builder().put("attribute", "username").put("node_limit", 1).build();
+        stubClusterStateWithGroup(throttledGroup("wg-1", throttling));
+
+        // alice takes her single slot; a second alice request is rejected.
+        Releasable alice = workloadGroupService.acquireThrottleOrReject("wg-1", "username|alice");
+        assertNotNull(alice);
+        expectThrows(
+            OpenSearchRejectedExecutionException.class,
+            () -> workloadGroupService.acquireThrottleOrReject("wg-1", "username|alice")
+        );
+        assertEquals(1, mockWorkloadGroupsStateAccessor.getWorkloadGroupState("wg-1").getTotalThrottled());
+
+        // bob is a different bucket, so he is admitted even while alice is at her limit.
+        Releasable bob = workloadGroupService.acquireThrottleOrReject("wg-1", "username|bob");
+        assertNotNull(bob);
+
+        // releasing alice frees her bucket
+        alice.close();
+        assertNotNull(workloadGroupService.acquireThrottleOrReject("wg-1", "username|alice"));
+    }
+
+    public void testAcquireThrottleRolePicksMatchingSubfieldFromMultiTokenPrincipal() {
+        when(mockWorkloadManagementSettings.getWlmMode()).thenReturn(WlmMode.ENABLED);
+        mockWorkloadGroupsStateAccessor.addNewWorkloadGroup("wg-1");
+        Settings throttling = Settings.builder().put("attribute", "role").put("node_limit", 1).build();
+        stubClusterStateWithGroup(throttledGroup("wg-1", throttling));
+
+        // A principal header may carry both subfields; the role bucket must key off the role token only.
+        String principal = "username|alice,role|admin";
+        assertNotNull(workloadGroupService.acquireThrottleOrReject("wg-1", principal));
+        expectThrows(
+            OpenSearchRejectedExecutionException.class,
+            () -> workloadGroupService.acquireThrottleOrReject("wg-1", "username|bob,role|admin")
+        );
+        assertEquals(1, mockWorkloadGroupsStateAccessor.getWorkloadGroupState("wg-1").getTotalThrottled());
+    }
+
+    public void testAcquireThrottleFailsOpenWhenPrincipalMissingForUsername() {
+        when(mockWorkloadManagementSettings.getWlmMode()).thenReturn(WlmMode.ENABLED);
+        mockWorkloadGroupsStateAccessor.addNewWorkloadGroup("wg-1");
+        Settings throttling = Settings.builder().put("attribute", "username").put("node_limit", 1).build();
+        stubClusterStateWithGroup(throttledGroup("wg-1", throttling));
+
+        // No principal (e.g. security plugin not installed) or no matching subfield -> not throttled (fail open).
+        assertNull(workloadGroupService.acquireThrottleOrReject("wg-1", null));
+        assertNull(workloadGroupService.acquireThrottleOrReject("wg-1", ""));
+        assertNull(workloadGroupService.acquireThrottleOrReject("wg-1", "role|admin")); // no username token
+        assertEquals(0, mockWorkloadGroupsStateAccessor.getWorkloadGroupState("wg-1").getTotalThrottled());
     }
 
     public void testShouldSBPHandle() {

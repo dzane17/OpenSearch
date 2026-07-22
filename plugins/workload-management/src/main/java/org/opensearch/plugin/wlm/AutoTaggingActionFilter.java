@@ -117,14 +117,32 @@ public class AutoTaggingActionFilter implements ActionFilter {
             }
         }
 
+        AttributeExtractor<String> principalExtractor = null;
         if (featureType.getAllowedAttributesRegistry().containsKey(PRINCIPAL_ATTRIBUTE_NAME)) {
             Attribute attribute = featureType.getAllowedAttributesRegistry().get(PRINCIPAL_ATTRIBUTE_NAME);
             assert attributeExtensions.containsKey(attribute);
-            attributeExtractors.add(attributeExtensions.get(attribute).getAttributeExtractor());
+            principalExtractor = attributeExtensions.get(attribute).getAttributeExtractor();
+            attributeExtractors.add(principalExtractor);
         }
 
         Optional<String> label = ruleProcessingService.evaluateLabel(attributeExtractors);
         label.ifPresent(s -> threadPool.getThreadContext().putHeader(WorkloadGroupTask.WORKLOAD_GROUP_ID_HEADER, s));
+        // Propagate the principal so core-side throttling can build per-username / per-role buckets.
+        if (principalExtractor != null) {
+            stashPrincipal(principalExtractor);
+        }
         chain.proceed(task, action, request, listener);
+    }
+
+    /**
+     * Stashes the extractor's {@code subfield|value} principal tokens (joined by
+     * {@link WorkloadGroupTask#WORKLOAD_GROUP_PRINCIPAL_VALUE_DELIMITER}) into the thread context for core-side
+     * throttling. No header is set when the extractor yields nothing, leaving username/role throttling to fail open.
+     */
+    private void stashPrincipal(AttributeExtractor<String> principalExtractor) {
+        String principal = String.join(WorkloadGroupTask.WORKLOAD_GROUP_PRINCIPAL_VALUE_DELIMITER, principalExtractor.extract());
+        if (principal.isEmpty() == false) {
+            threadPool.getThreadContext().putHeader(WorkloadGroupTask.WORKLOAD_GROUP_PRINCIPAL_HEADER, principal);
+        }
     }
 }
