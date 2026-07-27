@@ -555,6 +555,26 @@ public class WorkloadGroupServiceTests extends OpenSearchTestCase {
         assertNotNull(workloadGroupService.acquireThrottleOrReject("wg-1", "username|alice"));
     }
 
+    public void testAcquireThrottleUsernameWithCommaDoesNotCollide() {
+        when(mockWorkloadManagementSettings.getWlmMode()).thenReturn(WlmMode.ENABLED);
+        mockWorkloadGroupsStateAccessor.addNewWorkloadGroup("wg-1");
+        Settings throttling = Settings.builder().put("attribute", "username").put("node_limit", 1).build();
+        stubClusterStateWithGroup(throttledGroup("wg-1", throttling));
+
+        String delim = WorkloadGroupTask.WORKLOAD_GROUP_PRINCIPAL_VALUE_DELIMITER;
+        // principal for user "a,b" with a role token appended
+        String userAB = "username|a,b" + delim + "role|admin";
+        // user "a" is a genuinely different principal
+        String userA = "username|a";
+
+        Releasable ab = workloadGroupService.acquireThrottleOrReject("wg-1", userAB); // fills "a,b" bucket
+        assertNotNull(ab);
+        // user "a" must NOT be treated as the same bucket as "a,b" -> still admitted
+        assertNotNull(workloadGroupService.acquireThrottleOrReject("wg-1", userA));
+        // a second "a,b" request hits the "a,b" bucket limit -> rejected
+        expectThrows(OpenSearchRejectedExecutionException.class, () -> workloadGroupService.acquireThrottleOrReject("wg-1", userAB));
+    }
+
     public void testAcquireThrottleRolePicksMatchingSubfieldFromMultiTokenPrincipal() {
         when(mockWorkloadManagementSettings.getWlmMode()).thenReturn(WlmMode.ENABLED);
         mockWorkloadGroupsStateAccessor.addNewWorkloadGroup("wg-1");
@@ -562,11 +582,11 @@ public class WorkloadGroupServiceTests extends OpenSearchTestCase {
         stubClusterStateWithGroup(throttledGroup("wg-1", throttling));
 
         // A principal header may carry both subfields; the role bucket must key off the role token only.
-        String principal = "username|alice,role|admin";
-        assertNotNull(workloadGroupService.acquireThrottleOrReject("wg-1", principal));
+        String delim = WorkloadGroupTask.WORKLOAD_GROUP_PRINCIPAL_VALUE_DELIMITER;
+        assertNotNull(workloadGroupService.acquireThrottleOrReject("wg-1", "username|alice" + delim + "role|admin"));
         expectThrows(
             OpenSearchRejectedExecutionException.class,
-            () -> workloadGroupService.acquireThrottleOrReject("wg-1", "username|bob,role|admin")
+            () -> workloadGroupService.acquireThrottleOrReject("wg-1", "username|bob" + delim + "role|admin")
         );
         assertEquals(1, mockWorkloadGroupsStateAccessor.getWorkloadGroupState("wg-1").getTotalThrottled());
     }
@@ -582,6 +602,75 @@ public class WorkloadGroupServiceTests extends OpenSearchTestCase {
         assertNull(workloadGroupService.acquireThrottleOrReject("wg-1", ""));
         assertNull(workloadGroupService.acquireThrottleOrReject("wg-1", "role|admin")); // no username token
         assertEquals(0, mockWorkloadGroupsStateAccessor.getWorkloadGroupState("wg-1").getTotalThrottled());
+    }
+
+    /**
+     * A failure while recording the total_throttled stat must NOT swallow the rejection and admit the over-limit
+     * request. Whether the state map lookup returns null (group not yet registered / just deleted) or throws, the
+     * 429 must still propagate.
+     */
+    public void testAcquireThrottleStillRejectsWhenStatUpdateFails() {
+        when(mockWorkloadManagementSettings.getWlmMode()).thenReturn(WlmMode.ENABLED);
+        Settings throttling = Settings.builder().put("attribute", "group").put("node_limit", 1).build();
+        stubClusterStateWithGroup(throttledGroup("wg-1", throttling));
+
+        // state map with no entry for wg-1 (as during the state-registration lag) -> raw get(id) returns null
+        WorkloadGroupsStateAccessor emptyMapAccessor = Mockito.mock(WorkloadGroupsStateAccessor.class);
+        when(emptyMapAccessor.getWorkloadGroupStateMap()).thenReturn(new HashMap<>());
+        WorkloadGroupService serviceWithNullState = new WorkloadGroupService(
+            mockCancellationService,
+            mockClusterService,
+            mockThreadPool,
+            mockWorkloadManagementSettings,
+            mockNodeDuressTrackers,
+            emptyMapAccessor,
+            new HashSet<>(),
+            new HashSet<>()
+        );
+
+        assertNotNull(serviceWithNullState.acquireThrottleOrReject("wg-1", null)); // first admit fills the single slot
+        // second acquire is over the limit; a null state must not let the stat update swallow the 429
+        expectThrows(OpenSearchRejectedExecutionException.class, () -> serviceWithNullState.acquireThrottleOrReject("wg-1", null));
+
+        // accessor whose state-map lookup throws must also still propagate the 429
+        WorkloadGroupsStateAccessor throwingStateAccessor = Mockito.mock(WorkloadGroupsStateAccessor.class);
+        when(throwingStateAccessor.getWorkloadGroupStateMap()).thenThrow(new RuntimeException("state map race"));
+        WorkloadGroupService serviceWithThrowingState = new WorkloadGroupService(
+            mockCancellationService,
+            mockClusterService,
+            mockThreadPool,
+            mockWorkloadManagementSettings,
+            mockNodeDuressTrackers,
+            throwingStateAccessor,
+            new HashSet<>(),
+            new HashSet<>()
+        );
+
+        assertNotNull(serviceWithThrowingState.acquireThrottleOrReject("wg-1", null)); // fills the single slot
+        expectThrows(OpenSearchRejectedExecutionException.class, () -> serviceWithThrowingState.acquireThrottleOrReject("wg-1", null));
+    }
+
+    /**
+     * During the state-registration lag a node can enforce a new group's limit before its clusterChanged() registers
+     * the state. The rejection stat must not be misattributed to the DEFAULT group in that window.
+     */
+    public void testAcquireThrottleDoesNotMisattributeToDefaultDuringRegistrationLag() {
+        when(mockWorkloadManagementSettings.getWlmMode()).thenReturn(WlmMode.ENABLED);
+        Settings throttling = Settings.builder().put("attribute", "group").put("node_limit", 1).build();
+        stubClusterStateWithGroup(throttledGroup("wg-1", throttling));
+
+        // DEFAULT group state exists, but wg-1 is NOT yet registered (registration lag).
+        mockWorkloadGroupsStateAccessor.addNewWorkloadGroup(WorkloadGroupTask.DEFAULT_WORKLOAD_GROUP_ID_SUPPLIER.get());
+
+        assertNotNull(workloadGroupService.acquireThrottleOrReject("wg-1", null)); // fills the single slot
+        expectThrows(OpenSearchRejectedExecutionException.class, () -> workloadGroupService.acquireThrottleOrReject("wg-1", null));
+
+        // the rejection must NOT have landed on the DEFAULT group
+        assertEquals(
+            0,
+            mockWorkloadGroupsStateAccessor.getWorkloadGroupState(WorkloadGroupTask.DEFAULT_WORKLOAD_GROUP_ID_SUPPLIER.get())
+                .getTotalThrottled()
+        );
     }
 
     public void testShouldSBPHandle() {

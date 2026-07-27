@@ -27,16 +27,4 @@ public class WorkloadGroupThreadContextStatePropagatorTests extends OpenSearchTe
         Map<String, String> headers = sut.headers(source);
         assertEquals("adgarja0r235te", headers.get("workloadGroupId"));
     }
-
-    public void testPrincipalHeaderIsPropagated() {
-        WorkloadGroupThreadContextStatePropagator sut = new WorkloadGroupThreadContextStatePropagator();
-        Map<String, Object> source = Map.of(
-            WorkloadGroupTask.WORKLOAD_GROUP_ID_HEADER,
-            "adgarja0r235te",
-            WorkloadGroupTask.WORKLOAD_GROUP_PRINCIPAL_HEADER,
-            "username|alice"
-        );
-        assertEquals("username|alice", sut.transients(source).get(WorkloadGroupTask.WORKLOAD_GROUP_PRINCIPAL_HEADER));
-        assertEquals("username|alice", sut.headers(source).get(WorkloadGroupTask.WORKLOAD_GROUP_PRINCIPAL_HEADER));
-    }
 }

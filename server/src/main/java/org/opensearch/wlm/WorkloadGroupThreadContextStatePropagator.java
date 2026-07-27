@@ -19,10 +19,7 @@ import java.util.Map;
  */
 public class WorkloadGroupThreadContextStatePropagator implements ThreadContextStatePropagator {
 
-    public static List<String> PROPAGATED_HEADERS = List.of(
-        WorkloadGroupTask.WORKLOAD_GROUP_ID_HEADER,
-        WorkloadGroupTask.WORKLOAD_GROUP_PRINCIPAL_HEADER
-    );
+    public static List<String> PROPAGATED_HEADERS = List.of(WorkloadGroupTask.WORKLOAD_GROUP_ID_HEADER);
 
     /**
      * @param source current context transient headers

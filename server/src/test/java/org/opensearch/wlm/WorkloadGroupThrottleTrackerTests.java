@@ -30,7 +30,8 @@ public class WorkloadGroupThrottleTrackerTests extends OpenSearchTestCase {
             OpenSearchRejectedExecutionException.class,
             () -> tracker.acquire("bucket", 1)
         );
-        assertTrue(e.getMessage().contains("Node throttle limit reached"));
+        assertTrue(e.getMessage().contains("throttle limit reached"));
+        assertFalse(e.getMessage().contains("bucket"));
         // rejected acquire must not leave the count inflated
         assertEquals(1, tracker.inFlight("bucket"));
     }

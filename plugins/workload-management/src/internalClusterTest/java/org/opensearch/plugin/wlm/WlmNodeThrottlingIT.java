@@ -317,7 +317,7 @@ public class WlmNodeThrottlingIT extends OpenSearchIntegTestCase {
             .setQuery(scriptQuery(new Script(ScriptType.INLINE, "mockscript", ScriptedBlockPlugin.SCRIPT_NAME, Collections.emptyMap())));
     }
 
-    // Injects the resolved principal directly into the propagated thread-context header (WORKLOAD_GROUP_PRINCIPAL_HEADER).
+    // Injects the resolved principal directly into the thread-context header (WORKLOAD_GROUP_PRINCIPAL_HEADER).
     // In production the WLM auto-tagging filter sets this header from the security plugin's principal extractor; here we
     // stand in for that so the core username/role bucket-keying can be exercised without a real security plugin.
     private org.opensearch.transport.client.Client clientAs(String username) {

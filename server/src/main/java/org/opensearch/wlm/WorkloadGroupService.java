@@ -355,7 +355,16 @@ public class WorkloadGroupService extends AbstractLifecycleComponent
             try {
                 return throttleTracker.acquire(bucketKey, nodeLimit);
             } catch (OpenSearchRejectedExecutionException e) {
-                workloadGroupsStateAccessor.getWorkloadGroupState(workloadGroupId).totalThrottled.inc();
+                // Record the rejection without ever letting a stats failure swallow the 429. Use the raw state map,
+                // not the DEFAULT-fallback accessor, so a not-yet-registered group isn't misattributed to DEFAULT.
+                try {
+                    WorkloadGroupState workloadGroupState = workloadGroupsStateAccessor.getWorkloadGroupStateMap().get(workloadGroupId);
+                    if (workloadGroupState != null) {
+                        workloadGroupState.totalThrottled.inc();
+                    }
+                } catch (Exception statsException) {
+                    logger.warn("Failed to record throttle stat for workload group [" + workloadGroupId + "]", statsException);
+                }
                 throw e;
             }
         } catch (OpenSearchRejectedExecutionException e) {

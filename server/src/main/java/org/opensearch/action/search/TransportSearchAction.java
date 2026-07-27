@@ -485,9 +485,9 @@ public class TransportSearchAction extends HandledTransportAction<SearchRequest,
             // or HTTP header (HTTP header will be deprecated once ActionFilter is implemented)
             if (task instanceof WorkloadGroupTask) {
                 ((WorkloadGroupTask) task).setWorkloadGroupId(threadPool.getThreadContext());
-                // Node-level throttle admission. Runs before onRequestStart so a rejection doesn't leave the
-                // request-operations gauges incremented (they're only decremented on request end/failure, which the
-                // early return below skips). Principal header is null unless the security plugin's extractor set it.
+                // Node-level throttle admission. Runs before onRequestStart so a rejection doesn't leak the request
+                // gauges (decremented only on request end/failure, which the early return skips). Principal header
+                // is null unless the security plugin's extractor set it.
                 try {
                     String principal = threadPool.getThreadContext().getHeader(WorkloadGroupTask.WORKLOAD_GROUP_PRINCIPAL_HEADER);
                     Releasable throttlePermit = workloadGroupService.acquireThrottleOrReject(

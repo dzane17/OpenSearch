@@ -54,7 +54,7 @@ public class WorkloadGroupThrottleTracker {
             // concurrent acquires on the same bucket, but never admits over the limit — the safe direction.)
             release(bucketKey, counter);
             throw new OpenSearchRejectedExecutionException(
-                "Node throttle limit reached for bucket [" + bucketKey + "]: " + nodeLimit + " in-flight requests"
+                "Node-level workload group throttle limit reached: " + nodeLimit + " concurrent in-flight requests"
             );
         }
         return releaseOnce(bucketKey, counter);

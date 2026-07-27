@@ -167,9 +167,10 @@ public class AutoTaggingActionFilterTests extends OpenSearchTestCase {
             when(svc.evaluateLabel(anyList())).thenReturn(Optional.of("QG"));
             filter.apply(mock(Task.class), "Test", request, ActionRequestMetadata.empty(), null, chain);
 
-            // Both principal tokens are joined into the propagated header for core-side throttling.
+            // Both principal tokens are joined (by WORKLOAD_GROUP_PRINCIPAL_VALUE_DELIMITER) into the header for
+            // core-side throttling.
             assertEquals(
-                "username|alice,role|admin",
+                "username|alice" + WorkloadGroupTask.WORKLOAD_GROUP_PRINCIPAL_VALUE_DELIMITER + "role|admin",
                 threadPool.getThreadContext().getHeader(WorkloadGroupTask.WORKLOAD_GROUP_PRINCIPAL_HEADER)
             );
         }
