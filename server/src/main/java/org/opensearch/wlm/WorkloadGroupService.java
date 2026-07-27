@@ -16,7 +16,9 @@ import org.opensearch.cluster.ClusterStateListener;
 import org.opensearch.cluster.metadata.Metadata;
 import org.opensearch.cluster.metadata.WorkloadGroup;
 import org.opensearch.cluster.service.ClusterService;
+import org.opensearch.common.lease.Releasable;
 import org.opensearch.common.lifecycle.AbstractLifecycleComponent;
+import org.opensearch.common.settings.Settings;
 import org.opensearch.core.concurrency.OpenSearchRejectedExecutionException;
 import org.opensearch.monitor.jvm.JvmStats;
 import org.opensearch.monitor.process.ProcessProbe;
@@ -59,6 +61,8 @@ public class WorkloadGroupService extends AbstractLifecycleComponent
     private final Set<WorkloadGroup> deletedWorkloadGroups;
     private final NodeDuressTrackers nodeDuressTrackers;
     private final WorkloadGroupsStateAccessor workloadGroupsStateAccessor;
+    // Node-local in-flight throttle counters, keyed by throttle bucket. No cross-node coordination in this tier.
+    private final WorkloadGroupThrottleTracker throttleTracker = new WorkloadGroupThrottleTracker();
 
     public WorkloadGroupService(
         WorkloadGroupTaskCancellationService taskCancellationService,
@@ -310,6 +314,91 @@ public class WorkloadGroupService extends AbstractLifecycleComponent
                 );
             }
         });
+    }
+
+    /**
+     * Acquires one node-level throttle permit for the request, or returns {@code null} (nothing to release) when the
+     * request is not throttled: WLM disabled, default/unknown group, no {@code node_limit}, or no resolvable bucket
+     * (see {@link #resolveThrottleBucketKey}). The bucket depends on the group's throttle {@code attribute}.
+     *
+     * @param workloadGroupId the workload group the request is assigned to
+     * @param principal       the raw {@code WORKLOAD_GROUP_PRINCIPAL_HEADER} value, or {@code null} (see resolver)
+     * @return a permit to close on request completion, or {@code null} if not throttled
+     * @throws OpenSearchRejectedExecutionException if the bucket is already at its node limit
+     */
+    public Releasable acquireThrottleOrReject(String workloadGroupId, String principal) {
+        if (workloadManagementSettings.getWlmMode() != WlmMode.ENABLED) {
+            return null;
+        }
+        if (workloadGroupId == null || workloadGroupId.equals(WorkloadGroupTask.DEFAULT_WORKLOAD_GROUP_ID_SUPPLIER.get())) {
+            return null;
+        }
+        try {
+            WorkloadGroup workloadGroup = getWorkloadGroupById(workloadGroupId);
+            if (workloadGroup == null) {
+                return null;
+            }
+            Settings throttling = workloadGroup.getMutableWorkloadGroupFragment().getThrottling();
+            int nodeLimit = WorkloadGroupThrottleSettings.NODE_LIMIT.get(throttling);
+            if (nodeLimit == WorkloadGroupThrottleSettings.UNSET_LIMIT) {
+                return null;
+            }
+            // A null bucket means the request can't be attributed (e.g. username/role with no principal) -> fail open.
+            String bucketKey = resolveThrottleBucketKey(
+                workloadGroupId,
+                WorkloadGroupThrottleSettings.ATTRIBUTE.get(throttling),
+                principal
+            );
+            if (bucketKey == null) {
+                return null;
+            }
+            try {
+                return throttleTracker.acquire(bucketKey, nodeLimit);
+            } catch (OpenSearchRejectedExecutionException e) {
+                // Record the rejection without ever letting a stats failure swallow the 429. Use the raw state map,
+                // not the DEFAULT-fallback accessor, so a not-yet-registered group isn't misattributed to DEFAULT.
+                try {
+                    WorkloadGroupState workloadGroupState = workloadGroupsStateAccessor.getWorkloadGroupStateMap().get(workloadGroupId);
+                    if (workloadGroupState != null) {
+                        workloadGroupState.totalThrottled.inc();
+                    }
+                } catch (Exception statsException) {
+                    logger.warn("Failed to record throttle stat for workload group [" + workloadGroupId + "]", statsException);
+                }
+                throw e;
+            }
+        } catch (OpenSearchRejectedExecutionException e) {
+            throw e; // the intended 429
+        } catch (Exception e) {
+            // A bug in the throttle path must never fail an otherwise-valid search, so fail open.
+            logger.warn("Skipping node-level throttle for workload group [" + workloadGroupId + "] due to an error", e);
+            return null;
+        }
+    }
+
+    /**
+     * Builds the throttle bucket key: {@code <groupId>:group} for whole-group throttling, or
+     * {@code <groupId>:<attribute>:<value>} keyed by the matching principal subfield for {@code username}/{@code role}.
+     * Returns {@code null} (fail open, not throttled) when the principal is absent or lacks a token for the subfield.
+     */
+    private String resolveThrottleBucketKey(String workloadGroupId, String attribute, String principal) {
+        if ("group".equals(attribute)) {
+            return workloadGroupId + ":group";
+        }
+        if (principal == null || principal.isEmpty()) {
+            return null;
+        }
+        String subfieldPrefix = attribute + "|";
+        for (String token : principal.split(WorkloadGroupTask.WORKLOAD_GROUP_PRINCIPAL_VALUE_DELIMITER)) {
+            String trimmed = token.trim();
+            if (trimmed.startsWith(subfieldPrefix)) {
+                String value = trimmed.substring(subfieldPrefix.length());
+                if (value.isEmpty() == false) {
+                    return workloadGroupId + ":" + attribute + ":" + value;
+                }
+            }
+        }
+        return null;
     }
 
     private double getNormalisedRejectionThreshold(double limit, ResourceType resourceType) {
