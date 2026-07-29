@@ -12,6 +12,7 @@ import org.opensearch.common.annotation.ExperimentalApi;
 import org.opensearch.common.settings.Setting;
 import org.opensearch.common.settings.Settings;
 
+import java.math.BigInteger;
 import java.util.Map;
 import java.util.Set;
 
@@ -25,6 +26,9 @@ public class WorkloadGroupThrottleSettings {
 
     /** Sentinel for an unset limit, matching the {@code -1 = not set} convention of {@code WLM_SEARCH_TIMEOUT}. */
     public static final int UNSET_LIMIT = -1;
+
+    /** Upper bound for a limit. Limits are stored in an int-backed setting, so a larger value would overflow the {@code int}. */
+    public static final int MAX_LIMIT = Integer.MAX_VALUE;
 
     /** Dimension the limit is keyed by: {@code group} (whole group) or per {@code username} / {@code role}. No default: unset when absent. */
     public static final Setting<String> ATTRIBUTE = Setting.simpleString("attribute");
@@ -53,8 +57,8 @@ public class WorkloadGroupThrottleSettings {
 
     /**
      * Per-key validation: every key must be registered, {@code attribute} must be an allowed value, and each limit
-     * must be a non-negative integer ({@code -1} is the internal "unset" sentinel and is not user-settable). Safe to
-     * run on a partial fragment from an update request; the cross-field checks live in
+     * must be a non-negative integer no greater than {@link #MAX_LIMIT} ({@code -1} is the internal "unset" sentinel and
+     * is not user-settable). Safe to run on a partial fragment from an update request; the cross-field checks live in
      * {@link #validateMergedConfig(Settings)}.
      *
      * @param throttling the throttling settings to validate
@@ -86,16 +90,21 @@ public class WorkloadGroupThrottleSettings {
         }
     }
 
-    // Rejects a user-supplied limit that is not a non-negative integer; -1 is reserved as the internal "unset" sentinel.
+    // Rejects a user-supplied limit that is not a non-negative integer in [0, MAX_LIMIT]; -1 is reserved as the internal
+    // "unset" sentinel. Parsed as a BigInteger so a value that is a well-formed integer but too large for the int-backed
+    // setting (e.g. Integer.MAX_VALUE + 1) reports an overflow instead of being mislabelled as "not an integer".
     private static void validateUserLimit(String key, String value) {
-        int parsed;
+        final BigInteger parsed;
         try {
-            parsed = Integer.parseInt(value);
+            parsed = new BigInteger(value);
         } catch (NumberFormatException e) {
-            throw new IllegalArgumentException("throttling." + key + " must be a non-negative integer but was '" + value + "'");
+            throw new IllegalArgumentException("throttling." + key + " must be an integer but was '" + value + "'");
         }
-        if (parsed < 0) {
+        if (parsed.signum() < 0) {
             throw new IllegalArgumentException("throttling." + key + " must be non-negative but was " + parsed);
+        }
+        if (parsed.compareTo(BigInteger.valueOf(MAX_LIMIT)) > 0) {
+            throw new IllegalArgumentException("throttling." + key + " must not exceed " + MAX_LIMIT + " but was " + parsed);
         }
     }
 
@@ -122,7 +131,8 @@ public class WorkloadGroupThrottleSettings {
 
         int node = NODE_LIMIT.get(throttling);
         int shared = SHARED_LIMIT.get(throttling);
-        if (Math.max(0, node) + Math.max(0, shared) < 1) {
+        // Sum as long: each limit can be up to Integer.MAX_VALUE, so an int sum would overflow to a negative ceiling.
+        if ((long) Math.max(0, node) + Math.max(0, shared) < 1) {
             throw new IllegalArgumentException(
                 "Effective throttle ceiling is 0 (node_limit="
                     + (node == UNSET_LIMIT ? "unset" : node)

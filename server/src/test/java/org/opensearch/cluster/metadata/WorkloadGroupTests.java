@@ -452,6 +452,78 @@ public class WorkloadGroupTests extends AbstractSerializingTestCase<WorkloadGrou
         }
     }
 
+    public void testThrottleLimitExceedingMaxRejected() {
+        // Integer.MAX_VALUE + 1: a well-formed non-negative integer, but too large for the int-backed setting. The error
+        // must call out the overflow rather than falsely claiming it is "not an integer".
+        String tooLarge = Long.toString((long) Integer.MAX_VALUE + 1);
+        for (String key : new String[] { "node_limit", "shared_limit" }) {
+            IllegalArgumentException exception = expectThrows(
+                IllegalArgumentException.class,
+                () -> new MutableWorkloadGroupFragment(
+                    ResiliencyMode.ENFORCED,
+                    Map.of(ResourceType.MEMORY, 0.5),
+                    Settings.EMPTY,
+                    Settings.builder().put("attribute", "username").put(key, tooLarge).build()
+                )
+            );
+            assertTrue(exception.getMessage().contains(key + " must not exceed " + Integer.MAX_VALUE));
+            assertTrue(exception.getMessage().contains(tooLarge));
+        }
+    }
+
+    public void testThrottleLimitAtMaxAccepted() {
+        // Integer.MAX_VALUE is the largest limit the int-backed setting can hold and must be accepted.
+        WorkloadGroup workloadGroup = new WorkloadGroup(
+            "test",
+            "test_id",
+            new MutableWorkloadGroupFragment(
+                ResiliencyMode.ENFORCED,
+                Map.of(ResourceType.MEMORY, 0.5),
+                Settings.EMPTY,
+                Settings.builder().put("attribute", "username").put("node_limit", Integer.MAX_VALUE).build()
+            ),
+            System.currentTimeMillis()
+        );
+        Settings throttling = workloadGroup.getMutableWorkloadGroupFragment().getThrottling();
+        assertEquals(Integer.valueOf(Integer.MAX_VALUE), WorkloadGroupThrottleSettings.NODE_LIMIT.get(throttling));
+    }
+
+    public void testNonNumericThrottleLimitRejected() {
+        IllegalArgumentException exception = expectThrows(
+            IllegalArgumentException.class,
+            () -> new MutableWorkloadGroupFragment(
+                ResiliencyMode.ENFORCED,
+                Map.of(ResourceType.MEMORY, 0.5),
+                Settings.EMPTY,
+                Settings.builder().put("attribute", "username").put("node_limit", "not_a_number").build()
+            )
+        );
+        assertTrue(exception.getMessage().contains("node_limit must be an integer"));
+    }
+
+    public void testLargeMergedCeilingDoesNotOverflow() {
+        // Both limits at Integer.MAX_VALUE: the merged ceiling must be summed as a long so it does not overflow to a
+        // negative value and get misreported as an effective ceiling of 0.
+        WorkloadGroup workloadGroup = new WorkloadGroup(
+            "test",
+            "test_id",
+            new MutableWorkloadGroupFragment(
+                ResiliencyMode.ENFORCED,
+                Map.of(ResourceType.MEMORY, 0.5),
+                Settings.EMPTY,
+                Settings.builder()
+                    .put("attribute", "username")
+                    .put("node_limit", Integer.MAX_VALUE)
+                    .put("shared_limit", Integer.MAX_VALUE)
+                    .build()
+            ),
+            System.currentTimeMillis()
+        );
+        Settings throttling = workloadGroup.getMutableWorkloadGroupFragment().getThrottling();
+        assertEquals(Integer.valueOf(Integer.MAX_VALUE), WorkloadGroupThrottleSettings.NODE_LIMIT.get(throttling));
+        assertEquals(Integer.valueOf(Integer.MAX_VALUE), WorkloadGroupThrottleSettings.SHARED_LIMIT.get(throttling));
+    }
+
     public void testInvalidThrottleAttributeRejected() {
         IllegalArgumentException exception = expectThrows(
             IllegalArgumentException.class,
