@@ -13,11 +13,15 @@ import org.opensearch.cluster.ClusterChangedEvent;
 import org.opensearch.cluster.ClusterState;
 import org.opensearch.cluster.metadata.Metadata;
 import org.opensearch.cluster.metadata.WorkloadGroup;
+import org.opensearch.cluster.node.DiscoveryNode;
+import org.opensearch.cluster.node.DiscoveryNodeRole;
+import org.opensearch.cluster.node.DiscoveryNodes;
 import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.lease.Releasable;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.common.unit.TimeValue;
 import org.opensearch.common.util.concurrent.ThreadContext;
+import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.concurrency.OpenSearchRejectedExecutionException;
 import org.opensearch.search.backpressure.trackers.NodeDuressTrackers;
 import org.opensearch.tasks.Task;
@@ -36,6 +40,7 @@ import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BooleanSupplier;
 
 import org.mockito.ArgumentCaptor;
@@ -488,6 +493,25 @@ public class WorkloadGroupServiceTests extends OpenSearchTestCase {
         when(metadata.workloadGroups()).thenReturn(Map.of(wg.get_id(), wg));
     }
 
+    /**
+     * Drives the async {@link WorkloadGroupService#acquireThrottlePermit} back into the synchronous "permit or 429"
+     * contract these node-tier tests assert on. With no shared throttle service wired, it completes inline: responds
+     * with a permit (or null when not throttled) or fails with the 429. Rethrows the failure so {@code expectThrows}
+     * works.
+     */
+    private Releasable acquireThrottlePermitSync(WorkloadGroupService service, String workloadGroupId, String principal) {
+        AtomicReference<Releasable> permit = new AtomicReference<>();
+        AtomicReference<Exception> failure = new AtomicReference<>();
+        service.acquireThrottlePermit(workloadGroupId, principal, ActionListener.wrap(permit::set, failure::set));
+        if (failure.get() != null) {
+            if (failure.get() instanceof RuntimeException) {
+                throw (RuntimeException) failure.get();
+            }
+            throw new RuntimeException(failure.get());
+        }
+        return permit.get();
+    }
+
     private WorkloadGroup throttledGroup(String id, Settings throttling) {
         return new WorkloadGroup(
             id + "-name",
@@ -506,12 +530,12 @@ public class WorkloadGroupServiceTests extends OpenSearchTestCase {
         when(mockWorkloadManagementSettings.getWlmMode()).thenReturn(WlmMode.ENABLED);
         mockWorkloadGroupsStateAccessor.addNewWorkloadGroup("wg-1");
         stubClusterStateWithGroup(throttledGroup("wg-1", Settings.EMPTY)); // throttling not configured
-        assertNull(workloadGroupService.acquireThrottleOrReject("wg-1", null));
+        assertNull(acquireThrottlePermitSync(workloadGroupService, "wg-1", null));
     }
 
     public void testAcquireThrottleReturnsNullWhenWlmDisabled() {
         when(mockWorkloadManagementSettings.getWlmMode()).thenReturn(WlmMode.DISABLED);
-        assertNull(workloadGroupService.acquireThrottleOrReject("wg-1", null));
+        assertNull(acquireThrottlePermitSync(workloadGroupService, "wg-1", null));
     }
 
     public void testAcquireThrottleRejectsAtLimitAndIncrementsStat() {
@@ -520,15 +544,19 @@ public class WorkloadGroupServiceTests extends OpenSearchTestCase {
         Settings throttling = Settings.builder().put("attribute", "group").put("node_limit", 1).build();
         stubClusterStateWithGroup(throttledGroup("wg-1", throttling));
 
-        Releasable permit = workloadGroupService.acquireThrottleOrReject("wg-1", null); // first admit succeeds
+        Releasable permit = acquireThrottlePermitSync(workloadGroupService, "wg-1", null); // first admit succeeds
         assertNotNull(permit);
         // second admit hits node_limit of 1 -> 429 + total_throttled incremented
-        expectThrows(OpenSearchRejectedExecutionException.class, () -> workloadGroupService.acquireThrottleOrReject("wg-1", null));
+        OpenSearchRejectedExecutionException e = expectThrows(
+            OpenSearchRejectedExecutionException.class,
+            () -> acquireThrottlePermitSync(workloadGroupService, "wg-1", null)
+        );
+        assertEquals("Request throttled: workload group [wg-1-name] reached its per-node limit of 1 concurrent requests.", e.getMessage());
         assertEquals(1, mockWorkloadGroupsStateAccessor.getWorkloadGroupState("wg-1").getTotalThrottled());
 
         // releasing the first permit frees the slot so a subsequent acquire succeeds
         permit.close();
-        assertNotNull(workloadGroupService.acquireThrottleOrReject("wg-1", null));
+        assertNotNull(acquireThrottlePermitSync(workloadGroupService, "wg-1", null));
     }
 
     public void testAcquireThrottleUsernameKeepsPerUserBuckets() {
@@ -537,22 +565,26 @@ public class WorkloadGroupServiceTests extends OpenSearchTestCase {
         Settings throttling = Settings.builder().put("attribute", "username").put("node_limit", 1).build();
         stubClusterStateWithGroup(throttledGroup("wg-1", throttling));
 
-        // alice takes her single slot; a second alice request is rejected.
-        Releasable alice = workloadGroupService.acquireThrottleOrReject("wg-1", "username|alice");
+        // alice takes her single slot; a second alice request is rejected — and the message names the username.
+        Releasable alice = acquireThrottlePermitSync(workloadGroupService, "wg-1", "username|alice");
         assertNotNull(alice);
-        expectThrows(
+        OpenSearchRejectedExecutionException e = expectThrows(
             OpenSearchRejectedExecutionException.class,
-            () -> workloadGroupService.acquireThrottleOrReject("wg-1", "username|alice")
+            () -> acquireThrottlePermitSync(workloadGroupService, "wg-1", "username|alice")
+        );
+        assertEquals(
+            "Request throttled: workload group [wg-1-name] for username [alice] reached its per-node limit of 1 concurrent requests.",
+            e.getMessage()
         );
         assertEquals(1, mockWorkloadGroupsStateAccessor.getWorkloadGroupState("wg-1").getTotalThrottled());
 
         // bob is a different bucket, so he is admitted even while alice is at her limit.
-        Releasable bob = workloadGroupService.acquireThrottleOrReject("wg-1", "username|bob");
+        Releasable bob = acquireThrottlePermitSync(workloadGroupService, "wg-1", "username|bob");
         assertNotNull(bob);
 
         // releasing alice frees her bucket
         alice.close();
-        assertNotNull(workloadGroupService.acquireThrottleOrReject("wg-1", "username|alice"));
+        assertNotNull(acquireThrottlePermitSync(workloadGroupService, "wg-1", "username|alice"));
     }
 
     public void testAcquireThrottleUsernameWithCommaDoesNotCollide() {
@@ -567,12 +599,12 @@ public class WorkloadGroupServiceTests extends OpenSearchTestCase {
         // user "a" is a genuinely different principal
         String userA = "username|a";
 
-        Releasable ab = workloadGroupService.acquireThrottleOrReject("wg-1", userAB); // fills "a,b" bucket
+        Releasable ab = acquireThrottlePermitSync(workloadGroupService, "wg-1", userAB); // fills "a,b" bucket
         assertNotNull(ab);
         // user "a" must NOT be treated as the same bucket as "a,b" -> still admitted
-        assertNotNull(workloadGroupService.acquireThrottleOrReject("wg-1", userA));
+        assertNotNull(acquireThrottlePermitSync(workloadGroupService, "wg-1", userA));
         // a second "a,b" request hits the "a,b" bucket limit -> rejected
-        expectThrows(OpenSearchRejectedExecutionException.class, () -> workloadGroupService.acquireThrottleOrReject("wg-1", userAB));
+        expectThrows(OpenSearchRejectedExecutionException.class, () -> acquireThrottlePermitSync(workloadGroupService, "wg-1", userAB));
     }
 
     public void testAcquireThrottleRolePicksMatchingSubfieldFromMultiTokenPrincipal() {
@@ -583,10 +615,10 @@ public class WorkloadGroupServiceTests extends OpenSearchTestCase {
 
         // A principal header may carry both subfields; the role bucket must key off the role token only.
         String delim = WorkloadGroupTask.WORKLOAD_GROUP_PRINCIPAL_VALUE_DELIMITER;
-        assertNotNull(workloadGroupService.acquireThrottleOrReject("wg-1", "username|alice" + delim + "role|admin"));
+        assertNotNull(acquireThrottlePermitSync(workloadGroupService, "wg-1", "username|alice" + delim + "role|admin"));
         expectThrows(
             OpenSearchRejectedExecutionException.class,
-            () -> workloadGroupService.acquireThrottleOrReject("wg-1", "username|bob" + delim + "role|admin")
+            () -> acquireThrottlePermitSync(workloadGroupService, "wg-1", "username|bob" + delim + "role|admin")
         );
         assertEquals(1, mockWorkloadGroupsStateAccessor.getWorkloadGroupState("wg-1").getTotalThrottled());
     }
@@ -598,9 +630,9 @@ public class WorkloadGroupServiceTests extends OpenSearchTestCase {
         stubClusterStateWithGroup(throttledGroup("wg-1", throttling));
 
         // No principal (e.g. security plugin not installed) or no matching subfield -> not throttled (fail open).
-        assertNull(workloadGroupService.acquireThrottleOrReject("wg-1", null));
-        assertNull(workloadGroupService.acquireThrottleOrReject("wg-1", ""));
-        assertNull(workloadGroupService.acquireThrottleOrReject("wg-1", "role|admin")); // no username token
+        assertNull(acquireThrottlePermitSync(workloadGroupService, "wg-1", null));
+        assertNull(acquireThrottlePermitSync(workloadGroupService, "wg-1", ""));
+        assertNull(acquireThrottlePermitSync(workloadGroupService, "wg-1", "role|admin")); // no username token
         assertEquals(0, mockWorkloadGroupsStateAccessor.getWorkloadGroupState("wg-1").getTotalThrottled());
     }
 
@@ -628,9 +660,9 @@ public class WorkloadGroupServiceTests extends OpenSearchTestCase {
             new HashSet<>()
         );
 
-        assertNotNull(serviceWithNullState.acquireThrottleOrReject("wg-1", null)); // first admit fills the single slot
+        assertNotNull(acquireThrottlePermitSync(serviceWithNullState, "wg-1", null)); // first admit fills the single slot
         // second acquire is over the limit; a null state must not let the stat update swallow the 429
-        expectThrows(OpenSearchRejectedExecutionException.class, () -> serviceWithNullState.acquireThrottleOrReject("wg-1", null));
+        expectThrows(OpenSearchRejectedExecutionException.class, () -> acquireThrottlePermitSync(serviceWithNullState, "wg-1", null));
 
         // accessor whose state-map lookup throws must also still propagate the 429
         WorkloadGroupsStateAccessor throwingStateAccessor = Mockito.mock(WorkloadGroupsStateAccessor.class);
@@ -646,8 +678,8 @@ public class WorkloadGroupServiceTests extends OpenSearchTestCase {
             new HashSet<>()
         );
 
-        assertNotNull(serviceWithThrowingState.acquireThrottleOrReject("wg-1", null)); // fills the single slot
-        expectThrows(OpenSearchRejectedExecutionException.class, () -> serviceWithThrowingState.acquireThrottleOrReject("wg-1", null));
+        assertNotNull(acquireThrottlePermitSync(serviceWithThrowingState, "wg-1", null)); // fills the single slot
+        expectThrows(OpenSearchRejectedExecutionException.class, () -> acquireThrottlePermitSync(serviceWithThrowingState, "wg-1", null));
     }
 
     /**
@@ -662,8 +694,8 @@ public class WorkloadGroupServiceTests extends OpenSearchTestCase {
         // DEFAULT group state exists, but wg-1 is NOT yet registered (registration lag).
         mockWorkloadGroupsStateAccessor.addNewWorkloadGroup(WorkloadGroupTask.DEFAULT_WORKLOAD_GROUP_ID_SUPPLIER.get());
 
-        assertNotNull(workloadGroupService.acquireThrottleOrReject("wg-1", null)); // fills the single slot
-        expectThrows(OpenSearchRejectedExecutionException.class, () -> workloadGroupService.acquireThrottleOrReject("wg-1", null));
+        assertNotNull(acquireThrottlePermitSync(workloadGroupService, "wg-1", null)); // fills the single slot
+        expectThrows(OpenSearchRejectedExecutionException.class, () -> acquireThrottlePermitSync(workloadGroupService, "wg-1", null));
 
         // the rejection must NOT have landed on the DEFAULT group
         assertEquals(
@@ -671,6 +703,70 @@ public class WorkloadGroupServiceTests extends OpenSearchTestCase {
             mockWorkloadGroupsStateAccessor.getWorkloadGroupState(WorkloadGroupTask.DEFAULT_WORKLOAD_GROUP_ID_SUPPLIER.get())
                 .getTotalThrottled()
         );
+    }
+
+    /**
+     * The headline two-tier path: node_limit=1 + shared_limit=1 with a shared throttle service wired in. The first
+     * request takes the local slot, the second overflows and takes the shared slot, and the third is rejected (both
+     * tiers full) with total_throttled incremented. Uses a single-data-node ring so the shared acquire resolves to
+     * this node and runs via the local-owner short-circuit (no real network).
+     */
+    public void testAdmitFallsThroughNodeTierToSharedTier() {
+        when(mockWorkloadManagementSettings.getWlmMode()).thenReturn(WlmMode.ENABLED);
+        mockWorkloadGroupsStateAccessor.addNewWorkloadGroup("wg-1");
+
+        Settings throttling = Settings.builder().put("attribute", "group").put("node_limit", 1).put("shared_limit", 1).build();
+        WorkloadGroup group = throttledGroup("wg-1", throttling);
+
+        // Cluster state must expose both the group metadata and a single data node (so this node owns every bucket).
+        DiscoveryNode localNode = new DiscoveryNode(
+            "local",
+            "local",
+            buildNewFakeTransportAddress(),
+            Collections.emptyMap(),
+            Set.of(DiscoveryNodeRole.DATA_ROLE),
+            org.opensearch.Version.CURRENT
+        );
+        DiscoveryNodes nodes = DiscoveryNodes.builder().add(localNode).localNodeId("local").build();
+        ClusterState clusterState = Mockito.mock(ClusterState.class);
+        Metadata metadata = Mockito.mock(Metadata.class);
+        when(mockClusterService.state()).thenReturn(clusterState);
+        when(mockClusterService.localNode()).thenReturn(localNode);
+        when(clusterState.metadata()).thenReturn(metadata);
+        when(clusterState.nodes()).thenReturn(nodes);
+        when(metadata.workloadGroups()).thenReturn(Map.of(group.get_id(), group));
+
+        WorkloadGroupSharedThrottleService sharedService = new WorkloadGroupSharedThrottleService(
+            mockClusterService,
+            mockThreadPool,
+            Mockito.mock(org.opensearch.transport.TransportService.class)
+        );
+        // Populate the ring (the constructor starts empty; a nodes-changed event builds it — matches production).
+        ClusterState previous = Mockito.mock(ClusterState.class);
+        when(previous.nodes()).thenReturn(DiscoveryNodes.EMPTY_NODES);
+        sharedService.clusterChanged(new ClusterChangedEvent("test", clusterState, previous));
+        workloadGroupService.setSharedThrottleService(sharedService);
+
+        // 1st: local node_limit slot.
+        Releasable local = acquireThrottlePermitSync(workloadGroupService, "wg-1", null);
+        assertNotNull(local);
+        // 2nd: local exhausted -> falls through to shared_limit slot.
+        Releasable shared = acquireThrottlePermitSync(workloadGroupService, "wg-1", null);
+        assertNotNull(shared);
+        // 3rd: both tiers full -> 429 from the shared tier (with the cluster-wide message), and total_throttled bumped.
+        OpenSearchRejectedExecutionException e = expectThrows(
+            OpenSearchRejectedExecutionException.class,
+            () -> acquireThrottlePermitSync(workloadGroupService, "wg-1", null)
+        );
+        assertEquals(
+            "Request throttled: workload group [wg-1-name] reached its cluster-wide limit of 1 concurrent requests.",
+            e.getMessage()
+        );
+        assertEquals(1, mockWorkloadGroupsStateAccessor.getWorkloadGroupState("wg-1").getTotalThrottled());
+
+        // Releasing the shared permit frees the shared slot so a subsequent request is admitted again.
+        shared.close();
+        assertNotNull(acquireThrottlePermitSync(workloadGroupService, "wg-1", null));
     }
 
     public void testShouldSBPHandle() {

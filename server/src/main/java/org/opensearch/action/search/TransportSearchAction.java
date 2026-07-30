@@ -39,6 +39,7 @@ import org.opensearch.action.admin.cluster.shards.ClusterSearchShardsGroup;
 import org.opensearch.action.admin.cluster.shards.ClusterSearchShardsRequest;
 import org.opensearch.action.admin.cluster.shards.ClusterSearchShardsResponse;
 import org.opensearch.action.support.ActionFilters;
+import org.opensearch.action.support.ContextPreservingActionListener;
 import org.opensearch.action.support.HandledTransportAction;
 import org.opensearch.action.support.IndicesOptions;
 import org.opensearch.action.support.TimeoutTaskCancellationUtility;
@@ -68,7 +69,6 @@ import org.opensearch.core.common.Strings;
 import org.opensearch.core.common.breaker.CircuitBreaker;
 import org.opensearch.core.common.io.stream.NamedWriteableRegistry;
 import org.opensearch.core.common.io.stream.Writeable;
-import org.opensearch.core.concurrency.OpenSearchRejectedExecutionException;
 import org.opensearch.core.index.Index;
 import org.opensearch.core.index.shard.ShardId;
 import org.opensearch.core.indices.breaker.CircuitBreakerService;
@@ -485,25 +485,71 @@ public class TransportSearchAction extends HandledTransportAction<SearchRequest,
             // or HTTP header (HTTP header will be deprecated once ActionFilter is implemented)
             if (task instanceof WorkloadGroupTask) {
                 ((WorkloadGroupTask) task).setWorkloadGroupId(threadPool.getThreadContext());
-                // Node-level throttle admission. Runs before onRequestStart so a rejection doesn't leak the request
-                // gauges (decremented only on request end/failure, which the early return skips). Principal header
-                // is null unless the security plugin's extractor set it.
-                try {
-                    String principal = threadPool.getThreadContext().getHeader(WorkloadGroupTask.WORKLOAD_GROUP_PRINCIPAL_HEADER);
-                    Releasable throttlePermit = workloadGroupService.acquireThrottleOrReject(
-                        ((WorkloadGroupTask) task).getWorkloadGroupId(),
-                        principal
-                    );
-                    if (throttlePermit != null) {
-                        updatedListener = ActionListener.runBefore(updatedListener, throttlePermit::close);
-                    }
-                } catch (OpenSearchRejectedExecutionException e) {
-                    updatedListener.onFailure(e);
-                    return;
-                }
+                // Two-tier throttle admission (node-local + cluster-level shared). Runs before onRequestStart so a
+                // rejection doesn't leak the request gauges (decremented only on request end/failure, which the early
+                // return skips). The node-local tier is granted synchronously here (zero added latency); only an
+                // overflow to the shared tier does an asynchronous owner round-trip, so this call may complete inline
+                // or on a transport thread. Principal header is null unless the security plugin's extractor set it.
+                final String principal = threadPool.getThreadContext().getHeader(WorkloadGroupTask.WORKLOAD_GROUP_PRINCIPAL_HEADER);
+                final ActionListener<SearchResponse> outerListener = updatedListener;
+                // Preserve the request's thread context (workload group + principal headers, etc.) so that when the
+                // shared-tier admission callback runs on a transport thread, downstream search setup sees them.
+                final ActionListener<Releasable> admissionListener = ContextPreservingActionListener.wrapPreservingContext(
+                    ActionListener.wrap(throttlePermit -> {
+                        ActionListener<SearchResponse> proceedListener = throttlePermit == null
+                            ? outerListener
+                            : ActionListener.runBefore(outerListener, throttlePermit::close);
+                        proceedWithSearch(
+                            task,
+                            originalSearchRequest,
+                            searchAsyncActionProvider,
+                            proceedListener,
+                            searchRequestContext,
+                            timeProvider,
+                            requestSpan
+                        );
+                    }, outerListener::onFailure),
+                    threadPool.getThreadContext()
+                );
+                workloadGroupService.acquireThrottlePermit(((WorkloadGroupTask) task).getWorkloadGroupId(), principal, admissionListener);
+            } else {
+                proceedWithSearch(
+                    task,
+                    originalSearchRequest,
+                    searchAsyncActionProvider,
+                    updatedListener,
+                    searchRequestContext,
+                    timeProvider,
+                    requestSpan
+                );
             }
+        }
+    }
 
-            searchRequestContext.getSearchRequestOperationsListener().onRequestStart(searchRequestContext);
+    /**
+     * Runs the search once throttle admission has granted (or been skipped). Extracted from {@link #executeRequest}
+     * so it can be invoked either inline (node-local grant / not throttled) or asynchronously from the shared-tier
+     * acquire callback. Re-enters the request span scope because the async callback may run on a transport thread
+     * where the caller's span scope is no longer active.
+     */
+    private void proceedWithSearch(
+        Task task,
+        SearchRequest originalSearchRequest,
+        SearchAsyncActionProvider searchAsyncActionProvider,
+        ActionListener<SearchResponse> updatedListener,
+        SearchRequestContext searchRequestContext,
+        SearchTimeProvider timeProvider,
+        Span requestSpan
+    ) {
+        try (final SpanScope ignore = tracer.withSpanInScope(requestSpan)) {
+            try {
+                searchRequestContext.getSearchRequestOperationsListener().onRequestStart(searchRequestContext);
+            } catch (Exception e) {
+                // Route through updatedListener (which may hold a throttle permit via runBefore) so a failure here
+                // releases the permit rather than leaking it. A node-local permit has no TTL to reclaim it.
+                updatedListener.onFailure(e);
+                return;
+            }
 
             PipelinedRequest searchRequest;
             ActionListener<SearchResponse> listener;
