@@ -8,6 +8,9 @@
 
 package org.opensearch.wlm;
 
+import org.apache.logging.log4j.Level;
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
 import org.opensearch.action.search.SearchTask;
 import org.opensearch.cluster.ClusterChangedEvent;
 import org.opensearch.cluster.ClusterState;
@@ -18,6 +21,7 @@ import org.opensearch.cluster.node.DiscoveryNodeRole;
 import org.opensearch.cluster.node.DiscoveryNodes;
 import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.lease.Releasable;
+import org.opensearch.common.logging.Loggers;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.common.unit.TimeValue;
 import org.opensearch.common.util.concurrent.ThreadContext;
@@ -25,6 +29,7 @@ import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.concurrency.OpenSearchRejectedExecutionException;
 import org.opensearch.search.backpressure.trackers.NodeDuressTrackers;
 import org.opensearch.tasks.Task;
+import org.opensearch.test.MockLogAppender;
 import org.opensearch.test.OpenSearchTestCase;
 import org.opensearch.threadpool.Scheduler;
 import org.opensearch.threadpool.TestThreadPool;
@@ -513,15 +518,14 @@ public class WorkloadGroupServiceTests extends OpenSearchTestCase {
     }
 
     private WorkloadGroup throttledGroup(String id, Settings throttling) {
+        return throttledGroup(id, throttling, MutableWorkloadGroupFragment.ResiliencyMode.ENFORCED);
+    }
+
+    private WorkloadGroup throttledGroup(String id, Settings throttling, MutableWorkloadGroupFragment.ResiliencyMode mode) {
         return new WorkloadGroup(
             id + "-name",
             id,
-            new MutableWorkloadGroupFragment(
-                MutableWorkloadGroupFragment.ResiliencyMode.ENFORCED,
-                Map.of(ResourceType.MEMORY, 0.5),
-                Settings.EMPTY,
-                throttling
-            ),
+            new MutableWorkloadGroupFragment(mode, Map.of(ResourceType.MEMORY, 0.5), Settings.EMPTY, throttling),
             1L
         );
     }
@@ -557,6 +561,78 @@ public class WorkloadGroupServiceTests extends OpenSearchTestCase {
         // releasing the first permit frees the slot so a subsequent acquire succeeds
         permit.close();
         assertNotNull(acquireThrottlePermitSync(workloadGroupService, "wg-1", null));
+    }
+
+    public void testMonitorModeObservesButDoesNotThrottle() throws Exception {
+        when(mockWorkloadManagementSettings.getWlmMode()).thenReturn(WlmMode.ENABLED);
+        mockWorkloadGroupsStateAccessor.addNewWorkloadGroup("wg-1");
+        Settings throttling = Settings.builder().put("attribute", "group").put("node_limit", 1).build();
+        // Same node_limit=1 as the reject test, but the group is in MONITOR resiliency mode.
+        stubClusterStateWithGroup(throttledGroup("wg-1", throttling, MutableWorkloadGroupFragment.ResiliencyMode.MONITOR));
+
+        // The would-be-throttle log is at DEBUG; enable it and capture it.
+        Logger serviceLogger = LogManager.getLogger(WorkloadGroupService.class);
+        Level previousLevel = serviceLogger.getLevel();
+        Loggers.setLevel(serviceLogger, Level.DEBUG);
+        try (MockLogAppender appender = MockLogAppender.createForLoggers(serviceLogger)) {
+            appender.addExpectation(
+                new MockLogAppender.SeenEventExpectation(
+                    "monitor would-throttle log",
+                    WorkloadGroupService.class.getCanonicalName(),
+                    Level.DEBUG,
+                    "Request would be throttled (monitor mode, not rejected): workload group [wg-1-name] "
+                        + "reached its per-node limit of 1 concurrent requests."
+                )
+            );
+
+            // First request fills the single node slot (still tracked, so a breach can be observed).
+            Releasable permit = acquireThrottlePermitSync(workloadGroupService, "wg-1", null);
+            assertNotNull(permit);
+
+            // Second request would breach node_limit -> under MONITOR it is ADMITTED (null permit), not rejected,
+            // total_throttled is NOT incremented, and the would-throttle line is logged.
+            assertNull(acquireThrottlePermitSync(workloadGroupService, "wg-1", null));
+            assertEquals(0, mockWorkloadGroupsStateAccessor.getWorkloadGroupState("wg-1").getTotalThrottled());
+            appender.assertAllExpectationsMatched();
+
+            permit.close();
+        } finally {
+            Loggers.setLevel(serviceLogger, previousLevel);
+        }
+    }
+
+    public void testMonitorModeLogNamesTheUsernameAttribute() throws Exception {
+        when(mockWorkloadManagementSettings.getWlmMode()).thenReturn(WlmMode.ENABLED);
+        mockWorkloadGroupsStateAccessor.addNewWorkloadGroup("wg-1");
+        Settings throttling = Settings.builder().put("attribute", "username").put("node_limit", 1).build();
+        stubClusterStateWithGroup(throttledGroup("wg-1", throttling, MutableWorkloadGroupFragment.ResiliencyMode.MONITOR));
+
+        Logger serviceLogger = LogManager.getLogger(WorkloadGroupService.class);
+        Level previousLevel = serviceLogger.getLevel();
+        Loggers.setLevel(serviceLogger, Level.DEBUG);
+        try (MockLogAppender appender = MockLogAppender.createForLoggers(serviceLogger)) {
+            // The monitor log must render the resolved username in the same "for username [alice]" form as the 429.
+            appender.addExpectation(
+                new MockLogAppender.SeenEventExpectation(
+                    "monitor would-throttle log names username",
+                    WorkloadGroupService.class.getCanonicalName(),
+                    Level.DEBUG,
+                    "Request would be throttled (monitor mode, not rejected): workload group [wg-1-name] for username [alice] "
+                        + "reached its per-node limit of 1 concurrent requests."
+                )
+            );
+
+            // alice fills her single per-user slot; her second request would breach -> observed, admitted, no stat.
+            Releasable permit = acquireThrottlePermitSync(workloadGroupService, "wg-1", "username|alice");
+            assertNotNull(permit);
+            assertNull(acquireThrottlePermitSync(workloadGroupService, "wg-1", "username|alice"));
+            assertEquals(0, mockWorkloadGroupsStateAccessor.getWorkloadGroupState("wg-1").getTotalThrottled());
+            appender.assertAllExpectationsMatched();
+
+            permit.close();
+        } finally {
+            Loggers.setLevel(serviceLogger, previousLevel);
+        }
     }
 
     public void testAcquireThrottleUsernameKeepsPerUserBuckets() {
@@ -767,6 +843,49 @@ public class WorkloadGroupServiceTests extends OpenSearchTestCase {
         // Releasing the shared permit frees the shared slot so a subsequent request is admitted again.
         shared.close();
         assertNotNull(acquireThrottlePermitSync(workloadGroupService, "wg-1", null));
+    }
+
+    public void testMonitorModeObservesButDoesNotThrottleOnSharedTier() {
+        when(mockWorkloadManagementSettings.getWlmMode()).thenReturn(WlmMode.ENABLED);
+        mockWorkloadGroupsStateAccessor.addNewWorkloadGroup("wg-1");
+
+        Settings throttling = Settings.builder().put("attribute", "group").put("node_limit", 1).put("shared_limit", 1).build();
+        // Same two-tier config as testAdmitFallsThroughNodeTierToSharedTier, but MONITOR resiliency mode.
+        WorkloadGroup group = throttledGroup("wg-1", throttling, MutableWorkloadGroupFragment.ResiliencyMode.MONITOR);
+
+        DiscoveryNode localNode = new DiscoveryNode(
+            "local",
+            "local",
+            buildNewFakeTransportAddress(),
+            Collections.emptyMap(),
+            Set.of(DiscoveryNodeRole.DATA_ROLE),
+            org.opensearch.Version.CURRENT
+        );
+        DiscoveryNodes nodes = DiscoveryNodes.builder().add(localNode).localNodeId("local").build();
+        ClusterState clusterState = Mockito.mock(ClusterState.class);
+        Metadata metadata = Mockito.mock(Metadata.class);
+        when(mockClusterService.state()).thenReturn(clusterState);
+        when(mockClusterService.localNode()).thenReturn(localNode);
+        when(clusterState.metadata()).thenReturn(metadata);
+        when(clusterState.nodes()).thenReturn(nodes);
+        when(metadata.workloadGroups()).thenReturn(Map.of(group.get_id(), group));
+
+        WorkloadGroupSharedThrottleService sharedService = new WorkloadGroupSharedThrottleService(
+            mockClusterService,
+            mockThreadPool,
+            Mockito.mock(org.opensearch.transport.TransportService.class)
+        );
+        ClusterState previous = Mockito.mock(ClusterState.class);
+        when(previous.nodes()).thenReturn(DiscoveryNodes.EMPTY_NODES);
+        sharedService.clusterChanged(new ClusterChangedEvent("test", clusterState, previous));
+        workloadGroupService.setSharedThrottleService(sharedService);
+
+        // 1st fills the local slot, 2nd fills the shared slot.
+        assertNotNull(acquireThrottlePermitSync(workloadGroupService, "wg-1", null));
+        assertNotNull(acquireThrottlePermitSync(workloadGroupService, "wg-1", null));
+        // 3rd would breach the shared limit -> under MONITOR it is ADMITTED (null), not rejected, and no stat update.
+        assertNull(acquireThrottlePermitSync(workloadGroupService, "wg-1", null));
+        assertEquals(0, mockWorkloadGroupsStateAccessor.getWorkloadGroupState("wg-1").getTotalThrottled());
     }
 
     public void testShouldSBPHandle() {

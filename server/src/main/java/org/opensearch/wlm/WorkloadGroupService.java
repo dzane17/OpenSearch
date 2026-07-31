@@ -375,10 +375,9 @@ public class WorkloadGroupService extends AbstractLifecycleComponent
         if (plan.sharedLimit != WorkloadGroupThrottleSettings.UNSET_LIMIT && sharedThrottleService != null) {
             sharedThrottleService.acquireAsync(plan.bucketKey, plan.sharedLimit, ActionListener.wrap(listener::onResponse, e -> {
                 if (e instanceof OpenSearchRejectedExecutionException) {
-                    // Recompose the denial with the human-readable group name/attribute (the shared tier only has the
-                    // opaque bucket key), and count it.
-                    incrementThrottled(workloadGroupId);
-                    listener.onFailure(sharedTierRejection(plan));
+                    // At the shared limit. In MONITOR mode observe only (log, admit, no stat); otherwise reject with the
+                    // recomposed message (the shared tier only has the opaque bucket key) and count it.
+                    onThrottleBreach(plan, false, listener);
                 } else {
                     listener.onFailure(e);
                 }
@@ -387,9 +386,8 @@ public class WorkloadGroupService extends AbstractLifecycleComponent
         }
 
         if (plan.nodeLimit != WorkloadGroupThrottleSettings.UNSET_LIMIT && plan.sharedLimit == WorkloadGroupThrottleSettings.UNSET_LIMIT) {
-            // Node-only config with the local allowance exhausted and no shared tier to overflow to -> reject.
-            incrementThrottled(workloadGroupId);
-            listener.onFailure(nodeTierRejection(plan));
+            // Node-only config with the local allowance exhausted and no shared tier to overflow to.
+            onThrottleBreach(plan, true, listener);
         } else {
             // Either a shared tier was configured but is unavailable (not yet wired), or a shared-only config with no
             // wired tier. Fail open rather than reject, consistent with every other shared-tier-unavailable path.
@@ -397,22 +395,20 @@ public class WorkloadGroupService extends AbstractLifecycleComponent
         }
     }
 
-    // User-facing 429 for the node-local tier. Names the group (and attribute, if keyed) and the per-node limit knob.
-    private static OpenSearchRejectedExecutionException nodeTierRejection(ThrottlePlan plan) {
-        return new OpenSearchRejectedExecutionException(
-            "Request throttled: " + plan.describeTarget() + " reached its per-node limit of " + plan.nodeLimit + " concurrent requests."
-        );
-    }
-
-    // User-facing 429 for the cluster-level shared tier. Same shape as the node message, naming the cluster-wide limit.
-    private static OpenSearchRejectedExecutionException sharedTierRejection(ThrottlePlan plan) {
-        return new OpenSearchRejectedExecutionException(
-            "Request throttled: "
-                + plan.describeTarget()
-                + " reached its cluster-wide limit of "
-                + plan.sharedLimit
-                + " concurrent requests."
-        );
+    // Terminal handling when a request would be throttled at a tier's limit. In MONITOR mode the group only observes:
+    // log that the request WOULD have been rejected, then admit it (onResponse(null)) without touching total_throttled.
+    // In any other mode, count the rejection and fail with the user-facing 429.
+    private void onThrottleBreach(ThrottlePlan plan, boolean nodeTier, ActionListener<Releasable> listener) {
+        if (plan.monitorMode) {
+            // DEBUG, not INFO: this fires once per would-be-throttled request, so INFO would spam a hot bucket under
+            // load. The message names the throttle attribute value (username/role), but that is the caller's own
+            // identity and is already surfaced in the enforced-mode 429, so it is safe to log at a diagnostic level.
+            logger.debug("Request would be throttled (monitor mode, not rejected): {}.", plan.describeBreach(nodeTier));
+            listener.onResponse(null);
+            return;
+        }
+        incrementThrottled(plan.workloadGroupId);
+        listener.onFailure(new OpenSearchRejectedExecutionException("Request throttled: " + plan.describeBreach(nodeTier) + "."));
     }
 
     // Records a throttle rejection. Uses the raw state map, not the DEFAULT-fallback accessor, so a not-yet-registered
@@ -456,27 +452,43 @@ public class WorkloadGroupService extends AbstractLifecycleComponent
         if (bucketKey == null) {
             return null; // can't attribute the request to a bucket -> fail open
         }
-        return new ThrottlePlan(bucketKey, nodeLimit, sharedLimit, workloadGroup.getName(), attribute, value);
+        // MONITOR mode observes only: the limit is still evaluated so a breach can be logged, but the request is never
+        // rejected and no stat is updated (consistent with how MONITOR is dormant on the resource cancellation path).
+        boolean monitorMode = workloadGroup.getResiliencyMode() == MutableWorkloadGroupFragment.ResiliencyMode.MONITOR;
+        return new ThrottlePlan(workloadGroupId, bucketKey, nodeLimit, sharedLimit, workloadGroup.getName(), attribute, value, monitorMode);
     }
 
     // The resolved throttle configuration for a single request. Carries the human-readable group name and the throttle
     // dimension (attribute + resolved value) purely so a rejection message can name them; the opaque bucketKey remains
     // the identity used by both tracker tiers.
     private static class ThrottlePlan {
+        final String workloadGroupId; // id (not name) — the key for total_throttled stat updates
         final String bucketKey;
         final int nodeLimit;
         final int sharedLimit;
         final String groupName;
         final String attribute;   // "group" | "username" | "role"
         final String value;       // the resolved principal value for username/role; null for whole-group throttling
+        final boolean monitorMode; // group is in MONITOR resiliency mode -> observe (log), never reject or count
 
-        ThrottlePlan(String bucketKey, int nodeLimit, int sharedLimit, String groupName, String attribute, String value) {
+        ThrottlePlan(
+            String workloadGroupId,
+            String bucketKey,
+            int nodeLimit,
+            int sharedLimit,
+            String groupName,
+            String attribute,
+            String value,
+            boolean monitorMode
+        ) {
+            this.workloadGroupId = workloadGroupId;
             this.bucketKey = bucketKey;
             this.nodeLimit = nodeLimit;
             this.sharedLimit = sharedLimit;
             this.groupName = groupName;
             this.attribute = attribute;
             this.value = value;
+            this.monitorMode = monitorMode;
         }
 
         // "workload group [analytics]" or "workload group [analytics] for username [alice]".
@@ -486,6 +498,18 @@ public class WorkloadGroupService extends AbstractLifecycleComponent
                 return base;
             }
             return base + " for " + attribute + " [" + value + "]";
+        }
+
+        // "workload group [analytics] for username [alice] reached its per-node limit of 5 concurrent requests" —
+        // the shared clause used identically by the 429 rejection and the monitor-mode "would reject" log, so the two
+        // never drift.
+        String describeBreach(boolean nodeTier) {
+            return describeTarget()
+                + " reached its "
+                + (nodeTier ? "per-node" : "cluster-wide")
+                + " limit of "
+                + (nodeTier ? nodeLimit : sharedLimit)
+                + " concurrent requests";
         }
     }
 
