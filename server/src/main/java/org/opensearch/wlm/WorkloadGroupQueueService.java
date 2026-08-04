@@ -46,9 +46,9 @@ public class WorkloadGroupQueueService {
 
     private final ThreadPool threadPool;
     private final WorkloadGroupsStateAccessor stateAccessor;
-    // One queue per group id. Created lazily on first enqueue for a group; the value captures the group's size at
-    // creation. A group whose queue size changes keeps its old capacity until its queue drains and is recreated — an
-    // accepted simplification (queue size is rarely retuned live).
+    // One queue per group id, created lazily on first enqueue. The queue holds only the parked requests + depth; the
+    // capacity (queue.size) is NOT baked into it — it is passed in per enqueue from live config, so a dynamic
+    // queue.size change takes effect immediately (WorkloadGroupQueue.offer(req, size)).
     private final Map<String, WorkloadGroupQueue> queuesByGroup = new ConcurrentHashMap<>();
     private final KeyedLock<String> bucketLocks = new KeyedLock<>();
 
@@ -82,23 +82,33 @@ public class WorkloadGroupQueueService {
         if (size <= 0) {
             return false; // queueing disabled: not a queue rejection, the caller rejects with the normal throttle 429
         }
-        WorkloadGroupQueue queue = queuesByGroup.computeIfAbsent(groupId, k -> new WorkloadGroupQueue(size));
+        // Absolute deadline, computed once at first enqueue. A re-park from the sweep reuses the SAME QueuedRequest via
+        // enqueueExisting(...), so the deadline is never reset — that is what makes queue.timeout actually bound the
+        // total wait (a per-enqueue recompute would let a sub-timeout sweep interval push the deadline forever).
         long deadlineNanos = timeoutNanos > 0 ? threadPool.relativeTimeInNanos() + timeoutNanos : 0L;
         WorkloadGroupQueue.QueuedRequest req = new WorkloadGroupQueue.QueuedRequest(listener, bucketKey, task, principal, deadlineNanos);
-
-        final boolean enqueued;
-        try (Releasable ignored = bucketLocks.acquire(lockKey(groupId, bucketKey))) {
-            enqueued = queue.offer(req);
-        }
-        if (enqueued == false) {
+        if (enqueue(groupId, req, size) == false) {
             incrementQueueRejection(groupId); // queue full
             return false;
         }
         incrementQueued(groupId);
-        // Register the cancellation callback AFTER enqueue so it can reference the enqueued request. addOnCancelledCallback
-        // runs the callback immediately if the task is already cancelled, closing the race where cancellation lands
-        // between enqueue and registration.
-        req.cancellationHandle = task.addOnCancelledCallback(() -> evictCancelled(groupId, req));
+        return true;
+    }
+
+    // Parks a request (fresh or re-parked) and registers its cancellation callback. Returns false if the queue is full.
+    // Cancellation is registered AFTER offer so it can reference the enqueued request; addOnCancelledCallback runs the
+    // callback immediately if the task is already cancelled, closing the race where cancellation lands between enqueue
+    // and registration.
+    private boolean enqueue(String groupId, WorkloadGroupQueue.QueuedRequest req, int size) {
+        WorkloadGroupQueue queue = queuesByGroup.computeIfAbsent(groupId, k -> new WorkloadGroupQueue());
+        final boolean enqueued;
+        try (Releasable ignored = bucketLocks.acquire(lockKey(groupId, req.bucketKey()))) {
+            enqueued = queue.offer(req, size);
+        }
+        if (enqueued == false) {
+            return false;
+        }
+        req.cancellationHandle = req.task().addOnCancelledCallback(() -> evictCancelled(groupId, req));
         return true;
     }
 
@@ -167,45 +177,40 @@ public class WorkloadGroupQueueService {
     }
 
     /**
-     * Backstop sweep, run on the {@link WorkloadGroupService} scheduled loop. Evicts timed-out (→ 429) and cancelled
-     * requests, and re-attempts admission for still-parked requests via {@code reattempt} (which runs full throttle
-     * admission asynchronously and completes/leaves the listener). This is the correctness net behind node-completion
-     * and owner-push drains — it recovers a queued request stranded by a lost grant or a ring remap.
+     * Backstop sweep, run on the {@link WorkloadGroupService} scheduled loop. Two jobs, both done <em>in place</em> so
+     * a still-waiting request keeps its original identity and deadline:
+     * <ol>
+     *   <li><b>Eviction</b> — remove and fail (429 for timeout, {@link TaskCancelledException} for cancel) every parked
+     *       request that is past its {@code queue.timeout} deadline or whose task was cancelled. Because the request's
+     *       deadline is never reset (it is not dequeued-and-re-parked), {@code queue.timeout} actually bounds the wait.</li>
+     *   <li><b>Node-tier backstop drain</b> — for each bucket that still has a waiter, try {@code drain} (a node-tier
+     *       local re-acquire) once, admitting the head if a node permit is free. This recovers a request that the
+     *       node-completion chain missed. It does NOT re-contact the shared owner: the owner recovers its own lost
+     *       grants (grant-failure reclaim) and crashed reservations (lease TTL), and re-registering a shared waiter
+     *       every tick is exactly what caused unbounded owner-side waiter-count growth.</li>
+     * </ol>
      *
-     * @param reattempt re-runs admission for a still-parked request (typically {@link WorkloadGroupService#reattemptAdmission})
+     * @param drain admits the oldest waiter for a (groupId, bucketKey) against a freshly re-acquired node permit if one
+     *              is available; a no-op if the bucket is empty or no permit is free (typically
+     *              {@link WorkloadGroupService#sweepDrainNode})
      */
-    public void sweep(Reattempt reattempt) {
+    public void sweep(SweepDrain drain) {
         long now = threadPool.relativeTimeInNanos();
         for (Map.Entry<String, WorkloadGroupQueue> entry : queuesByGroup.entrySet()) {
             String groupId = entry.getKey();
             WorkloadGroupQueue queue = entry.getValue();
             // Snapshot bucket keys so we don't iterate a map being mutated by concurrent drains.
             for (String bucketKey : new ArrayList<>(queue.bucketKeys())) {
-                List<WorkloadGroupQueue.QueuedRequest> expired = new ArrayList<>();
-                List<WorkloadGroupQueue.QueuedRequest> retry = new ArrayList<>();
-                // Pull the whole bucket under the lock, classifying each entry, and DO NOT re-enqueue survivors here:
-                // a survivor is handed to reattempt(), which re-runs admission and re-parks it via the normal enqueue
-                // path if it is still denied. Re-offering here as well would double-enqueue it. Everything the sweep
-                // removes is therefore acted on (failed or re-attempted) after the lock is released.
+                List<WorkloadGroupQueue.QueuedRequest> evicted;
                 try (Releasable ignored = bucketLocks.acquire(lockKey(groupId, bucketKey))) {
-                    WorkloadGroupQueue.QueuedRequest req;
-                    while ((req = queue.pollOldest(bucketKey)) != null) {
-                        if (req.task().isCancelled() || req.isExpired(now)) {
-                            expired.add(req);
-                        } else {
-                            retry.add(req);
-                        }
-                    }
+                    evicted = queue.evictExpiredAndCancelled(bucketKey, now);
                 }
-                for (WorkloadGroupQueue.QueuedRequest req : expired) {
+                for (WorkloadGroupQueue.QueuedRequest req : evicted) {
                     failTimedOutOrCancelled(groupId, req);
                 }
-                // Re-attempt in original (oldest-first) order. Each re-attempt either admits, re-parks (fresh enqueue),
-                // or 429s — so a survivor is never left both dequeued and un-acted-on.
-                for (WorkloadGroupQueue.QueuedRequest req : retry) {
-                    req.releaseCancellationHandle(); // it will re-register a fresh callback if re-parked
-                    reattempt.reattempt(groupId, req);
-                }
+                // Node-tier backstop: try to admit the head if a local permit is free. drainNode holds the bucket lock
+                // internally and admits at most one; safe to call even if the bucket is now empty.
+                drain.drain(groupId, bucketKey);
             }
         }
     }
@@ -312,12 +317,13 @@ public class WorkloadGroupQueueService {
     }
 
     /**
-     * Re-attempts full throttle admission for a still-parked request. Implemented by {@link WorkloadGroupService}; the
-     * queue service holds no throttle logic.
+     * Node-tier backstop drain for the sweep: admit the oldest waiter for {@code (groupId, bucketKey)} against a
+     * freshly re-acquired node permit, if one is free; otherwise a no-op. Implemented by {@link WorkloadGroupService}
+     * (which owns the node permit tracker) so the queue service holds no throttle logic.
      */
     @ExperimentalApi
     @FunctionalInterface
-    public interface Reattempt {
-        void reattempt(String groupId, WorkloadGroupQueue.QueuedRequest req);
+    public interface SweepDrain {
+        void drain(String groupId, String bucketKey);
     }
 }

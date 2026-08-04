@@ -95,23 +95,26 @@ public class WorkloadGroupQueue {
         }
     }
 
-    private final int size;
     private final Map<String, ArrayDeque<QueuedRequest>> byBucket = new ConcurrentHashMap<>();
     private final AtomicInteger depth = new AtomicInteger(0);
     private final AtomicLong peak = new AtomicLong(0);
 
-    public WorkloadGroupQueue(int size) {
-        this.size = size;
-    }
+    public WorkloadGroupQueue() {}
 
     /**
      * Attempts to park a request under the group's shared {@code size} budget. Must be called while holding the
      * per-bucket lock for {@code req.bucketKey}. Returns {@code false} without enqueuing if queueing is disabled
      * ({@code size <= 0}) or the queue is full — the caller then rejects with a 429.
+     * <p>
+     * The cap is passed in per call (not stored on this instance) so a live change to {@code queue.size} takes effect
+     * immediately: a decrease stops admitting new requests once depth is at/above the new cap (existing parked
+     * requests are not evicted); an increase widens capacity at once.
      *
+     * @param req  the request to park
+     * @param size the group's <em>current</em> {@code queue.size}
      * @return {@code true} if the request was enqueued, {@code false} if it was rejected (disabled/full)
      */
-    boolean offer(QueuedRequest req) {
+    boolean offer(QueuedRequest req, int size) {
         if (size <= 0) {
             return false;
         }
@@ -125,6 +128,15 @@ public class WorkloadGroupQueue {
         peak.accumulateAndGet(updated, Math::max);
         byBucket.computeIfAbsent(req.bucketKey, k -> new ArrayDeque<>()).addLast(req);
         return true;
+    }
+
+    /**
+     * Returns the oldest parked request for {@code bucketKey} without removing it, or {@code null} if none. Must be
+     * called while holding the per-bucket lock.
+     */
+    QueuedRequest peekOldest(String bucketKey) {
+        ArrayDeque<QueuedRequest> deque = byBucket.get(bucketKey);
+        return deque == null ? null : deque.peekFirst();
     }
 
     /**
@@ -144,6 +156,32 @@ public class WorkloadGroupQueue {
             byBucket.remove(bucketKey);
         }
         return req;
+    }
+
+    /**
+     * Removes and returns every parked request in {@code bucketKey} that is cancelled or past its deadline, leaving
+     * all survivors in place with their original deadlines intact. Must be called while holding the per-bucket lock.
+     * Depth is decremented for each removed request. This is how the backstop sweep enforces {@code queue.timeout}
+     * without disturbing (or resetting the deadline of) requests that are still waiting.
+     */
+    java.util.List<QueuedRequest> evictExpiredAndCancelled(String bucketKey, long nowNanos) {
+        ArrayDeque<QueuedRequest> deque = byBucket.get(bucketKey);
+        if (deque == null) {
+            return java.util.Collections.emptyList();
+        }
+        java.util.List<QueuedRequest> evicted = new java.util.ArrayList<>();
+        for (java.util.Iterator<QueuedRequest> it = deque.iterator(); it.hasNext();) {
+            QueuedRequest req = it.next();
+            if (req.task().isCancelled() || req.isExpired(nowNanos)) {
+                it.remove();
+                depth.decrementAndGet();
+                evicted.add(req);
+            }
+        }
+        if (deque.isEmpty()) {
+            byBucket.remove(bucketKey);
+        }
+        return evicted;
     }
 
     /**
@@ -176,9 +214,5 @@ public class WorkloadGroupQueue {
 
     long peakDepth() {
         return peak.get();
-    }
-
-    int maxSize() {
-        return size;
     }
 }

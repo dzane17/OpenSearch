@@ -33,7 +33,6 @@ import org.opensearch.transport.TransportResponseHandler;
 import org.opensearch.transport.TransportService;
 
 import java.io.IOException;
-import java.util.ArrayList;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
@@ -98,11 +97,13 @@ public class WorkloadGroupSharedThrottleService implements ClusterStateListener 
     private final AtomicReference<ThrottleOwnerSelector> ring = new AtomicReference<>();
     private volatile Scheduler.Cancellable sweepTask;
 
-    // OWNER-SIDE waiter registry for owner-push queue draining: for each bucket this node owns, how many requests each
-    // coordinator is waiting on. Counts only — no request identity (the requests live on their coordinators). A stale
-    // count (a waiter that drained via a node permit) simply costs a wasted grant and self-drains as grants decrement
-    // it; there is no pruning. Populated when an acquire denies with wantsQueue=true; consulted when a lease releases.
-    private final Map<String, Map<DiscoveryNode, Integer>> waitersByBucket = new ConcurrentHashMap<>();
+    // OWNER-SIDE waiter registry for owner-push queue draining: for each bucket this node owns, the SET of coordinators
+    // that have at least one request parked for the bucket. A set (not a count) so registration is idempotent and the
+    // registry is bounded at <= N coordinators per bucket — a coordinator that re-registers (e.g. still parked across
+    // several acquires) does not inflate it. A coordinator is removed when a grant to it comes back unused (it has no
+    // more queued requests for the bucket), so the registry self-reconciles with real demand. No request identity is
+    // held (the requests live on their coordinators).
+    private final Map<String, Set<DiscoveryNode>> waitersByBucket = new ConcurrentHashMap<>();
 
     // COORDINATOR-SIDE: how a pushed grant is turned into an admitted queued request. Late-bound (the queue service is
     // constructed after this service); returns true if a queued request was admitted with the reserved permit, false
@@ -143,6 +144,11 @@ public class WorkloadGroupSharedThrottleService implements ClusterStateListener 
             ReleaseRequest::new,
             (request, channel, task) -> {
                 tracker.release(request.bucketKey, request.leaseId);
+                // If this release is a coordinator returning an UNUSED grant (it had no queued request for the bucket),
+                // drop it from the waiter set so it stops drawing wasted grants (remote analog of the local removeWaiter).
+                if (request.unusedGrantFrom != null) {
+                    removeWaiter(request.bucketKey, request.unusedGrantFrom);
+                }
                 // A slot just freed on the owner. If a coordinator is waiting on this bucket, hand the freed slot to one
                 // of them (reserve-then-grant) so its queued request can drain — owner-push. No-op if no waiters.
                 onSharedSlotFreed(request.bucketKey, request.sharedLimit);
@@ -281,7 +287,7 @@ public class WorkloadGroupSharedThrottleService implements ClusterStateListener 
                     logger.debug("Shared throttle acquire to owner [{}] for bucket [{}] failed; failing open", owner.getId(), bucketKey);
                     // Reclaim only (no owner-push): this lease likely never existed; UNSET_LIMIT tells the owner to
                     // release without driving a grant.
-                    sendRelease(owner, bucketKey, WorkloadGroupThrottleSettings.UNSET_LIMIT, leaseId);
+                    sendRelease(owner, bucketKey, WorkloadGroupThrottleSettings.UNSET_LIMIT, leaseId, null);
                     listener.onResponse(null);
                 }
 
@@ -314,19 +320,26 @@ public class WorkloadGroupSharedThrottleService implements ClusterStateListener 
 
     private Releasable releaseRemote(DiscoveryNode owner, String bucketKey, int sharedLimit, String leaseId) {
         // The remote RELEASE RPC carries sharedLimit so the owner can drive owner-push after freeing the slot.
-        return releaseOnce(() -> sendRelease(owner, bucketKey, sharedLimit, leaseId));
+        return releaseOnce(() -> sendRelease(owner, bucketKey, sharedLimit, leaseId, null));
+    }
+
+    // Returns an UNUSED remote grant: a RELEASE tagged with this coordinator so the owner also deregisters it from the
+    // bucket's waiter set before re-driving owner-push to the next waiter.
+    private void sendReleaseUnusedGrant(DiscoveryNode owner, String bucketKey, int sharedLimit, String leaseId, DiscoveryNode self) {
+        sendRelease(owner, bucketKey, sharedLimit, leaseId, self);
     }
 
     // Fire-and-forget RELEASE RPC to the bucket owner. Bounded by the same timeout as acquire so a half-open
     // connection can't leave the response handler pending until the connection is torn down. A lost release is not
     // fatal — the owner's TTL sweep reclaims the lease — so failures are logged at debug only. Carries sharedLimit so
-    // the owner can drive owner-push (grant a waiter the freed slot) after releasing.
-    private void sendRelease(DiscoveryNode owner, String bucketKey, int sharedLimit, String leaseId) {
+    // the owner can drive owner-push (grant a waiter the freed slot) after releasing. {@code unusedGrantFrom} is set
+    // only when returning an unused grant, so the owner deregisters that coordinator; null for a normal permit release.
+    private void sendRelease(DiscoveryNode owner, String bucketKey, int sharedLimit, String leaseId, DiscoveryNode unusedGrantFrom) {
         final TransportRequestOptions options = TransportRequestOptions.builder().withTimeout(ACQUIRE_TIMEOUT).build();
         transportService.sendRequest(
             owner,
             RELEASE_ACTION_NAME,
-            new ReleaseRequest(bucketKey, sharedLimit, leaseId),
+            new ReleaseRequest(bucketKey, sharedLimit, leaseId, unusedGrantFrom),
             options,
             new TransportResponseHandler<TransportResponse.Empty>() {
                 @Override
@@ -376,62 +389,123 @@ public class WorkloadGroupSharedThrottleService implements ClusterStateListener 
         this.grantConsumer = grantConsumer;
     }
 
-    // OWNER-SIDE: record that a coordinator is waiting on a bucket this node owns. Counts only; increments the
-    // coordinator's waiter count for the bucket.
+    // OWNER-SIDE: record that a coordinator is waiting on a bucket this node owns. Idempotent (a set), so re-registering
+    // an already-known waiter is a no-op and the registry stays bounded at <= N coordinators per bucket.
     private void registerWaiter(String bucketKey, DiscoveryNode coordinator) {
-        waitersByBucket.compute(bucketKey, (k, byNode) -> {
-            if (byNode == null) {
-                byNode = new ConcurrentHashMap<>();
+        waitersByBucket.compute(bucketKey, (k, nodes) -> {
+            if (nodes == null) {
+                nodes = ConcurrentHashMap.newKeySet();
             }
-            byNode.merge(coordinator, 1, Integer::sum);
-            return byNode;
+            nodes.add(coordinator);
+            return nodes;
         });
     }
 
-    // OWNER-SIDE: a shared slot for this bucket just freed. If a coordinator is waiting, reserve the slot (a fresh TTL
-    // lease) and push a grant to one waiter (round-robin over waiting coordinators). No waiters -> nothing to do.
+    // OWNER-SIDE: drop a coordinator from a bucket's waiter set (it reported no more queued requests for the bucket,
+    // via an unused grant). Prunes the bucket entry when the last waiter leaves.
+    private void removeWaiter(String bucketKey, DiscoveryNode coordinator) {
+        waitersByBucket.computeIfPresent(bucketKey, (k, nodes) -> {
+            nodes.remove(coordinator);
+            return nodes.isEmpty() ? null : nodes;
+        });
+    }
+
+    // OWNER-SIDE: a shared slot for this bucket just freed. Reserve it and push a grant to one waiting coordinator.
+    // Iterative, not recursive: if a chosen waiter turns out to be gone (disconnected), we reclaim and try the next
+    // one in a bounded loop (at most one pass over the <= N waiters), so a burst of stale/undeliverable waiters can
+    // never blow the stack. The unused-grant case (coordinator connected but has no queued request) is handled off
+    // this thread by the grant round-trip, which removes the waiter and re-drives once — not looped here.
     private void onSharedSlotFreed(String bucketKey, int sharedLimit) {
         if (sharedLimit == WorkloadGroupThrottleSettings.UNSET_LIMIT) {
             return; // reclaim-only release (e.g. failed-acquire cleanup): never drive a grant
         }
-        final DiscoveryNode target = pickWaiter(bucketKey);
-        if (target == null) {
-            return;
-        }
-        final String reservedLeaseId = leaseId();
-        // Reserve the freed slot so a concurrent acquire can't take it before the grant lands. If the bucket is somehow
-        // already at the limit again (a racing acquire beat us), don't over-grant: put the waiter credit back.
-        if (tracker.tryAcquire(bucketKey, sharedLimit, reservedLeaseId, LEASE_TTL_NANOS) == false) {
-            registerWaiter(bucketKey, target);
-            return;
-        }
-        if (target.getId().equals(clusterService.localNode().getId())) {
-            // Local waiter: consume the grant in-process, no network hop.
-            consumeGrant(bucketKey, sharedLimit, reservedLeaseId);
-        } else {
-            sendGrant(target, bucketKey, sharedLimit, reservedLeaseId);
+        // Bound the loop by the current waiter-set size so we never spin more than the waiters we started with.
+        int maxAttempts = waiterCount(bucketKey);
+        for (int attempt = 0; attempt < maxAttempts; attempt++) {
+            final DiscoveryNode target = pickWaiter(bucketKey);
+            if (target == null) {
+                return; // no waiters
+            }
+            final String reservedLeaseId = leaseId();
+            // Reserve the freed slot so a concurrent acquire can't take it before the grant lands. If the bucket is at
+            // its limit again (a racing acquire beat us), don't over-grant: re-register the waiter and stop.
+            if (tracker.tryAcquire(bucketKey, sharedLimit, reservedLeaseId, LEASE_TTL_NANOS) == false) {
+                registerWaiter(bucketKey, target);
+                return;
+            }
+            if (target.getId().equals(clusterService.localNode().getId())) {
+                // Local waiter: consume in-process. Returns true if it admitted a queued request (slot handed off).
+                // If false (no queued request), it already released the reserved slot; loop to the next waiter.
+                if (consumeGrantLocal(bucketKey, sharedLimit, reservedLeaseId, target)) {
+                    return;
+                }
+                // fall through to try the next waiter with the (now re-freed) slot
+            } else if (transportService.nodeConnected(target) == false) {
+                // Disconnected waiter: reclaim the reserved slot, drop it, and loop to the next waiter — handled here
+                // in the bounded loop rather than by recursing through sendGrant.
+                tracker.release(bucketKey, reservedLeaseId);
+                removeWaiter(bucketKey, target);
+                // fall through to try the next waiter
+            } else {
+                // Remote, connected waiter: fire the grant and stop. Delivery failure and unused-grant return are
+                // handled asynchronously by sendGrant's response handler + the grant handler (which re-drive once).
+                sendGrant(target, bucketKey, sharedLimit, reservedLeaseId);
+                return;
+            }
         }
     }
 
-    // OWNER-SIDE: pick a waiting coordinator (round-robin-ish: first key with a positive count) and decrement its
-    // count. Returns null if no coordinator is waiting on the bucket.
+    // OWNER-SIDE: consume a grant for a LOCAL waiter without a network hop. Returns true if a queued request was
+    // admitted (slot handed off); false if the coordinator had no queued request (reserved slot released, waiter
+    // removed) so the caller's loop can try the next waiter.
+    //
+    // Recursion safety: on ADMIT we hand a self-re-driving reservedPermit — but its close() fires later, at request
+    // completion (async), so re-driving then is fine and not re-entrant. On the NO-request path we release the reserved
+    // lease DIRECTLY (not by closing a re-driving permit) and return false so the caller's bounded loop advances,
+    // rather than recursing through onSharedSlotFreed.
+    private boolean consumeGrantLocal(String bucketKey, int sharedLimit, String reservedLeaseId, DiscoveryNode self) {
+        final GrantConsumer consumer = grantConsumer;
+        if (consumer == null) {
+            tracker.release(bucketKey, reservedLeaseId);
+            removeWaiter(bucketKey, self);
+            return false;
+        }
+        final DiscoveryNode owner = clusterService.localNode(); // local path: this node owns the bucket
+        boolean admitted;
+        try {
+            admitted = consumer.admit(bucketKey, reservedPermit(owner, bucketKey, sharedLimit, reservedLeaseId));
+        } catch (Exception e) {
+            logger.warn("Queue grant admit failed for bucket [" + bucketKey + "]", e);
+            tracker.release(bucketKey, reservedLeaseId);
+            return false;
+        }
+        if (admitted == false) {
+            // admitWithPermit does not close the permit on a false return; release the reserved lease directly so the
+            // slot is reused by this loop. (Not via the permit's close(), which would re-drive owner-push inline.)
+            tracker.release(bucketKey, reservedLeaseId);
+            removeWaiter(bucketKey, self); // this coordinator has nothing queued for the bucket
+            return false;
+        }
+        return true;
+    }
+
+    // Current number of coordinators waiting on a bucket (0 if none).
+    private int waiterCount(String bucketKey) {
+        Set<DiscoveryNode> nodes = waitersByBucket.get(bucketKey);
+        return nodes == null ? 0 : nodes.size();
+    }
+
+    // OWNER-SIDE: pick any waiting coordinator for the bucket and remove it from the set. Returns null if none. The
+    // caller re-registers it if the grant can't proceed (limit re-reached) so a still-waiting coordinator isn't lost.
     private DiscoveryNode pickWaiter(String bucketKey) {
         final DiscoveryNode[] picked = new DiscoveryNode[1];
-        waitersByBucket.computeIfPresent(bucketKey, (k, byNode) -> {
-            // Iterate a snapshot of keys so ordering rotates as counts change; pick the first with a positive count.
-            for (DiscoveryNode node : new ArrayList<>(byNode.keySet())) {
-                Integer count = byNode.get(node);
-                if (count != null && count > 0) {
-                    picked[0] = node;
-                    if (count == 1) {
-                        byNode.remove(node);
-                    } else {
-                        byNode.put(node, count - 1);
-                    }
-                    break;
-                }
+        waitersByBucket.computeIfPresent(bucketKey, (k, nodes) -> {
+            java.util.Iterator<DiscoveryNode> it = nodes.iterator();
+            if (it.hasNext()) {
+                picked[0] = it.next();
+                it.remove();
             }
-            return byNode.isEmpty() ? null : byNode;
+            return nodes.isEmpty() ? null : nodes;
         });
         return picked[0];
     }
@@ -441,7 +515,8 @@ public class WorkloadGroupSharedThrottleService implements ClusterStateListener 
     private void sendGrant(DiscoveryNode coordinator, String bucketKey, int sharedLimit, String reservedLeaseId) {
         if (transportService.nodeConnected(coordinator) == false) {
             tracker.release(bucketKey, reservedLeaseId); // waiter gone; reclaim immediately
-            onSharedSlotFreed(bucketKey, sharedLimit); // try the next waiter
+            removeWaiter(bucketKey, coordinator); // it's disconnected; drop it from the set
+            onSharedSlotFreed(bucketKey, sharedLimit); // try the next waiter (iterative; this call is not re-entrant here)
             return;
         }
         final TransportRequestOptions options = TransportRequestOptions.builder().withTimeout(ACQUIRE_TIMEOUT).build();
@@ -484,25 +559,45 @@ public class WorkloadGroupSharedThrottleService implements ClusterStateListener 
     }
 
     private void consumeGrant(String bucketKey, int sharedLimit, String reservedLeaseId) {
-        // The reserved permit closes exactly once: it releases the lease and (via the normal release path) re-drives
-        // owner-push, so an unused grant hands the freed slot to the next waiting coordinator.
-        final DiscoveryNode owner = ring.get().ownerFor(bucketKey).orElse(null);
-        final Releasable permit = reservedPermit(owner, bucketKey, sharedLimit, reservedLeaseId);
         final GrantConsumer consumer = grantConsumer;
         if (consumer == null) {
-            permit.close(); // not wired yet -> return the slot
+            returnUnusedGrant(bucketKey, sharedLimit, reservedLeaseId); // not wired yet -> return the slot + deregister
             return;
         }
+        // The permit handed to a successfully-admitted request releases only the reserved lease on completion (which
+        // re-drives owner-push at the owner). It does NOT carry the unused-grant deregister signal — an admitted
+        // coordinator is a legitimate ongoing waiter if it has more queued requests.
+        final DiscoveryNode owner = ring.get().ownerFor(bucketKey).orElse(null);
         boolean admitted;
         try {
-            admitted = consumer.admit(bucketKey, permit);
+            admitted = consumer.admit(bucketKey, reservedPermit(owner, bucketKey, sharedLimit, reservedLeaseId));
         } catch (Exception e) {
             logger.warn("Queue grant admit failed for bucket [" + bucketKey + "]", e);
-            permit.close();
+            returnUnusedGrant(bucketKey, sharedLimit, reservedLeaseId);
             return;
         }
         if (admitted == false) {
-            permit.close(); // no queued request on this coordinator -> return the reserved slot to the next waiter
+            // No queued request on this coordinator for the bucket: return the reserved slot AND tell the owner to
+            // deregister this coordinator so it stops drawing wasted grants.
+            returnUnusedGrant(bucketKey, sharedLimit, reservedLeaseId);
+        }
+    }
+
+    // Returns an unused reserved slot to its owner, tagging the release so the owner deregisters this coordinator from
+    // the bucket's waiter set (it has no queued request for the bucket) and then re-drives owner-push to the next
+    // waiter. If this node is the owner, does it in-process.
+    private void returnUnusedGrant(String bucketKey, int sharedLimit, String reservedLeaseId) {
+        final DiscoveryNode owner = ring.get().ownerFor(bucketKey).orElse(null);
+        final DiscoveryNode self = clusterService.localNode();
+        if (owner == null) {
+            return; // ring empty; the reserved lease (if any) is reclaimed by TTL
+        }
+        if (owner.getId().equals(self.getId())) {
+            tracker.release(bucketKey, reservedLeaseId);
+            removeWaiter(bucketKey, self);
+            onSharedSlotFreed(bucketKey, sharedLimit);
+        } else {
+            sendReleaseUnusedGrant(owner, bucketKey, sharedLimit, reservedLeaseId, self);
         }
     }
 
@@ -614,16 +709,20 @@ public class WorkloadGroupSharedThrottleService implements ClusterStateListener 
         // UNSET_LIMIT means "release only, do not drive push".
         final int sharedLimit;
         final String leaseId;
+        // Set only when this release is a coordinator returning an UNUSED grant: the owner deregisters this node from
+        // the bucket's waiter set (it has no queued request). Null for a normal permit release.
+        final DiscoveryNode unusedGrantFrom;
 
         // Convenience for callers/tests that don't drive owner-push on release.
         ReleaseRequest(String bucketKey, String leaseId) {
-            this(bucketKey, WorkloadGroupThrottleSettings.UNSET_LIMIT, leaseId);
+            this(bucketKey, WorkloadGroupThrottleSettings.UNSET_LIMIT, leaseId, null);
         }
 
-        ReleaseRequest(String bucketKey, int sharedLimit, String leaseId) {
+        ReleaseRequest(String bucketKey, int sharedLimit, String leaseId, DiscoveryNode unusedGrantFrom) {
             this.bucketKey = bucketKey;
             this.sharedLimit = sharedLimit;
             this.leaseId = leaseId;
+            this.unusedGrantFrom = unusedGrantFrom;
         }
 
         ReleaseRequest(StreamInput in) throws IOException {
@@ -631,6 +730,7 @@ public class WorkloadGroupSharedThrottleService implements ClusterStateListener 
             this.bucketKey = in.readString();
             this.sharedLimit = in.readVInt();
             this.leaseId = in.readString();
+            this.unusedGrantFrom = in.readOptionalWriteable(DiscoveryNode::new);
         }
 
         @Override
@@ -639,6 +739,7 @@ public class WorkloadGroupSharedThrottleService implements ClusterStateListener 
             out.writeString(bucketKey);
             out.writeVInt(sharedLimit);
             out.writeString(leaseId);
+            out.writeOptionalWriteable(unusedGrantFrom);
         }
     }
 

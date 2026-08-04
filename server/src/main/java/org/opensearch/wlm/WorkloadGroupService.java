@@ -137,11 +137,11 @@ public class WorkloadGroupService extends AbstractLifecycleComponent
         }
         taskCancellationService.cancelTasks(nodeDuressTrackers::isNodeInDuress, activeWorkloadGroups, deletedWorkloadGroups);
         taskCancellationService.pruneDeletedWorkloadGroups(deletedWorkloadGroups);
-        // Backstop sweep: evict timed-out/cancelled queued requests and re-attempt admission for the rest (recovers a
-        // request stranded by a lost owner grant or a ring remap). Owner-push and node-completion are the primary drains.
+        // Backstop sweep: evict timed-out/cancelled queued requests (enforces queue.timeout) and, as a node-tier
+        // backstop, admit a waiter if a local permit is free. Owner-push and node-completion are the primary drains.
         final WorkloadGroupQueueService qs = queueService;
         if (qs != null) {
-            qs.sweep(this::reattemptAdmission);
+            qs.sweep(this::sweepDrainNode);
         }
     }
 
@@ -424,25 +424,38 @@ public class WorkloadGroupService extends AbstractLifecycleComponent
         }
     }
 
-    // Acquires a node-local permit and, if granted, wraps its close() to drain the bucket's queue (a freed node permit
-    // creates room for one waiting request on this coordinator). The drain is guarded by a cheap totalDepth() check so
-    // the common unthrottled path pays only one atomic read past the shipped decrement.
+    // Acquires a node-local permit for admission, wrapped so its close() drains the bucket's queue.
     private Releasable acquireNodePermit(ThrottlePlan plan) {
-        Releasable permit = throttleTracker.tryAcquire(plan.bucketKey, plan.nodeLimit);
-        if (permit == null) {
+        return wrapNodePermit(
+            throttleTracker.tryAcquire(plan.bucketKey, plan.nodeLimit),
+            plan.workloadGroupId,
+            plan.bucketKey,
+            plan.nodeLimit
+        );
+    }
+
+    // Wraps a raw node permit so its close() releases the slot AND drains one waiter for the bucket — a freed node
+    // permit creates room for one waiting request on this coordinator. Returns null if the raw permit is null (limit
+    // reached). The wrapping is applied to BOTH the initial admission permit and the permit handed to a drained
+    // waiter, so the node-completion drain chains continuously instead of dying after one hop (each hop is a separate,
+    // asynchronous request completion, so there is no synchronous recursion). Guarded by a cheap totalDepth() check so
+    // the common unthrottled path pays only one atomic read past the shipped decrement.
+    private Releasable wrapNodePermit(Releasable raw, String groupId, String bucketKey, int nodeLimit) {
+        if (raw == null) {
             return null;
         }
         final WorkloadGroupQueueService qs = queueService;
         if (qs == null) {
-            return permit;
+            return raw;
         }
-        final String groupId = plan.workloadGroupId;
-        final String bucketKey = plan.bucketKey;
-        final int nodeLimit = plan.nodeLimit;
         return () -> {
-            permit.close();
+            raw.close();
             if (qs.totalDepth() > 0) {
-                qs.drainNode(groupId, bucketKey, key -> throttleTracker.tryAcquire(key, nodeLimit));
+                qs.drainNode(
+                    groupId,
+                    bucketKey,
+                    key -> wrapNodePermit(throttleTracker.tryAcquire(key, nodeLimit), groupId, key, nodeLimit)
+                );
             }
         };
     }
@@ -479,15 +492,29 @@ public class WorkloadGroupService extends AbstractLifecycleComponent
     }
 
     /**
-     * Re-attempts throttle admission for a request the backstop sweep pulled from the queue (e.g. after a lost owner
-     * grant or a ring remap). Re-runs the full two-tier acquire using the request's captured principal; on success
-     * completes the parked listener with the permit, on a definitive denial re-parks (tryEnqueue) or 429s, and on
-     * fail-open admits. Wired into {@link WorkloadGroupQueueService#sweep} so the queue service holds no throttle logic.
+     * Node-tier backstop drain for the sweep: admit the oldest waiter for {@code bucketKey} against a freshly acquired
+     * node permit if one is free; a no-op otherwise. Wired into {@link WorkloadGroupQueueService#sweep}. This recovers
+     * a request the node-completion chain missed without re-running full admission or re-contacting the shared owner
+     * (the owner recovers its own lost grants and reservations), and — crucially — without dequeuing-and-re-parking,
+     * so a still-waiting request keeps its original {@code queue.timeout} deadline.
      */
-    private void reattemptAdmission(String groupId, WorkloadGroupQueue.QueuedRequest req) {
-        // The parked listener is already context-preserving; re-running acquire and completing it is safe off-thread.
-        // Use the captured principal (the sweep thread has no request context).
-        acquireThrottlePermit(req.task(), req.principal(), req.listener());
+    private void sweepDrainNode(String groupId, String bucketKey) {
+        // node_limit is not carried per-bucket here; the drain lambda re-derives the permit for the bucket. We only
+        // engage the node tier as a backstop — the shared tier is drained by owner-push. Look up the group's current
+        // node_limit from cluster state; if throttling is no longer configured, nothing to drain.
+        WorkloadGroup workloadGroup = getWorkloadGroupById(groupId);
+        if (workloadGroup == null) {
+            return;
+        }
+        int nodeLimit = WorkloadGroupThrottleSettings.NODE_LIMIT.get(workloadGroup.getMutableWorkloadGroupFragment().getThrottling());
+        if (nodeLimit == WorkloadGroupThrottleSettings.UNSET_LIMIT) {
+            return; // shared-only config: the node tier can't admit; owner-push handles it.
+        }
+        queueService.drainNode(
+            groupId,
+            bucketKey,
+            key -> wrapNodePermit(throttleTracker.tryAcquire(key, nodeLimit), groupId, key, nodeLimit)
+        );
     }
 
     // Records a throttle rejection. Uses the raw state map, not the DEFAULT-fallback accessor, so a not-yet-registered
