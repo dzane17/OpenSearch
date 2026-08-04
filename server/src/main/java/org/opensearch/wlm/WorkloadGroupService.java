@@ -66,6 +66,8 @@ public class WorkloadGroupService extends AbstractLifecycleComponent
     private final NodeThrottleTracker throttleTracker = new NodeThrottleTracker();
     // Cluster-level (shared_limit) tier; late-bound after the transport service exists. Null => only the local tier.
     private volatile WorkloadGroupSharedThrottleService sharedThrottleService;
+    // Coordinator-local request queues; late-bound. Null => no queueing (throttle denial rejects immediately, as before).
+    private volatile WorkloadGroupQueueService queueService;
 
     public WorkloadGroupService(
         WorkloadGroupTaskCancellationService taskCancellationService,
@@ -135,6 +137,12 @@ public class WorkloadGroupService extends AbstractLifecycleComponent
         }
         taskCancellationService.cancelTasks(nodeDuressTrackers::isNodeInDuress, activeWorkloadGroups, deletedWorkloadGroups);
         taskCancellationService.pruneDeletedWorkloadGroups(deletedWorkloadGroups);
+        // Backstop sweep: evict timed-out/cancelled queued requests and re-attempt admission for the rest (recovers a
+        // request stranded by a lost owner grant or a ring remap). Owner-push and node-completion are the primary drains.
+        final WorkloadGroupQueueService qs = queueService;
+        if (qs != null) {
+            qs.sweep(this::reattemptAdmission);
+        }
     }
 
     /**
@@ -222,12 +230,15 @@ public class WorkloadGroupService extends AbstractLifecycleComponent
                 }
             }
         }
+        final WorkloadGroupQueueService qs = queueService;
         if (existingStateMap != null) {
             existingStateMap.forEach((workloadGroupId, currentState) -> {
                 boolean shouldInclude = workloadGroupIds.contains("_all") || workloadGroupIds.contains(workloadGroupId);
                 if (shouldInclude) {
                     if (requestedBreached == null || requestedBreached == resourceLimitBreached(workloadGroupId, currentState)) {
-                        statsHolderMap.put(workloadGroupId, WorkloadGroupStatsHolder.from(currentState));
+                        long queuedCurrent = qs == null ? 0L : qs.currentDepth(workloadGroupId);
+                        long queuePeak = qs == null ? 0L : qs.peakDepth(workloadGroupId);
+                        statsHolderMap.put(workloadGroupId, WorkloadGroupStatsHolder.from(currentState, queuedCurrent, queuePeak));
                     }
                 }
             });
@@ -329,6 +340,14 @@ public class WorkloadGroupService extends AbstractLifecycleComponent
     }
 
     /**
+     * Late-binds the coordinator-local request-queue service. When unset, a throttle denial rejects immediately (the
+     * pre-queueing behavior); when set, a denial may park the request instead (if the group's {@code queue.size} > 0).
+     */
+    public void setQueueService(WorkloadGroupQueueService queueService) {
+        this.queueService = queueService;
+    }
+
+    /**
      * Two-tier throttle admission for a search request. Notifies {@code listener} with:
      * <ul>
      *   <li>a non-null {@link Releasable} — admitted; close it exactly once on request completion to release the
@@ -342,11 +361,12 @@ public class WorkloadGroupService extends AbstractLifecycleComponent
      * shared tier does the asynchronous owner round-trip, so the calling thread is never blocked. The listener may
      * therefore be invoked inline or, for the shared-tier overflow, on a transport thread.
      *
-     * @param workloadGroupId the workload group the request is assigned to
+     * @param task            the search task (carries the workload group id; observed for cancellation while queued)
      * @param principal       the raw {@code WORKLOAD_GROUP_PRINCIPAL_HEADER} value, or {@code null}
      * @param listener        receives the permit / null / 429
      */
-    public void acquireThrottlePermit(String workloadGroupId, String principal, ActionListener<Releasable> listener) {
+    public void acquireThrottlePermit(WorkloadGroupTask task, String principal, ActionListener<Releasable> listener) {
+        final String workloadGroupId = task.getWorkloadGroupId();
         final ThrottlePlan plan;
         try {
             plan = resolveThrottlePlan(workloadGroupId, principal);
@@ -363,7 +383,7 @@ public class WorkloadGroupService extends AbstractLifecycleComponent
 
         // Node-local tier: synchronous, no cross-node coordination. Granting here is the zero-latency common path.
         if (plan.nodeLimit != WorkloadGroupThrottleSettings.UNSET_LIMIT) {
-            Releasable localPermit = throttleTracker.tryAcquire(plan.bucketKey, plan.nodeLimit);
+            Releasable localPermit = acquireNodePermit(plan);
             if (localPermit != null) {
                 listener.onResponse(localPermit);
                 return;
@@ -373,21 +393,30 @@ public class WorkloadGroupService extends AbstractLifecycleComponent
 
         // Cluster-level shared tier (asynchronous owner round-trip).
         if (plan.sharedLimit != WorkloadGroupThrottleSettings.UNSET_LIMIT && sharedThrottleService != null) {
-            sharedThrottleService.acquireAsync(plan.bucketKey, plan.sharedLimit, ActionListener.wrap(listener::onResponse, e -> {
-                if (e instanceof OpenSearchRejectedExecutionException) {
-                    // At the shared limit. In MONITOR mode observe only (log, admit, no stat); otherwise reject with the
-                    // recomposed message (the shared tier only has the opaque bucket key) and count it.
-                    onThrottleBreach(plan, false, listener);
-                } else {
-                    listener.onFailure(e);
-                }
-            }));
+            // wantsQueue: on a shared-tier denial the owner should register this coordinator as a waiter for owner-push,
+            // but only if this group actually queues (size > 0) and the queue service is wired.
+            boolean wantsQueue = queueService != null && plan.queueSize > 0;
+            sharedThrottleService.acquireAsync(
+                plan.bucketKey,
+                plan.sharedLimit,
+                wantsQueue,
+                ActionListener.wrap(listener::onResponse, e -> {
+                    if (e instanceof OpenSearchRejectedExecutionException) {
+                        // At the shared limit. In MONITOR mode observe only (log, admit, no stat); otherwise queue if
+                        // configured, else reject with the recomposed message (the shared tier only has the opaque bucket
+                        // key) and count it.
+                        onThrottleBreach(plan, false, task, principal, listener);
+                    } else {
+                        listener.onFailure(e);
+                    }
+                })
+            );
             return;
         }
 
         if (plan.nodeLimit != WorkloadGroupThrottleSettings.UNSET_LIMIT && plan.sharedLimit == WorkloadGroupThrottleSettings.UNSET_LIMIT) {
             // Node-only config with the local allowance exhausted and no shared tier to overflow to.
-            onThrottleBreach(plan, true, listener);
+            onThrottleBreach(plan, true, task, principal, listener);
         } else {
             // Either a shared tier was configured but is unavailable (not yet wired), or a shared-only config with no
             // wired tier. Fail open rather than reject, consistent with every other shared-tier-unavailable path.
@@ -395,10 +424,39 @@ public class WorkloadGroupService extends AbstractLifecycleComponent
         }
     }
 
-    // Terminal handling when a request would be throttled at a tier's limit. In MONITOR mode the group only observes:
-    // log that the request WOULD have been rejected, then admit it (onResponse(null)) without touching total_throttled.
-    // In any other mode, count the rejection and fail with the user-facing 429.
-    private void onThrottleBreach(ThrottlePlan plan, boolean nodeTier, ActionListener<Releasable> listener) {
+    // Acquires a node-local permit and, if granted, wraps its close() to drain the bucket's queue (a freed node permit
+    // creates room for one waiting request on this coordinator). The drain is guarded by a cheap totalDepth() check so
+    // the common unthrottled path pays only one atomic read past the shipped decrement.
+    private Releasable acquireNodePermit(ThrottlePlan plan) {
+        Releasable permit = throttleTracker.tryAcquire(plan.bucketKey, plan.nodeLimit);
+        if (permit == null) {
+            return null;
+        }
+        final WorkloadGroupQueueService qs = queueService;
+        if (qs == null) {
+            return permit;
+        }
+        final String groupId = plan.workloadGroupId;
+        final String bucketKey = plan.bucketKey;
+        final int nodeLimit = plan.nodeLimit;
+        return () -> {
+            permit.close();
+            if (qs.totalDepth() > 0) {
+                qs.drainNode(groupId, bucketKey, key -> throttleTracker.tryAcquire(key, nodeLimit));
+            }
+        };
+    }
+
+    // Terminal handling when a request would be throttled at a tier's limit. Order: MONITOR observes only (log + admit,
+    // no stat); else try to park the request in the queue (if queueing is enabled and has room); else count the
+    // rejection and fail with the user-facing 429.
+    private void onThrottleBreach(
+        ThrottlePlan plan,
+        boolean nodeTier,
+        WorkloadGroupTask task,
+        String principal,
+        ActionListener<Releasable> listener
+    ) {
         if (plan.monitorMode) {
             // DEBUG, not INFO: this fires once per would-be-throttled request, so INFO would spam a hot bucket under
             // load. The message names the throttle attribute value (username/role), but that is the caller's own
@@ -407,8 +465,29 @@ public class WorkloadGroupService extends AbstractLifecycleComponent
             listener.onResponse(null);
             return;
         }
+        // Queue-then-reject: hold the request instead of rejecting, if queueing is enabled and the group's queue has
+        // room. A parked request holds no thread — only its listener + open connection — and is admitted later by a
+        // node-completion drain, an owner grant, or failed by the timeout/cancellation sweep.
+        final WorkloadGroupQueueService qs = queueService;
+        if (qs != null
+            && plan.queueSize > 0
+            && qs.tryEnqueue(plan.workloadGroupId, plan.bucketKey, task, principal, plan.queueSize, plan.queueTimeoutNanos, listener)) {
+            return; // parked; listener completed later
+        }
         incrementThrottled(plan.workloadGroupId);
         listener.onFailure(new OpenSearchRejectedExecutionException("Request throttled: " + plan.describeBreach(nodeTier) + "."));
+    }
+
+    /**
+     * Re-attempts throttle admission for a request the backstop sweep pulled from the queue (e.g. after a lost owner
+     * grant or a ring remap). Re-runs the full two-tier acquire using the request's captured principal; on success
+     * completes the parked listener with the permit, on a definitive denial re-parks (tryEnqueue) or 429s, and on
+     * fail-open admits. Wired into {@link WorkloadGroupQueueService#sweep} so the queue service holds no throttle logic.
+     */
+    private void reattemptAdmission(String groupId, WorkloadGroupQueue.QueuedRequest req) {
+        // The parked listener is already context-preserving; re-running acquire and completing it is safe off-thread.
+        // Use the captured principal (the sweep thread has no request context).
+        acquireThrottlePermit(req.task(), req.principal(), req.listener());
     }
 
     // Records a throttle rejection. Uses the raw state map, not the DEFAULT-fallback accessor, so a not-yet-registered
@@ -455,7 +534,22 @@ public class WorkloadGroupService extends AbstractLifecycleComponent
         // MONITOR mode observes only: the limit is still evaluated so a breach can be logged, but the request is never
         // rejected and no stat is updated (consistent with how MONITOR is dormant on the resource cancellation path).
         boolean monitorMode = workloadGroup.getResiliencyMode() == MutableWorkloadGroupFragment.ResiliencyMode.MONITOR;
-        return new ThrottlePlan(workloadGroupId, bucketKey, nodeLimit, sharedLimit, workloadGroup.getName(), attribute, value, monitorMode);
+        // Queue config (used only if a throttle limit is breached). Absent => size 0 => no queueing (reject immediately).
+        Settings queue = workloadGroup.getMutableWorkloadGroupFragment().getQueue();
+        int queueSize = WorkloadGroupQueueSettings.SIZE.get(queue);
+        long queueTimeoutNanos = WorkloadGroupQueueSettings.TIMEOUT.get(queue).nanos();
+        return new ThrottlePlan(
+            workloadGroupId,
+            bucketKey,
+            nodeLimit,
+            sharedLimit,
+            workloadGroup.getName(),
+            attribute,
+            value,
+            monitorMode,
+            queueSize,
+            queueTimeoutNanos
+        );
     }
 
     // The resolved throttle configuration for a single request. Carries the human-readable group name and the throttle
@@ -470,6 +564,8 @@ public class WorkloadGroupService extends AbstractLifecycleComponent
         final String attribute;   // "group" | "username" | "role"
         final String value;       // the resolved principal value for username/role; null for whole-group throttling
         final boolean monitorMode; // group is in MONITOR resiliency mode -> observe (log), never reject or count
+        final int queueSize;        // queue.size for this group (0 => queueing disabled)
+        final long queueTimeoutNanos; // queue.timeout in nanos (0 => no timeout)
 
         ThrottlePlan(
             String workloadGroupId,
@@ -479,7 +575,9 @@ public class WorkloadGroupService extends AbstractLifecycleComponent
             String groupName,
             String attribute,
             String value,
-            boolean monitorMode
+            boolean monitorMode,
+            int queueSize,
+            long queueTimeoutNanos
         ) {
             this.workloadGroupId = workloadGroupId;
             this.bucketKey = bucketKey;
@@ -489,6 +587,8 @@ public class WorkloadGroupService extends AbstractLifecycleComponent
             this.attribute = attribute;
             this.value = value;
             this.monitorMode = monitorMode;
+            this.queueSize = queueSize;
+            this.queueTimeoutNanos = queueTimeoutNanos;
         }
 
         // "workload group [analytics]" or "workload group [analytics] for username [alice]".

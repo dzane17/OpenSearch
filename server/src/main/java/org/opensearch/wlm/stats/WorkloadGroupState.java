@@ -44,6 +44,22 @@ public class WorkloadGroupState {
     public final CounterMetric totalThrottled = new CounterMetric();
 
     /**
+     * Cumulative requests parked in the workload group's request queue (admitted into the queue after a throttle
+     * denial), since the OpenSearch start time.
+     */
+    public final CounterMetric totalQueued = new CounterMetric();
+
+    /**
+     * Cumulative requests rejected because the workload group's request queue was full, since the OpenSearch start time.
+     */
+    public final CounterMetric totalQueueRejections = new CounterMetric();
+
+    /**
+     * Cumulative queued requests rejected after waiting past {@code queue.timeout}, since the OpenSearch start time.
+     */
+    public final CounterMetric totalQueueTimeouts = new CounterMetric();
+
+    /**
      * This is used to store the resource type state both for CPU and MEMORY
      */
     private final Map<ResourceType, ResourceTypeState> resourceState;
@@ -91,6 +107,30 @@ public class WorkloadGroupState {
      */
     public long getTotalThrottled() {
         return totalThrottled.count();
+    }
+
+    /**
+     *
+     * @return requests parked in the workload group's request queue
+     */
+    public long getTotalQueued() {
+        return totalQueued.count();
+    }
+
+    /**
+     *
+     * @return requests rejected because the workload group's request queue was full
+     */
+    public long getTotalQueueRejections() {
+        return totalQueueRejections.count();
+    }
+
+    /**
+     *
+     * @return queued requests rejected after waiting past the queue timeout
+     */
+    public long getTotalQueueTimeouts() {
+        return totalQueueTimeouts.count();
     }
 
     /**

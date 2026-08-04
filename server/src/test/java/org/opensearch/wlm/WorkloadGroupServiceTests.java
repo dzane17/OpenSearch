@@ -507,7 +507,16 @@ public class WorkloadGroupServiceTests extends OpenSearchTestCase {
     private Releasable acquireThrottlePermitSync(WorkloadGroupService service, String workloadGroupId, String principal) {
         AtomicReference<Releasable> permit = new AtomicReference<>();
         AtomicReference<Exception> failure = new AtomicReference<>();
-        service.acquireThrottlePermit(workloadGroupId, principal, ActionListener.wrap(permit::set, failure::set));
+        // acquireThrottlePermit takes the task (it carries the workload group id and is observed for cancellation while
+        // queued). Build a SearchTask whose workload group id is the requested one via a real thread-context header
+        // (mockThreadPool is a Mockito mock, so use a self-contained ThreadContext here).
+        WorkloadGroupTask task = new SearchTask(1, "", "", () -> "", null, null);
+        ThreadContext threadContext = new ThreadContext(Settings.EMPTY);
+        if (workloadGroupId != null) {
+            threadContext.putHeader(WorkloadGroupTask.WORKLOAD_GROUP_ID_HEADER, workloadGroupId);
+        }
+        task.setWorkloadGroupId(threadContext);
+        service.acquireThrottlePermit(task, principal, ActionListener.wrap(permit::set, failure::set));
         if (failure.get() != null) {
             if (failure.get() instanceof RuntimeException) {
                 throw (RuntimeException) failure.get();

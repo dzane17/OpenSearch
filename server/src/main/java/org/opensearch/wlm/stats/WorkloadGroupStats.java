@@ -97,11 +97,21 @@ public class WorkloadGroupStats implements ToXContentObject, Writeable {
         public static final String TOTAL_CANCELLATIONS = "total_cancellations";
         public static final String FAILURES = "failures";
         public static final String THROTTLED = "total_throttled";
+        public static final String QUEUED = "total_queued";
+        public static final String QUEUE_REJECTIONS = "total_queue_rejections";
+        public static final String QUEUE_TIMEOUTS = "total_queue_timeouts";
+        public static final String QUEUED_CURRENT = "queued_current";
+        public static final String QUEUE_PEAK = "queue_peak";
         private long completions;
         private long rejections;
         private long failures;
         private long cancellations;
         private long throttled;
+        private long queued;
+        private long queueRejections;
+        private long queueTimeouts;
+        private long queuedCurrent;
+        private long queuePeak;
         private Map<ResourceType, ResourceStats> resourceStats;
 
         // this is needed to support the factory method
@@ -115,11 +125,32 @@ public class WorkloadGroupStats implements ToXContentObject, Writeable {
             long throttled,
             Map<ResourceType, ResourceStats> resourceStats
         ) {
+            this(completions, rejections, failures, cancellations, throttled, 0, 0, 0, 0, 0, resourceStats);
+        }
+
+        public WorkloadGroupStatsHolder(
+            long completions,
+            long rejections,
+            long failures,
+            long cancellations,
+            long throttled,
+            long queued,
+            long queueRejections,
+            long queueTimeouts,
+            long queuedCurrent,
+            long queuePeak,
+            Map<ResourceType, ResourceStats> resourceStats
+        ) {
             this.completions = completions;
             this.rejections = rejections;
             this.failures = failures;
             this.cancellations = cancellations;
             this.throttled = throttled;
+            this.queued = queued;
+            this.queueRejections = queueRejections;
+            this.queueTimeouts = queueTimeouts;
+            this.queuedCurrent = queuedCurrent;
+            this.queuePeak = queuePeak;
             this.resourceStats = resourceStats;
         }
 
@@ -128,9 +159,14 @@ public class WorkloadGroupStats implements ToXContentObject, Writeable {
             this.rejections = in.readVLong();
             this.failures = in.readVLong();
             this.cancellations = in.readVLong();
-            // total_throttled is version-gated so a pre-throttling node's stats stream stays readable.
+            // total_throttled and the queue stats are version-gated so a pre-throttling node's stats stream stays readable.
             if (in.getVersion().onOrAfter(Version.V_3_7_0)) {
                 this.throttled = in.readVLong();
+                this.queued = in.readVLong();
+                this.queueRejections = in.readVLong();
+                this.queueTimeouts = in.readVLong();
+                this.queuedCurrent = in.readVLong();
+                this.queuePeak = in.readVLong();
             }
             this.resourceStats = in.readMap((i) -> ResourceType.fromName(i.readString()), ResourceStats::new);
         }
@@ -151,16 +187,49 @@ public class WorkloadGroupStats implements ToXContentObject, Writeable {
             return throttled;
         }
 
+        public long getQueued() {
+            return queued;
+        }
+
+        public long getQueueRejections() {
+            return queueRejections;
+        }
+
+        public long getQueueTimeouts() {
+            return queueTimeouts;
+        }
+
+        public long getQueuedCurrent() {
+            return queuedCurrent;
+        }
+
+        public long getQueuePeak() {
+            return queuePeak;
+        }
+
         public Map<ResourceType, ResourceStats> getResourceStats() {
             return resourceStats;
         }
 
         /**
-         * static factory method to convert {@link WorkloadGroupState} into {@link WorkloadGroupStatsHolder}
+         * static factory method to convert {@link WorkloadGroupState} into {@link WorkloadGroupStatsHolder}, with no
+         * live queue depth (used where a queue service is not available, e.g. tests).
          * @param workloadGroupState which needs to be converted
          * @return WorkloadGroupStatsHolder object
          */
         public static WorkloadGroupStatsHolder from(WorkloadGroupState workloadGroupState) {
+            return from(workloadGroupState, 0L, 0L);
+        }
+
+        /**
+         * static factory method to convert {@link WorkloadGroupState} into {@link WorkloadGroupStatsHolder}, including
+         * the point-in-time queue depth gauges (which live in the queue service, not the state).
+         * @param workloadGroupState which needs to be converted
+         * @param queuedCurrent current queued depth for this group
+         * @param queuePeak peak queued depth for this group
+         * @return WorkloadGroupStatsHolder object
+         */
+        public static WorkloadGroupStatsHolder from(WorkloadGroupState workloadGroupState, long queuedCurrent, long queuePeak) {
             final WorkloadGroupStatsHolder statsHolder = new WorkloadGroupStatsHolder();
 
             Map<ResourceType, ResourceStats> resourceStatsMap = new HashMap<>();
@@ -174,6 +243,11 @@ public class WorkloadGroupStats implements ToXContentObject, Writeable {
             statsHolder.failures = workloadGroupState.getFailures();
             statsHolder.cancellations = workloadGroupState.getTotalCancellations();
             statsHolder.throttled = workloadGroupState.getTotalThrottled();
+            statsHolder.queued = workloadGroupState.getTotalQueued();
+            statsHolder.queueRejections = workloadGroupState.getTotalQueueRejections();
+            statsHolder.queueTimeouts = workloadGroupState.getTotalQueueTimeouts();
+            statsHolder.queuedCurrent = queuedCurrent;
+            statsHolder.queuePeak = queuePeak;
             statsHolder.resourceStats = resourceStatsMap;
             return statsHolder;
         }
@@ -192,6 +266,11 @@ public class WorkloadGroupStats implements ToXContentObject, Writeable {
             // version-gated to match the StreamInput ctor; read/write order must stay in sync.
             if (out.getVersion().onOrAfter(Version.V_3_7_0)) {
                 out.writeVLong(statsHolder.throttled);
+                out.writeVLong(statsHolder.queued);
+                out.writeVLong(statsHolder.queueRejections);
+                out.writeVLong(statsHolder.queueTimeouts);
+                out.writeVLong(statsHolder.queuedCurrent);
+                out.writeVLong(statsHolder.queuePeak);
             }
             out.writeMap(statsHolder.resourceStats, (o, val) -> o.writeString(val.getName()), ResourceStats::writeTo);
         }
@@ -209,6 +288,11 @@ public class WorkloadGroupStats implements ToXContentObject, Writeable {
             // builder.field(FAILURES, failures);
             builder.field(TOTAL_CANCELLATIONS, cancellations);
             builder.field(THROTTLED, throttled);
+            builder.field(QUEUED, queued);
+            builder.field(QUEUE_REJECTIONS, queueRejections);
+            builder.field(QUEUE_TIMEOUTS, queueTimeouts);
+            builder.field(QUEUED_CURRENT, queuedCurrent);
+            builder.field(QUEUE_PEAK, queuePeak);
 
             for (ResourceType resourceType : ResourceType.getSortedValues()) {
                 ResourceStats resourceStats1 = resourceStats.get(resourceType);
@@ -230,12 +314,29 @@ public class WorkloadGroupStats implements ToXContentObject, Writeable {
                 && Objects.equals(resourceStats, that.resourceStats)
                 && failures == that.failures
                 && cancellations == that.cancellations
-                && throttled == that.throttled;
+                && throttled == that.throttled
+                && queued == that.queued
+                && queueRejections == that.queueRejections
+                && queueTimeouts == that.queueTimeouts
+                && queuedCurrent == that.queuedCurrent
+                && queuePeak == that.queuePeak;
         }
 
         @Override
         public int hashCode() {
-            return Objects.hash(completions, rejections, cancellations, failures, throttled, resourceStats);
+            return Objects.hash(
+                completions,
+                rejections,
+                cancellations,
+                failures,
+                throttled,
+                queued,
+                queueRejections,
+                queueTimeouts,
+                queuedCurrent,
+                queuePeak,
+                resourceStats
+            );
         }
     }
 
