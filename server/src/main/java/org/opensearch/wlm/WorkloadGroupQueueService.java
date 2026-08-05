@@ -96,20 +96,20 @@ public class WorkloadGroupQueueService {
     }
 
     // Parks a request (fresh or re-parked) and registers its cancellation callback. Returns false if the queue is full.
-    // Cancellation is registered AFTER offer so it can reference the enqueued request; addOnCancelledCallback runs the
-    // callback immediately if the task is already cancelled, closing the race where cancellation lands between enqueue
-    // and registration.
+    // Cancellation is registered AFTER a successful offer (it references the enqueued request) but STILL UNDER the
+    // bucket lock: a concurrent drain that admits this request must take the same lock, so installing the handle inside
+    // the lock guarantees a racing admit cannot poll the request before its cancellation handle exists (which would
+    // leave the callback registered on an already-admitted task forever). addOnCancelledCallback runs the callback
+    // immediately if the task is already cancelled, closing the race where cancellation lands during enqueue.
     private boolean enqueue(String groupId, WorkloadGroupQueue.QueuedRequest req, int size) {
         WorkloadGroupQueue queue = queuesByGroup.computeIfAbsent(groupId, k -> new WorkloadGroupQueue());
-        final boolean enqueued;
         try (Releasable ignored = bucketLocks.acquire(lockKey(groupId, req.bucketKey()))) {
-            enqueued = queue.offer(req, size);
+            if (queue.offer(req, size) == false) {
+                return false;
+            }
+            req.cancellationHandle = req.task().addOnCancelledCallback(() -> evictCancelled(groupId, req));
+            return true;
         }
-        if (enqueued == false) {
-            return false;
-        }
-        req.cancellationHandle = req.task().addOnCancelledCallback(() -> evictCancelled(groupId, req));
-        return true;
     }
 
     /**
@@ -213,6 +213,12 @@ public class WorkloadGroupQueueService {
                 drain.drain(groupId, bucketKey);
             }
         }
+        // Note: an emptied group queue's map entry is intentionally NOT pruned here. A concurrent tryEnqueue could
+        // offer to the same WorkloadGroupQueue between an "is it empty" check and its removal, which would orphan that
+        // freshly-parked request (present in the queue object but no longer reachable from queuesByGroup). The leak is
+        // one small empty object per group ever used — negligible (groups are few and long-lived) — and not worth a
+        // race to reclaim. A parked request for a DELETED group is still failed here by the deadline eviction above,
+        // independent of whether the group exists in cluster state.
     }
 
     /** Total parked requests across all groups on this coordinator. Cheap; used for the node-drain fast-out. */
@@ -239,15 +245,16 @@ public class WorkloadGroupQueueService {
     // --- internals ---
 
     // Completes a parked listener with an acquired permit, off the caller's thread. Deregisters the cancellation
-    // callback first (the request is leaving the queue). If the task was cancelled in the meantime, release the permit
-    // and fail rather than starting a doomed search.
+    // callback first (the request is leaving the queue).
+    //
+    // The ENTIRE body — including the cancelled-task branch that closes the permit — runs on the GENERIC executor, never
+    // inline on the caller's (draining/completion) thread. This is load-bearing for recursion safety: for a node-tier
+    // permit, permit.close() is the wrapNodePermit wrapper whose close() re-enters drainNode -> admit. Running close()
+    // on the caller thread would let a run of consecutively-cancelled waiters recurse close -> drainNode -> admit ->
+    // close ... one synchronous frame per waiter (StackOverflow under a cancel storm). Dispatching first means each such
+    // hop is a fresh executor task, so the chain unwinds across tasks rather than down one stack.
     private void admit(WorkloadGroupQueue.QueuedRequest req, Releasable permit) {
         req.releaseCancellationHandle();
-        if (req.task().isCancelled()) {
-            permit.close();
-            req.listener().onFailure(new TaskCancelledException("task cancelled while queued"));
-            return;
-        }
         threadPool.executor(ThreadPool.Names.GENERIC).execute(() -> {
             if (req.task().isCancelled()) {
                 permit.close();
@@ -258,7 +265,10 @@ public class WorkloadGroupQueueService {
         });
     }
 
-    // Cancellation callback: remove the entry (if still queued) and fail it. Runs on whatever thread cancelled the task.
+    // Cancellation callback: remove the entry (if still queued) and fail it. Runs on whatever thread cancelled the task
+    // — including, for a task already cancelled at enqueue time, inline under the enqueue bucket lock (KeyedLock is
+    // reentrant, so re-acquiring below does not deadlock). The failure is dispatched on the GENERIC executor rather
+    // than completed inline so the listener is never completed while a bucket lock is held (consistent with admit()).
     private void evictCancelled(String groupId, WorkloadGroupQueue.QueuedRequest req) {
         WorkloadGroupQueue queue = queuesByGroup.get(groupId);
         if (queue == null) {
@@ -269,7 +279,8 @@ public class WorkloadGroupQueueService {
             removed = queue.remove(req);
         }
         if (removed) {
-            req.listener().onFailure(new TaskCancelledException("task cancelled while queued"));
+            threadPool.executor(ThreadPool.Names.GENERIC)
+                .execute(() -> req.listener().onFailure(new TaskCancelledException("task cancelled while queued")));
         }
     }
 

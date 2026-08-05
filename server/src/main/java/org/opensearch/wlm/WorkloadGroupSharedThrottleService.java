@@ -419,12 +419,18 @@ public class WorkloadGroupSharedThrottleService implements ClusterStateListener 
         if (sharedLimit == WorkloadGroupThrottleSettings.UNSET_LIMIT) {
             return; // reclaim-only release (e.g. failed-acquire cleanup): never drive a grant
         }
-        // Bound the loop by the current waiter-set size so we never spin more than the waiters we started with.
-        int maxAttempts = waiterCount(bucketKey);
+        // Absolute safety cap on total iterations to bound work and rule out livelock, while still allowing the loop to
+        // react to waiters that REGISTER during it. A fixed snapshot of waiterCount is not enough: a stale local waiter
+        // or a disconnected waiter frees the reserved slot without handing it off, and a coordinator can registerWaiter
+        // (on a concurrent denied acquire) after the snapshot — leaving a free slot with an un-granted waiter, which
+        // would otherwise strand until the next unrelated release (a spurious queue.timeout despite free capacity).
+        // The cap is generous (waiters at entry, doubled, plus a constant); each iteration makes progress (serves,
+        // drops a stale/disconnected waiter, or stops), so the loop terminates well within it in practice.
+        final int maxAttempts = Math.max(1, waiterCount(bucketKey) * 2 + 8);
         for (int attempt = 0; attempt < maxAttempts; attempt++) {
             final DiscoveryNode target = pickWaiter(bucketKey);
             if (target == null) {
-                return; // no waiters
+                return; // no waiters currently registered
             }
             final String reservedLeaseId = leaseId();
             // Reserve the freed slot so a concurrent acquire can't take it before the grant lands. If the bucket is at
@@ -435,17 +441,18 @@ public class WorkloadGroupSharedThrottleService implements ClusterStateListener 
             }
             if (target.getId().equals(clusterService.localNode().getId())) {
                 // Local waiter: consume in-process. Returns true if it admitted a queued request (slot handed off).
-                // If false (no queued request), it already released the reserved slot; loop to the next waiter.
+                // If false (no queued request), it already released the reserved slot; loop to try another waiter with
+                // the (now re-freed) slot — including any registered concurrently with this loop.
                 if (consumeGrantLocal(bucketKey, sharedLimit, reservedLeaseId, target)) {
                     return;
                 }
-                // fall through to try the next waiter with the (now re-freed) slot
+                // fall through: slot freed but not handed off -> re-check for a (possibly newly-registered) waiter
             } else if (transportService.nodeConnected(target) == false) {
                 // Disconnected waiter: reclaim the reserved slot, drop it, and loop to the next waiter — handled here
                 // in the bounded loop rather than by recursing through sendGrant.
                 tracker.release(bucketKey, reservedLeaseId);
                 removeWaiter(bucketKey, target);
-                // fall through to try the next waiter
+                // fall through: slot freed but not handed off -> re-check
             } else {
                 // Remote, connected waiter: fire the grant and stop. Delivery failure and unused-grant return are
                 // handled asynchronously by sendGrant's response handler + the grant handler (which re-drive once).
