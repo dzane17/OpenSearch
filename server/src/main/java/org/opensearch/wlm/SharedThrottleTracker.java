@@ -13,6 +13,7 @@ import org.opensearch.common.annotation.ExperimentalApi;
 import java.util.Iterator;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.LongAdder;
 import java.util.function.LongSupplier;
 
 /**
@@ -40,12 +41,35 @@ import java.util.function.LongSupplier;
  * </ul>
  * A bucket entry exists only while it has at least one live lease, so memory scales with concurrently-active
  * buckets, not the total user/role population.
+ * <p>
+ * Prune cost: reclaiming expired leases is an O(size) scan of the bucket's lease map. To keep a saturated hot bucket
+ * from paying that scan on every denied acquire, each bucket caches the earliest lease expiry ({@code minExpiry}); the
+ * scan is skipped whenever the bucket is full but nothing can have expired yet ({@code minExpiry > now}), which is the
+ * common case under sustained load (fresh leases, long TTL). The scan still runs promptly the moment a lease actually
+ * expires, so reclamation is never delayed.
  */
 @ExperimentalApi
 public class SharedThrottleTracker {
 
-    private final Map<String, Map<String, Long>> leasesByBucket = new ConcurrentHashMap<>();
+    /**
+     * Per-bucket state: the live leases plus the earliest expiry among them. Both fields are only read and written
+     * inside a {@code leasesByBucket.compute(...)} block, i.e. under the outer map's per-key bin lock, so the plain
+     * {@code long} needs no additional synchronization. {@code minExpiry} is a lower bound on the true earliest expiry:
+     * it is tightened on insert and recomputed exactly during a prune, but deliberately left stale (small) on
+     * {@link #release} — removing a lease can only raise the true minimum, so a stale-small value can at most trigger
+     * one extra (harmless) scan, never cause a full bucket to skip a scan that would have freed a slot.
+     */
+    private static final class Bucket {
+        final Map<String, Long> leases = new ConcurrentHashMap<>();
+        long minExpiry = Long.MAX_VALUE;
+    }
+
+    private final Map<String, Bucket> leasesByBucket = new ConcurrentHashMap<>();
     private final LongSupplier nanoTimeSupplier;
+
+    // Number of times an O(size) expiry scan actually ran (as opposed to being skipped by the minExpiry guard).
+    // Package-private diagnostic, used by tests to assert the scan-skipping optimization holds.
+    private final LongAdder pruneScans = new LongAdder();
 
     public SharedThrottleTracker() {
         this(System::nanoTime);
@@ -66,25 +90,29 @@ public class SharedThrottleTracker {
      *         is already at the limit
      */
     public boolean tryAcquire(String bucketKey, int sharedLimit, String leaseId, long ttlNanos) {
-        final long expiresAt = nanoTimeSupplier.getAsLong() + ttlNanos;
+        final long now = nanoTimeSupplier.getAsLong();
+        final long expiresAt = now + ttlNanos;
         final boolean[] granted = new boolean[1];
-        leasesByBucket.compute(bucketKey, (k, leases) -> {
-            if (leases == null) {
-                leases = new ConcurrentHashMap<>();
+        leasesByBucket.compute(bucketKey, (k, bucket) -> {
+            if (bucket == null) {
+                bucket = new Bucket();
             }
-            // Only prune when the bucket looks full. An expired lease can change the outcome only when we would
-            // otherwise reject; below the limit there is a free slot regardless, so we skip the O(size) scan and keep
-            // the common under-limit acquire O(1). A saturated bucket still self-heals its stuck leases right here, at
-            // the one moment it matters. (Leases in an idle bucket are reclaimed by the periodic sweep instead.)
-            if (leases.size() >= sharedLimit) {
-                pruneExpired(leases);
+            // Only scan when the bucket looks full AND some lease could actually have expired. Below the limit there
+            // is a free slot regardless; and while minExpiry > now every lease is still live, so the O(size) scan
+            // could not free anything. Skipping it keeps the common saturated-but-fresh acquire O(1) while still
+            // self-healing stuck leases the instant one expires.
+            if (bucket.leases.size() >= sharedLimit && bucket.minExpiry <= now) {
+                pruneExpired(bucket, now);
             }
-            if (leases.size() < sharedLimit) {
-                leases.put(leaseId, expiresAt);
+            if (bucket.leases.size() < sharedLimit) {
+                bucket.leases.put(leaseId, expiresAt);
+                if (expiresAt < bucket.minExpiry) {
+                    bucket.minExpiry = expiresAt;
+                }
                 granted[0] = true;
             }
-            // Never leave an empty map behind (keeps the live set == active buckets).
-            return leases.isEmpty() ? null : leases;
+            // Never leave an empty bucket behind (keeps the live set == active buckets).
+            return bucket.leases.isEmpty() ? null : bucket;
         });
         return granted[0];
     }
@@ -98,9 +126,12 @@ public class SharedThrottleTracker {
      * @param leaseId   the lease id returned to the coordinator at acquire time
      */
     public void release(String bucketKey, String leaseId) {
-        leasesByBucket.computeIfPresent(bucketKey, (k, leases) -> {
-            leases.remove(leaseId);
-            return leases.isEmpty() ? null : leases;
+        leasesByBucket.computeIfPresent(bucketKey, (k, bucket) -> {
+            bucket.leases.remove(leaseId);
+            // minExpiry is intentionally left unchanged: removing a lease can only raise the true earliest expiry, so
+            // the cached value stays a valid (possibly loose) lower bound. Recomputing here would add an O(size) scan
+            // to the release hot path for no correctness benefit.
+            return bucket.leases.isEmpty() ? null : bucket;
         });
     }
 
@@ -109,18 +140,19 @@ public class SharedThrottleTracker {
      * Safe to run concurrently with {@link #tryAcquire}/{@link #release} thanks to per-key {@code compute}.
      */
     public void sweepExpired() {
+        final long now = nanoTimeSupplier.getAsLong();
         for (String bucketKey : leasesByBucket.keySet()) {
-            leasesByBucket.computeIfPresent(bucketKey, (k, leases) -> {
-                pruneExpired(leases);
-                return leases.isEmpty() ? null : leases;
+            leasesByBucket.computeIfPresent(bucketKey, (k, bucket) -> {
+                pruneExpired(bucket, now);
+                return bucket.leases.isEmpty() ? null : bucket;
             });
         }
     }
 
     // Current live (non-expired-at-read-time) count for a bucket. Package-private for tests.
     int inFlight(String bucketKey) {
-        Map<String, Long> leases = leasesByBucket.get(bucketKey);
-        return leases == null ? 0 : leases.size();
+        Bucket bucket = leasesByBucket.get(bucketKey);
+        return bucket == null ? 0 : bucket.leases.size();
     }
 
     // Number of buckets currently holding at least one lease. Package-private for tests.
@@ -128,12 +160,24 @@ public class SharedThrottleTracker {
         return leasesByBucket.size();
     }
 
-    private void pruneExpired(Map<String, Long> leases) {
-        final long now = nanoTimeSupplier.getAsLong();
-        for (Iterator<Map.Entry<String, Long>> it = leases.entrySet().iterator(); it.hasNext();) {
-            if (it.next().getValue() <= now) {
+    // Number of O(size) expiry scans performed so far. Package-private for tests to verify scan-skipping.
+    long pruneScanCount() {
+        return pruneScans.sum();
+    }
+
+    // Removes every expired lease and recomputes the bucket's earliest surviving expiry. Runs the O(size) scan, so it
+    // is only reached when a scan is actually warranted (see the guard in tryAcquire) or from the periodic sweep.
+    private void pruneExpired(Bucket bucket, long now) {
+        pruneScans.increment();
+        long min = Long.MAX_VALUE;
+        for (Iterator<Map.Entry<String, Long>> it = bucket.leases.entrySet().iterator(); it.hasNext();) {
+            final long expiresAt = it.next().getValue();
+            if (expiresAt <= now) {
                 it.remove();
+            } else if (expiresAt < min) {
+                min = expiresAt;
             }
         }
+        bucket.minExpiry = min;
     }
 }

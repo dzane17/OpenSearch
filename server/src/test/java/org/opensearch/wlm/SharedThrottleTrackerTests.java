@@ -149,4 +149,70 @@ public class SharedThrottleTrackerTests extends OpenSearchTestCase {
         assertFalse(tracker.tryAcquire("a", 1, "la2", TTL));
         assertEquals(2, tracker.activeBuckets());
     }
+
+    public void testSaturatedBucketWithFreshLeasesSkipsPruneScan() {
+        // The minExpiry guard: while a full bucket's leases are all still live, repeated denied acquires must not
+        // trigger the O(size) expiry scan at all.
+        AtomicLong clock = new AtomicLong(0);
+        SharedThrottleTracker tracker = new SharedThrottleTracker(clock::get);
+        assertTrue(tracker.tryAcquire("b", 2, "l1", 100)); // expires at 100
+        assertTrue(tracker.tryAcquire("b", 2, "l2", 100)); // expires at 100
+        assertEquals("no scan needed to fill an empty bucket", 0, tracker.pruneScanCount());
+        for (int i = 0; i < 50; i++) {
+            assertFalse("full bucket denies while fresh", tracker.tryAcquire("b", 2, "denied-" + i, 100));
+        }
+        assertEquals("no expiry scan runs while every lease is still live", 0, tracker.pruneScanCount());
+    }
+
+    public void testSaturatedBucketScansOnceLeasesCanExpire() {
+        // The flip side: the instant a lease could have expired (minExpiry <= now), a full-bucket acquire runs exactly
+        // one scan, reclaims, and admits.
+        AtomicLong clock = new AtomicLong(0);
+        SharedThrottleTracker tracker = new SharedThrottleTracker(clock::get);
+        assertTrue(tracker.tryAcquire("b", 2, "l1", 100)); // expires at 100
+        assertTrue(tracker.tryAcquire("b", 2, "l2", 100)); // expires at 100
+        assertFalse(tracker.tryAcquire("b", 2, "l3", 100)); // denied while fresh, no scan
+        assertEquals(0, tracker.pruneScanCount());
+        clock.set(100); // both leases now at/past expiry
+        assertTrue("expired leases reclaimed and slot granted", tracker.tryAcquire("b", 2, "l4", 100));
+        assertEquals("exactly one scan ran once expiry was possible", 1, tracker.pruneScanCount());
+        assertEquals(1, tracker.inFlight("b"));
+    }
+
+    public void testReleaseLeavesMinExpiryStaleButReclamationStillCorrect() {
+        // release() intentionally does not recompute minExpiry. Verify the resulting stale-small bound is safe: it may
+        // cost at most one extra scan but never causes a full bucket to wrongly skip reclaiming an expired lease.
+        AtomicLong clock = new AtomicLong(0);
+        SharedThrottleTracker tracker = new SharedThrottleTracker(clock::get);
+        assertTrue(tracker.tryAcquire("b", 2, "early", 100)); // expires at 100 -> minExpiry = 100
+        assertTrue(tracker.tryAcquire("b", 2, "late", 1000)); // expires at 1000
+        tracker.release("b", "early"); // removes the earliest lease; minExpiry stays a stale 100
+        assertTrue(tracker.tryAcquire("b", 2, "l3", 1000)); // refill to the limit; "late" (1000) + "l3" (1000) live
+        assertFalse(tracker.tryAcquire("b", 2, "l4", 1000)); // full again
+        clock.set(500); // past the stale minExpiry (100) but before any real expiry (1000)
+        // Guard fires on the stale bound and scans, but nothing is expired -> no reclaim, still denied. The scan is the
+        // documented "one wasted scan", and correctness (no over-admission) holds.
+        assertFalse("nothing truly expired -> still denied", tracker.tryAcquire("b", 2, "l5", 1000));
+        assertEquals(2, tracker.inFlight("b"));
+        clock.set(1000); // now the real leases expire
+        assertTrue("real expiry is reclaimed on the next acquire", tracker.tryAcquire("b", 2, "l6", 1000));
+        assertEquals(1, tracker.inFlight("b"));
+    }
+
+    public void testSweepRecomputesMinExpiryEnablingLaterSkip() {
+        // After a periodic sweep prunes expired leases, the recomputed minExpiry must let a still-full bucket skip the
+        // scan again while the survivors remain fresh.
+        AtomicLong clock = new AtomicLong(0);
+        SharedThrottleTracker tracker = new SharedThrottleTracker(clock::get);
+        assertTrue(tracker.tryAcquire("b", 2, "l1", 100));  // expires at 100
+        assertTrue(tracker.tryAcquire("b", 2, "l2", 1_000)); // expires at 1000
+        clock.set(100); // l1 expired
+        tracker.sweepExpired(); // prunes l1, recomputes minExpiry to l2's expiry (1000)
+        assertEquals(1, tracker.pruneScanCount());
+        assertTrue(tracker.tryAcquire("b", 2, "l3", 1_000)); // back to full; survivors expire at 1000
+        for (int i = 0; i < 20; i++) {
+            assertFalse(tracker.tryAcquire("b", 2, "denied-" + i, 1_000));
+        }
+        assertEquals("no further scans while survivors are fresh", 1, tracker.pruneScanCount());
+    }
 }
