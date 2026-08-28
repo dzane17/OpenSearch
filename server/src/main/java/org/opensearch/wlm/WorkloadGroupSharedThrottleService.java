@@ -33,6 +33,7 @@ import org.opensearch.transport.TransportResponseHandler;
 import org.opensearch.transport.TransportService;
 
 import java.io.IOException;
+import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
@@ -116,13 +117,13 @@ public class WorkloadGroupSharedThrottleService implements ClusterStateListener 
         transportService.registerRequestHandler(
             ACQUIRE_ACTION_NAME,
             ThreadPool.Names.SAME,
-            AcquireRequest::new,
+            AcquirePermitRequest::new,
             (request, channel, task) -> channel.sendResponse(handleAcquire(request))
         );
         transportService.registerRequestHandler(
             RELEASE_ACTION_NAME,
             ThreadPool.Names.SAME,
-            ReleaseRequest::new,
+            ReleasePermitRequest::new,
             (request, channel, task) -> {
                 tracker.release(request.bucketKey, request.permitId);
                 channel.sendResponse(TransportResponse.Empty.INSTANCE);
@@ -217,16 +218,16 @@ public class WorkloadGroupSharedThrottleService implements ClusterStateListener 
         transportService.sendRequest(
             owner,
             ACQUIRE_ACTION_NAME,
-            new AcquireRequest(bucketKey, sharedLimit, permitId, ttlNanos),
+            new AcquirePermitRequest(bucketKey, sharedLimit, permitId, ttlNanos),
             options,
-            new TransportResponseHandler<AcquireResponse>() {
+            new TransportResponseHandler<AcquirePermitResponse>() {
                 @Override
-                public AcquireResponse read(StreamInput in) throws IOException {
-                    return new AcquireResponse(in);
+                public AcquirePermitResponse read(StreamInput in) throws IOException {
+                    return new AcquirePermitResponse(in);
                 }
 
                 @Override
-                public void handleResponse(AcquireResponse response) {
+                public void handleResponse(AcquirePermitResponse response) {
                     if (response.granted) {
                         listener.onResponse(releaseRemote(owner, bucketKey, permitId));
                     } else {
@@ -255,9 +256,9 @@ public class WorkloadGroupSharedThrottleService implements ClusterStateListener 
     }
 
     // Owner-side admission. Package-private for tests.
-    AcquireResponse handleAcquire(AcquireRequest request) {
+    AcquirePermitResponse handleAcquire(AcquirePermitRequest request) {
         boolean granted = tracker.tryAcquire(request.bucketKey, request.sharedLimit, request.permitId, request.ttlNanos);
-        return new AcquireResponse(granted);
+        return new AcquirePermitResponse(granted);
     }
 
     private Releasable releaseLocal(String bucketKey, String permitId) {
@@ -276,7 +277,7 @@ public class WorkloadGroupSharedThrottleService implements ClusterStateListener 
         transportService.sendRequest(
             owner,
             RELEASE_ACTION_NAME,
-            new ReleaseRequest(bucketKey, permitId),
+            new ReleasePermitRequest(bucketKey, permitId),
             options,
             new TransportResponseHandler<TransportResponse.Empty>() {
                 @Override
@@ -336,82 +337,167 @@ public class WorkloadGroupSharedThrottleService implements ClusterStateListener 
     }
 
     /**
-     * Acquire RPC: a coordinator asks the bucket's owner to admit one request under {@code sharedLimit}.
+     * Shared body helpers for the RPC types below. All three serialize their body as ONE count-prefixed, name-keyed map
+     * rather than as positional fields, so a peer built from a different commit of the same release stays interoperable.
+     * OpenSearch transport serde is otherwise positional, and a {@code Version} gate cannot separate two builds that
+     * report the same version — which is exactly what a blue/green deployment produces.
+     * <p>
+     * <b>The rule for reading depends on when a field was introduced, not on what the field does.</b>
+     * <ul>
+     *   <li><b>Baseline fields</b> — the ones below, present since this map format was introduced. Every build that speaks
+     *       this protocol sends them, so absence means genuine corruption or a truly incompatible peer, never ordinary
+     *       version skew. Read them with {@code require*}: a throw happens while the transport layer is decoding, before
+     *       any handler runs, so it becomes a clean error response — exactly what the positional format already did for a
+     *       malformed message. Strictness therefore costs nothing and preserves the existing behavior.</li>
+     *   <li><b>Fields added after this point</b> — may be read strictly ONLY where the sender is guaranteed to have sent
+     *       them, which in practice means gating the read on the stream's version. That version is the NEGOTIATED MINIMUM
+     *       of the two nodes ({@code Version.min}, see NativeOutboundHandler), not the sender's alone — which is what
+     *       makes the gate safe here: min is never above the sender, so a peer that predates the field always takes the
+     *       else branch and the strict read never runs.
+     *       <pre>
+     *       if (in.getVersion().onOrAfter(V_X)) {{@code newField = requireString(body, KEY_NEW);}}
+     *       else {{@code newField = SOME_DEFAULT;}}
+     *       </pre>
+     *       That is preferable to an unconditional default where it applies, because it still catches a peer that should
+     *       have sent the field. It does NOT apply to the case this format exists for: two builds reporting the SAME
+     *       version, one with the field and one without. A version gate cannot separate those, so a field that can appear
+     *       in same-version skew must be read with a safe default — otherwise it throws on EVERY message from EVERY older
+     *       build for the whole rollout window, systematically, discarding the benefit of this format.</li>
+     * </ul>
+     * Values are generic, so a future field keeps its natural type. Stick to types in {@code StreamOutput.WRITERS}
+     * (String, Integer, Long, Boolean, List, Map): a value whose type an older peer's {@code readGenericValue} does not
+     * know would throw while decoding, defeating the tolerance.
      */
-    public static class AcquireRequest extends TransportRequest {
+    private static Map<String, Object> readBody(StreamInput in) throws IOException {
+        return in.readMap(StreamInput::readString, StreamInput::readGenericValue);
+    }
+
+    // --- baseline fields: strict, matching what the positional format did for a malformed message ---
+
+    private static String requireString(Map<String, Object> body, String key) {
+        final Object value = body.get(key);
+        if (value instanceof String s) {
+            return s;
+        }
+        throw new IllegalStateException("wlm shared-throttle: key [" + key + "] missing or not a String [" + value + "]");
+    }
+
+    private static Number requireNumber(Map<String, Object> body, String key) {
+        final Object value = body.get(key);
+        if (value instanceof Number n) {
+            return n;
+        }
+        throw new IllegalStateException("wlm shared-throttle: key [" + key + "] missing or not a Number [" + value + "]");
+    }
+
+    private static boolean requireBoolean(Map<String, Object> body, String key) {
+        final Object value = body.get(key);
+        if (value instanceof Boolean b) {
+            return b;
+        }
+        throw new IllegalStateException("wlm shared-throttle: key [" + key + "] missing or not a Boolean [" + value + "]");
+    }
+
+    // Adding a field? Read it strictly only if a version gate guarantees the sender has it; if it can be absent from a
+    // same-version build, read it with a safe default instead. See the rule above.
+
+    /**
+     * {@code coord -> owner}. Acquire RPC: a coordinator asks the bucket's owner to admit one request under
+     * {@code sharedLimit}.
+     */
+    public static class AcquirePermitRequest extends TransportRequest {
+        static final String KEY_BUCKET = "bucket_key";
+        static final String KEY_SHARED_LIMIT = "shared_limit";
+        static final String KEY_PERMIT_ID = "permit_id";
+        static final String KEY_TTL_NANOS = "ttl_nanos";
+
         final String bucketKey;
         final int sharedLimit;
         final String permitId;
         final long ttlNanos;
 
-        AcquireRequest(String bucketKey, int sharedLimit, String permitId, long ttlNanos) {
+        AcquirePermitRequest(String bucketKey, int sharedLimit, String permitId, long ttlNanos) {
             this.bucketKey = bucketKey;
             this.sharedLimit = sharedLimit;
             this.permitId = permitId;
             this.ttlNanos = ttlNanos;
         }
 
-        AcquireRequest(StreamInput in) throws IOException {
+        AcquirePermitRequest(StreamInput in) throws IOException {
             super(in);
-            this.bucketKey = in.readString();
-            this.sharedLimit = in.readVInt();
-            this.permitId = in.readString();
-            this.ttlNanos = in.readVLong();
+            final Map<String, Object> body = readBody(in);
+            this.bucketKey = requireString(body, KEY_BUCKET);
+            this.sharedLimit = requireNumber(body, KEY_SHARED_LIMIT).intValue();
+            this.permitId = requireString(body, KEY_PERMIT_ID);
+            this.ttlNanos = requireNumber(body, KEY_TTL_NANOS).longValue();
+            // Any other key is a field this build does not know about: ignored on purpose. That is the tolerance.
         }
 
         @Override
         public void writeTo(StreamOutput out) throws IOException {
             super.writeTo(out);
-            out.writeString(bucketKey);
-            out.writeVInt(sharedLimit);
-            out.writeString(permitId);
-            out.writeVLong(ttlNanos);
+            out.writeMap(
+                Map.of(KEY_BUCKET, bucketKey, KEY_SHARED_LIMIT, sharedLimit, KEY_PERMIT_ID, permitId, KEY_TTL_NANOS, ttlNanos),
+                StreamOutput::writeString,
+                StreamOutput::writeGenericValue
+            );
         }
     }
 
     /**
-     * Acquire RPC response: whether the owner granted a shared permit.
+     * {@code owner -> coord}. Acquire RPC response: whether the owner granted a shared permit.
      */
-    public static class AcquireResponse extends TransportResponse {
+    public static class AcquirePermitResponse extends TransportResponse {
+        static final String KEY_GRANTED = "granted";
+
         final boolean granted;
 
-        AcquireResponse(boolean granted) {
+        AcquirePermitResponse(boolean granted) {
             this.granted = granted;
         }
 
-        AcquireResponse(StreamInput in) throws IOException {
-            this.granted = in.readBoolean();
+        AcquirePermitResponse(StreamInput in) throws IOException {
+            final Map<String, Object> body = readBody(in);
+            this.granted = requireBoolean(body, KEY_GRANTED);
         }
 
         @Override
         public void writeTo(StreamOutput out) throws IOException {
-            out.writeBoolean(granted);
+            out.writeMap(Map.of(KEY_GRANTED, granted), StreamOutput::writeString, StreamOutput::writeGenericValue);
         }
     }
 
     /**
-     * Release RPC: fire-and-forget, tells the owner to drop a previously-granted permit.
+     * {@code coord -> owner}. Release RPC: fire-and-forget, tells the owner to drop a previously-granted permit.
      */
-    public static class ReleaseRequest extends TransportRequest {
+    public static class ReleasePermitRequest extends TransportRequest {
+        static final String KEY_BUCKET = "bucket_key";
+        static final String KEY_PERMIT_ID = "permit_id";
+
         final String bucketKey;
         final String permitId;
 
-        ReleaseRequest(String bucketKey, String permitId) {
+        ReleasePermitRequest(String bucketKey, String permitId) {
             this.bucketKey = bucketKey;
             this.permitId = permitId;
         }
 
-        ReleaseRequest(StreamInput in) throws IOException {
+        ReleasePermitRequest(StreamInput in) throws IOException {
             super(in);
-            this.bucketKey = in.readString();
-            this.permitId = in.readString();
+            final Map<String, Object> body = readBody(in);
+            this.bucketKey = requireString(body, KEY_BUCKET);
+            this.permitId = requireString(body, KEY_PERMIT_ID);
+            // Any other key is a field this build does not know about: ignored on purpose. That is the tolerance.
         }
 
         @Override
         public void writeTo(StreamOutput out) throws IOException {
             super.writeTo(out);
-            out.writeString(bucketKey);
-            out.writeString(permitId);
+            out.writeMap(
+                Map.of(KEY_BUCKET, bucketKey, KEY_PERMIT_ID, permitId),
+                StreamOutput::writeString,
+                StreamOutput::writeGenericValue
+            );
         }
     }
 }
