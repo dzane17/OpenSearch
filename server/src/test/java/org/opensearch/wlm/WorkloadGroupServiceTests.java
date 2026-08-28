@@ -24,6 +24,7 @@ import org.opensearch.common.lease.Releasable;
 import org.opensearch.common.logging.Loggers;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.common.unit.TimeValue;
+import org.opensearch.common.util.concurrent.OpenSearchExecutors;
 import org.opensearch.common.util.concurrent.ThreadContext;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.concurrency.OpenSearchRejectedExecutionException;
@@ -507,7 +508,16 @@ public class WorkloadGroupServiceTests extends OpenSearchTestCase {
     private Releasable acquireThrottlePermitSync(WorkloadGroupService service, String workloadGroupId, String principal) {
         AtomicReference<Releasable> permit = new AtomicReference<>();
         AtomicReference<Exception> failure = new AtomicReference<>();
-        service.acquireThrottlePermit(workloadGroupId, principal, ActionListener.wrap(permit::set, failure::set));
+        // acquireThrottlePermit takes the task (it carries the workload group id and is observed for cancellation while
+        // queued). Build a SearchTask whose workload group id is the requested one via a real thread-context header
+        // (mockThreadPool is a Mockito mock, so use a self-contained ThreadContext here).
+        WorkloadGroupTask task = new SearchTask(1, "", "", () -> "", null, null);
+        ThreadContext threadContext = new ThreadContext(Settings.EMPTY);
+        if (workloadGroupId != null) {
+            threadContext.putHeader(WorkloadGroupTask.WORKLOAD_GROUP_ID_HEADER, workloadGroupId);
+        }
+        task.setWorkloadGroupId(threadContext);
+        service.acquireThrottlePermit(task, principal, ActionListener.wrap(permit::set, failure::set));
         if (failure.get() != null) {
             if (failure.get() instanceof RuntimeException) {
                 throw (RuntimeException) failure.get();
@@ -528,6 +538,130 @@ public class WorkloadGroupServiceTests extends OpenSearchTestCase {
             new MutableWorkloadGroupFragment(mode, Map.of(ResourceType.MEMORY, 0.5), Settings.EMPTY, throttling),
             1L
         );
+    }
+
+    // Same as throttledGroup but with queueing enabled, so a throttle denial can park instead of rejecting.
+    private WorkloadGroup queueingGroup(String id, Settings throttling, Settings queue, MutableWorkloadGroupFragment.ResiliencyMode mode) {
+        return new WorkloadGroup(
+            id + "-name",
+            id,
+            new MutableWorkloadGroupFragment(mode, Map.of(ResourceType.MEMORY, 0.5), Settings.EMPTY, throttling, queue),
+            1L
+        );
+    }
+
+    // Delivers a clusterChanged event whose CURRENT state holds exactly `currentGroups` (previous state holds `previous`).
+    private void deliverWorkloadGroupsChanged(Map<String, WorkloadGroup> previous, Map<String, WorkloadGroup> currentGroups) {
+        ClusterChangedEvent event = Mockito.mock(ClusterChangedEvent.class);
+        ClusterState previousState = Mockito.mock(ClusterState.class);
+        ClusterState currentState = Mockito.mock(ClusterState.class);
+        Metadata previousMetadata = Mockito.mock(Metadata.class);
+        Metadata currentMetadata = Mockito.mock(Metadata.class);
+        when(event.previousState()).thenReturn(previousState);
+        when(event.state()).thenReturn(currentState);
+        when(previousState.metadata()).thenReturn(previousMetadata);
+        when(currentState.metadata()).thenReturn(currentMetadata);
+        when(previousMetadata.workloadGroups()).thenReturn(previous);
+        when(currentMetadata.workloadGroups()).thenReturn(currentGroups);
+        workloadGroupService.clusterChanged(event);
+    }
+
+    public void testDisablingThrottlingImmediatelyReleasesTheQueuedBacklog() {
+        // Disabling throttling leaves parked requests with nothing to wait for, and an unthrottled group takes the
+        // no-permit fast path — so it produces no permit completions to drive a drain chain, and parked requests have no
+        // deadline. Without an explicit release they wait forever. Reacting to the config change must free them at once
+        // (the sweep is only the backstop). Note disabling throttling necessarily disables queueing in the same update:
+        // WorkloadGroup rejects a queue with no throttle limit, and validateMergedConfig rejects an all-unset throttling
+        // block, so "throttling off, queueing on" is unreachable and this is the only way to strand a backlog.
+        when(mockWorkloadManagementSettings.getWlmMode()).thenReturn(WlmMode.ENABLED);
+        mockWorkloadGroupsStateAccessor.addNewWorkloadGroup("wg-1");
+        when(mockThreadPool.executor(ThreadPool.Names.GENERIC)).thenReturn(OpenSearchExecutors.newDirectExecutorService());
+
+        Settings throttling = Settings.builder().put("attribute", "group").put("node_limit", 1).build();
+        Settings queue = Settings.builder().put("size_per_bucket", 5).build();
+        WorkloadGroup throttled = queueingGroup("wg-1", throttling, queue, MutableWorkloadGroupFragment.ResiliencyMode.ENFORCED);
+        stubClusterStateWithGroup(throttled);
+        WorkloadGroupQueueService queueService = new WorkloadGroupQueueService(mockThreadPool, mockWorkloadGroupsStateAccessor);
+        workloadGroupService.setQueueService(queueService);
+
+        // One request holds the single node slot; two more park behind it.
+        assertNotNull(acquireThrottlePermitSync(workloadGroupService, "wg-1", null));
+        assertNull(acquireThrottlePermitSync(workloadGroupService, "wg-1", null));
+        assertNull(acquireThrottlePermitSync(workloadGroupService, "wg-1", null));
+        assertEquals("two requests should be parked", 2, queueService.currentDepth("wg-1"));
+
+        // Operator disables throttling (and therefore queueing) on the group.
+        WorkloadGroup unthrottled = new WorkloadGroup(
+            "wg-1-name",
+            "wg-1",
+            new MutableWorkloadGroupFragment(MutableWorkloadGroupFragment.ResiliencyMode.ENFORCED, Map.of(ResourceType.MEMORY, 0.5)),
+            2L
+        );
+        deliverWorkloadGroupsChanged(Map.of("wg-1", throttled), Map.of("wg-1", unthrottled));
+
+        assertEquals("the whole backlog must be released as soon as throttling is disabled", 0, queueService.currentDepth("wg-1"));
+    }
+
+    public void testCompletionDrainHonoursALiveNodeLimitDecrease() {
+        // Regression: the node-tier drain chain used to capture node_limit when the chain started and reuse it for every
+        // subsequent hop. A busy bucket's chain runs one hop per request completion, so it can outlive a live node_limit
+        // update — and reusing the captured (higher) value kept admitting above the NEW lower limit until the chain broke.
+        // The drain must re-read node_limit from cluster state instead.
+        when(mockWorkloadManagementSettings.getWlmMode()).thenReturn(WlmMode.ENABLED);
+        mockWorkloadGroupsStateAccessor.addNewWorkloadGroup("wg-1");
+        Settings queue = Settings.builder().put("size_per_bucket", 5).build();
+
+        // Start at node_limit=2 and fill both slots, then park a third request.
+        Settings limit2 = Settings.builder().put("attribute", "group").put("node_limit", 2).build();
+        stubClusterStateWithGroup(queueingGroup("wg-1", limit2, queue, MutableWorkloadGroupFragment.ResiliencyMode.ENFORCED));
+        // This is the only test here that actually admits FROM the queue, so it needs a real executor: admit()
+        // dispatches the parked listener off the caller thread. Direct (same-thread) keeps the assertions synchronous —
+        // depth is decremented under the bucket lock before admit() runs, so inline dispatch does not affect what we assert.
+        when(mockThreadPool.executor(ThreadPool.Names.GENERIC)).thenReturn(OpenSearchExecutors.newDirectExecutorService());
+        WorkloadGroupQueueService queueService = new WorkloadGroupQueueService(mockThreadPool, mockWorkloadGroupsStateAccessor);
+        workloadGroupService.setQueueService(queueService);
+
+        Releasable first = acquireThrottlePermitSync(workloadGroupService, "wg-1", null);
+        Releasable second = acquireThrottlePermitSync(workloadGroupService, "wg-1", null);
+        assertNotNull(first);
+        assertNotNull(second);
+        // The 3rd breaches node_limit=2 with no shared tier configured, so it parks.
+        assertNull("third request should be parked, not admitted", acquireThrottlePermitSync(workloadGroupService, "wg-1", null));
+        assertEquals(1, queueService.currentDepth("wg-1"));
+
+        // Operator lowers node_limit to 1 while the bucket is busy with a backlog.
+        Settings limit1 = Settings.builder().put("attribute", "group").put("node_limit", 1).build();
+        stubClusterStateWithGroup(queueingGroup("wg-1", limit1, queue, MutableWorkloadGroupFragment.ResiliencyMode.ENFORCED));
+
+        // Completing one request drops in-flight to 1, which is already AT the new limit — so the drain must not admit
+        // the parked request. With the old captured limit of 2 it would have, over-admitting above the configured 1.
+        first.close();
+        assertEquals("drain must respect the lowered node_limit, leaving the request parked", 1, queueService.currentDepth("wg-1"));
+
+        // Completing the second drops in-flight to 0, leaving room under the new limit -> the parked request drains.
+        second.close();
+        assertEquals("a slot under the new limit must still drain the backlog", 0, queueService.currentDepth("wg-1"));
+    }
+
+    public void testMonitorModeNeverParksEvenWhenQueueingIsEnabled() {
+        // MONITOR observes and always admits — it must never park a request. Both queueing entry points are gated on
+        // monitorMode == false; without that guard a would-be-throttled monitor request would sit in the queue holding
+        // its listener and never be answered (monitor mode is supposed to be a dry run, so this would be a hang, not a
+        // rejection). Note a parked request and an admitted monitor request BOTH surface as a null permit here, so the
+        // queue depth is what actually distinguishes them.
+        when(mockWorkloadManagementSettings.getWlmMode()).thenReturn(WlmMode.ENABLED);
+        mockWorkloadGroupsStateAccessor.addNewWorkloadGroup("wg-1");
+        Settings throttling = Settings.builder().put("attribute", "group").put("node_limit", 1).build();
+        Settings queue = Settings.builder().put("size_per_bucket", 5).build();
+        stubClusterStateWithGroup(queueingGroup("wg-1", throttling, queue, MutableWorkloadGroupFragment.ResiliencyMode.MONITOR));
+        WorkloadGroupQueueService queueService = new WorkloadGroupQueueService(mockThreadPool, mockWorkloadGroupsStateAccessor);
+        workloadGroupService.setQueueService(queueService);
+
+        assertNotNull(acquireThrottlePermitSync(workloadGroupService, "wg-1", null)); // fills node_limit=1
+        // The 2nd request breaches node_limit. Under MONITOR it is admitted untracked (null permit), never queued.
+        assertNull(acquireThrottlePermitSync(workloadGroupService, "wg-1", null));
+        assertEquals("a monitor-mode request must never be parked", 0, queueService.currentDepth("wg-1"));
+        assertEquals(0, mockWorkloadGroupsStateAccessor.getWorkloadGroupState("wg-1").getTotalThrottled());
     }
 
     public void testAcquireThrottleReturnsNullWhenNodeLimitUnset() {
@@ -885,6 +1019,57 @@ public class WorkloadGroupServiceTests extends OpenSearchTestCase {
         assertNotNull(acquireThrottlePermitSync(workloadGroupService, "wg-1", null));
         // 3rd would breach the shared limit -> under MONITOR it is ADMITTED (null), not rejected, and no stat update.
         assertNull(acquireThrottlePermitSync(workloadGroupService, "wg-1", null));
+        assertEquals(0, mockWorkloadGroupsStateAccessor.getWorkloadGroupState("wg-1").getTotalThrottled());
+    }
+
+    public void testMonitorModeNeverParksOnSharedTierWithQueueingEnabled() {
+        // The shared tier takes the ENQUEUE-FIRST path, which parks the request BEFORE asking the owner for a slot. That
+        // path is gated on `queueSizePerBucket > 0 && monitorMode == false`; this pins the monitorMode half. Without it a
+        // monitor-mode request would be parked before the acquire even happens — i.e. MONITOR would silently start
+        // holding requests instead of being a dry run. The node-tier equivalent is guarded separately inside
+        // onThrottleBreach, so this is the case that actually covers the enqueue-first gate.
+        when(mockWorkloadManagementSettings.getWlmMode()).thenReturn(WlmMode.ENABLED);
+        mockWorkloadGroupsStateAccessor.addNewWorkloadGroup("wg-1");
+
+        Settings throttling = Settings.builder().put("attribute", "group").put("node_limit", 1).put("shared_limit", 1).build();
+        Settings queue = Settings.builder().put("size_per_bucket", 5).build();
+        WorkloadGroup group = queueingGroup("wg-1", throttling, queue, MutableWorkloadGroupFragment.ResiliencyMode.MONITOR);
+
+        DiscoveryNode localNode = new DiscoveryNode(
+            "local",
+            "local",
+            buildNewFakeTransportAddress(),
+            Collections.emptyMap(),
+            Set.of(DiscoveryNodeRole.DATA_ROLE),
+            org.opensearch.Version.CURRENT
+        );
+        DiscoveryNodes nodes = DiscoveryNodes.builder().add(localNode).localNodeId("local").build();
+        ClusterState clusterState = Mockito.mock(ClusterState.class);
+        Metadata metadata = Mockito.mock(Metadata.class);
+        when(mockClusterService.state()).thenReturn(clusterState);
+        when(mockClusterService.localNode()).thenReturn(localNode);
+        when(clusterState.metadata()).thenReturn(metadata);
+        when(clusterState.nodes()).thenReturn(nodes);
+        when(metadata.workloadGroups()).thenReturn(Map.of(group.get_id(), group));
+
+        WorkloadGroupSharedThrottleService sharedService = new WorkloadGroupSharedThrottleService(
+            mockClusterService,
+            mockThreadPool,
+            Mockito.mock(org.opensearch.transport.TransportService.class)
+        );
+        ClusterState previous = Mockito.mock(ClusterState.class);
+        when(previous.nodes()).thenReturn(DiscoveryNodes.EMPTY_NODES);
+        sharedService.clusterChanged(new ClusterChangedEvent("test", clusterState, previous));
+        workloadGroupService.setSharedThrottleService(sharedService);
+        WorkloadGroupQueueService queueService = new WorkloadGroupQueueService(mockThreadPool, mockWorkloadGroupsStateAccessor);
+        workloadGroupService.setQueueService(queueService);
+
+        // 1st fills the local slot, 2nd fills the shared slot.
+        assertNotNull(acquireThrottlePermitSync(workloadGroupService, "wg-1", null));
+        assertNotNull(acquireThrottlePermitSync(workloadGroupService, "wg-1", null));
+        // 3rd overflows to the shared tier at its limit. Under MONITOR it must be admitted untracked, never parked.
+        assertNull(acquireThrottlePermitSync(workloadGroupService, "wg-1", null));
+        assertEquals("a monitor-mode request must never be parked on the shared tier", 0, queueService.currentDepth("wg-1"));
         assertEquals(0, mockWorkloadGroupsStateAccessor.getWorkloadGroupState("wg-1").getTotalThrottled());
     }
 

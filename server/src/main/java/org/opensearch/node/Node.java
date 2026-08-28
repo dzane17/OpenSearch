@@ -308,6 +308,7 @@ import org.opensearch.transport.client.Client;
 import org.opensearch.transport.client.node.NodeClient;
 import org.opensearch.usage.UsageService;
 import org.opensearch.watcher.ResourceWatcherService;
+import org.opensearch.wlm.WorkloadGroupQueueService;
 import org.opensearch.wlm.WorkloadGroupService;
 import org.opensearch.wlm.WorkloadGroupSharedThrottleService;
 import org.opensearch.wlm.WorkloadGroupsStateAccessor;
@@ -1433,6 +1434,16 @@ public class Node implements Closeable {
                 transportService
             );
             workloadGroupService.setSharedThrottleService(workloadGroupSharedThrottleService);
+
+            // Coordinator-local request queues: park a throttle-denied search instead of rejecting it, and admit it
+            // when a permit frees (node-completion drain, owner-push grant, or the WorkloadGroupService backstop sweep).
+            final WorkloadGroupQueueService workloadGroupQueueService = new WorkloadGroupQueueService(
+                threadPool,
+                workloadGroupsStateAccessor
+            );
+            workloadGroupService.setQueueService(workloadGroupQueueService);
+            // Owner-push grant -> admit one queued request against the reserved shared permit.
+            workloadGroupSharedThrottleService.setGrantConsumer(workloadGroupQueueService::admitWithPermit);
 
             TopNSearchTasksLogger taskConsumer = new TopNSearchTasksLogger(settings, settingsModule.getClusterSettings());
             transportService.getTaskManager().registerTaskResourceConsumer(taskConsumer);

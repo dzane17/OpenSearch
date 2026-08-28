@@ -10,6 +10,7 @@ package org.opensearch.wlm;
 
 import org.opensearch.test.OpenSearchTestCase;
 
+import java.util.List;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -214,5 +215,28 @@ public class SharedThrottleTrackerTests extends OpenSearchTestCase {
             assertFalse(tracker.tryAcquire("b", 2, "denied-" + i, 1_000));
         }
         assertEquals("no further scans while survivors are fresh", 1, tracker.pruneScanCount());
+    }
+
+    public void testSweepExpiredReportsOnlyBucketsThatActuallyFreedCapacity() {
+        // The owning service drives owner-push from this return value, so it must name exactly the buckets that gained
+        // free capacity: a miss strands a waiting coordinator (an expiry has no release RPC to re-drive the bucket), and
+        // a false positive would make the owner reserve-and-grant a slot that does not exist.
+        AtomicLong now = new AtomicLong(0L);
+        SharedThrottleTracker tracker = new SharedThrottleTracker(now::get);
+        assertTrue(tracker.tryAcquire("expiring", 5, "lease-a", 1000L));
+        assertTrue(tracker.tryAcquire("surviving", 5, "lease-b", 100_000L));
+
+        // Nothing has expired yet.
+        assertTrue("no expiry yet -> no bucket reported", tracker.sweepExpired().isEmpty());
+
+        // Past only the first lease's TTL.
+        now.set(1001L);
+        List<String> freed = tracker.sweepExpired();
+        assertEquals("exactly the bucket whose lease was reclaimed", List.of("expiring"), freed);
+        assertEquals(0, tracker.inFlight("expiring"));
+        assertEquals(1, tracker.inFlight("surviving"));
+
+        // Idempotent: a second pass has nothing left to reclaim for that bucket.
+        assertTrue("a repeat sweep must not re-report an already-reclaimed bucket", tracker.sweepExpired().isEmpty());
     }
 }

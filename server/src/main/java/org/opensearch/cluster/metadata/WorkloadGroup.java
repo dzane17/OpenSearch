@@ -78,18 +78,25 @@ public class WorkloadGroup extends AbstractDiffable<WorkloadGroup> implements To
         // Drop null-valued "clear" keys before storage (meaningful only during an update merge, not on create).
         Settings normalizedSettings = stripClearMarkers(mutableWorkloadGroupFragment.getSettings());
         Settings normalizedThrottling = stripClearMarkers(mutableWorkloadGroupFragment.getThrottling());
+        Settings normalizedQueue = stripClearMarkers(mutableWorkloadGroupFragment.getQueue());
         if (normalizedSettings.equals(mutableWorkloadGroupFragment.getSettings()) == false
-            || normalizedThrottling.equals(mutableWorkloadGroupFragment.getThrottling()) == false) {
+            || normalizedThrottling.equals(mutableWorkloadGroupFragment.getThrottling()) == false
+            || normalizedQueue.equals(mutableWorkloadGroupFragment.getQueue()) == false) {
             mutableWorkloadGroupFragment = new MutableWorkloadGroupFragment(
                 mutableWorkloadGroupFragment.getResiliencyMode(),
                 mutableWorkloadGroupFragment.getResourceLimits(),
                 normalizedSettings,
-                normalizedThrottling
+                normalizedThrottling,
+                normalizedQueue
             );
         }
 
         // Cross-field checks on the merged throttling config (attribute required with a limit; ceiling must be >= 1).
         WorkloadGroupThrottleSettings.validateMergedConfig(mutableWorkloadGroupFragment.getThrottling());
+        // A queue with no throttle limit has nothing to queue: queueing engages only on a throttle denial.
+        if (mutableWorkloadGroupFragment.getQueue().isEmpty() == false && mutableWorkloadGroupFragment.getThrottling().isEmpty()) {
+            throw new IllegalArgumentException("queue requires a throttle limit; set throttling.node_limit or throttling.shared_limit");
+        }
 
         this.name = name;
         this._id = _id;
@@ -127,10 +134,14 @@ public class WorkloadGroup extends AbstractDiffable<WorkloadGroup> implements To
             existingGroup.getMutableWorkloadGroupFragment().getThrottling(),
             mutableWorkloadGroupFragment.getThrottling()
         );
+        final Settings updatedQueue = mergeSettings(
+            existingGroup.getMutableWorkloadGroupFragment().getQueue(),
+            mutableWorkloadGroupFragment.getQueue()
+        );
         return new WorkloadGroup(
             existingGroup.getName(),
             existingGroup.get_id(),
-            new MutableWorkloadGroupFragment(mode, updatedResourceLimits, updatedSettings, updatedThrottling),
+            new MutableWorkloadGroupFragment(mode, updatedResourceLimits, updatedSettings, updatedThrottling, updatedQueue),
             Instant.now().getMillis()
         );
     }
@@ -336,7 +347,8 @@ public class WorkloadGroup extends AbstractDiffable<WorkloadGroup> implements To
                     mutableWorkloadGroupFragment1.parseField(parser, fieldName);
                 } else if (token == XContentParser.Token.VALUE_NULL) {
                     if (fieldName.equals(MutableWorkloadGroupFragment.SETTINGS_STRING)
-                        || fieldName.equals(MutableWorkloadGroupFragment.THROTTLING_STRING)) {
+                        || fieldName.equals(MutableWorkloadGroupFragment.THROTTLING_STRING)
+                        || fieldName.equals(MutableWorkloadGroupFragment.QUEUE_STRING)) {
                         mutableWorkloadGroupFragment1.parseField(parser, fieldName);
                     }
                 }

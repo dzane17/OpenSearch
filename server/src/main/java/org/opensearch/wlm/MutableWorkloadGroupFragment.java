@@ -37,16 +37,19 @@ public class MutableWorkloadGroupFragment extends AbstractDiffable<MutableWorklo
     public static final String RESOURCE_LIMITS_STRING = "resource_limits";
     public static final String SETTINGS_STRING = "settings";
     public static final String THROTTLING_STRING = "throttling";
+    public static final String QUEUE_STRING = "queue";
     private ResiliencyMode resiliencyMode;
     private Map<ResourceType, Double> resourceLimits;
     private Settings settings;
     private Settings throttling;
+    private Settings queue;
 
     public static final List<String> acceptedFieldNames = List.of(
         RESILIENCY_MODE_STRING,
         RESOURCE_LIMITS_STRING,
         SETTINGS_STRING,
-        THROTTLING_STRING
+        THROTTLING_STRING,
+        QUEUE_STRING
     );
 
     public MutableWorkloadGroupFragment() {}
@@ -68,13 +71,25 @@ public class MutableWorkloadGroupFragment extends AbstractDiffable<MutableWorklo
         Settings settings,
         Settings throttling
     ) {
+        this(resiliencyMode, resourceLimits, settings, throttling, Settings.EMPTY);
+    }
+
+    public MutableWorkloadGroupFragment(
+        ResiliencyMode resiliencyMode,
+        Map<ResourceType, Double> resourceLimits,
+        Settings settings,
+        Settings throttling,
+        Settings queue
+    ) {
         validateResourceLimits(resourceLimits);
         WorkloadGroupSearchSettings.validate(settings);
         WorkloadGroupThrottleSettings.validate(throttling);
+        WorkloadGroupQueueSettings.validate(queue);
         this.resiliencyMode = resiliencyMode;
         this.resourceLimits = resourceLimits;
         this.settings = settings != null ? settings : Settings.EMPTY;
         this.throttling = throttling != null ? throttling : Settings.EMPTY;
+        this.queue = queue != null ? queue : Settings.EMPTY;
     }
 
     public MutableWorkloadGroupFragment(StreamInput in) throws IOException {
@@ -85,9 +100,13 @@ public class MutableWorkloadGroupFragment extends AbstractDiffable<MutableWorklo
         }
         String updatedResiliencyMode = in.readOptionalString();
         resiliencyMode = updatedResiliencyMode == null ? null : ResiliencyMode.fromName(updatedResiliencyMode);
+        // TODO(merge): this block gained a third read (queue) on the queueing branch while staying gated at V_3_7_0, so
+        // it is shape-compatible only while queueing ships in the SAME release as throttling. If they split, give queue
+        // its own version gate — see the matching note on the write path below.
         if (in.getVersion().onOrAfter(Version.V_3_7_0)) {
             settings = Settings.readOptionalSettingsFromStream(in);
             throttling = Settings.readOptionalSettingsFromStream(in);
+            queue = Settings.readOptionalSettingsFromStream(in);
         } else if (in.getVersion().onOrAfter(Version.V_3_6_0)) {
             // Legacy 3.6 format: read and discard (experimental API, no backward compat guarantee)
             boolean isNull = in.readBoolean();
@@ -96,9 +115,11 @@ public class MutableWorkloadGroupFragment extends AbstractDiffable<MutableWorklo
             }
             settings = Settings.EMPTY;
             throttling = Settings.EMPTY;
+            queue = Settings.EMPTY;
         } else {
             settings = Settings.EMPTY;
             throttling = Settings.EMPTY;
+            queue = Settings.EMPTY;
         }
     }
 
@@ -152,6 +173,18 @@ public class MutableWorkloadGroupFragment extends AbstractDiffable<MutableWorklo
         }
     }
 
+    static class QueueParser implements FieldParser<Settings> {
+        public Settings parseField(XContentParser parser) throws IOException {
+            // "queue": null means clear all queue config (disable queueing)
+            if (parser.currentToken() == XContentParser.Token.VALUE_NULL) {
+                return Settings.EMPTY;
+            }
+            Settings queue = Settings.fromXContent(parser);
+            WorkloadGroupQueueSettings.validate(queue);
+            return queue;
+        }
+    }
+
     static class FieldParserFactory {
         static Optional<FieldParser<?>> fieldParserFor(String fieldName) {
             return switch (fieldName) {
@@ -159,6 +192,7 @@ public class MutableWorkloadGroupFragment extends AbstractDiffable<MutableWorklo
                 case RESOURCE_LIMITS_STRING -> Optional.of(new ResourceLimitsParser());
                 case SETTINGS_STRING -> Optional.of(new SearchSettingsParser());
                 case THROTTLING_STRING -> Optional.of(new ThrottlingParser());
+                case QUEUE_STRING -> Optional.of(new QueueParser());
                 default -> Optional.empty();
             };
         }
@@ -214,6 +248,21 @@ public class MutableWorkloadGroupFragment extends AbstractDiffable<MutableWorklo
         } catch (IOException e) {
             throw new IllegalStateException("writing error encountered for the field " + THROTTLING_STRING);
         }
+    }, QUEUE_STRING, (builder) -> {
+        try {
+            // Like throttling, queue config is omitted entirely when unset.
+            Settings q = queue != null ? queue : Settings.EMPTY;
+            if (q.isEmpty() == false) {
+                builder.startObject(QUEUE_STRING);
+                if (q.hasValue(WorkloadGroupQueueSettings.SIZE_PER_BUCKET.getKey())) {
+                    builder.field(WorkloadGroupQueueSettings.SIZE_PER_BUCKET.getKey(), WorkloadGroupQueueSettings.SIZE_PER_BUCKET.get(q));
+                }
+                builder.endObject();
+            }
+            return null;
+        } catch (IOException e) {
+            throw new IllegalStateException("writing error encountered for the field " + QUEUE_STRING);
+        }
     });
 
     private static void writeSettingsFields(XContentBuilder builder, Settings s) throws IOException {
@@ -241,6 +290,7 @@ public class MutableWorkloadGroupFragment extends AbstractDiffable<MutableWorklo
                     case RESOURCE_LIMITS_STRING -> setResourceLimits((Map<ResourceType, Double>) value);
                     case SETTINGS_STRING -> setSettings((Settings) value);
                     case THROTTLING_STRING -> setThrottling((Settings) value);
+                    case QUEUE_STRING -> setQueue((Settings) value);
                 }
             } catch (IllegalArgumentException e) {
                 throw e;
@@ -265,8 +315,10 @@ public class MutableWorkloadGroupFragment extends AbstractDiffable<MutableWorklo
         out.writeOptionalString(resiliencyMode == null ? null : resiliencyMode.getName());
         if (out.getVersion().onOrAfter(Version.V_3_7_0)) {
             Settings.writeOptionalSettingsToStream(settings, out);
-            // TODO: when upstreamed, gate throttling behind its own release version to support mixed-build clusters.
+            // TODO(merge): when upstreamed, gate throttling/queue behind their own release version to support mixed-build
+            // clusters. Today both ride the V_3_7_0 gate, which only works because they ship in the same release.
             Settings.writeOptionalSettingsToStream(throttling, out);
+            Settings.writeOptionalSettingsToStream(queue, out);
         } else if (out.getVersion().onOrAfter(Version.V_3_6_0)) {
             // Legacy 3.6 format: write empty map (experimental API, settings not preserved across versions)
             out.writeBoolean(false);
@@ -297,12 +349,13 @@ public class MutableWorkloadGroupFragment extends AbstractDiffable<MutableWorklo
         return Objects.equals(resiliencyMode, that.resiliencyMode)
             && Objects.equals(resourceLimits, that.resourceLimits)
             && Objects.equals(settings, that.settings)
-            && Objects.equals(throttling, that.throttling);
+            && Objects.equals(throttling, that.throttling)
+            && Objects.equals(queue, that.queue);
     }
 
     @Override
     public int hashCode() {
-        return Objects.hash(resiliencyMode, resourceLimits, settings, throttling);
+        return Objects.hash(resiliencyMode, resourceLimits, settings, throttling, queue);
     }
 
     public ResiliencyMode getResiliencyMode() {
@@ -319,6 +372,10 @@ public class MutableWorkloadGroupFragment extends AbstractDiffable<MutableWorklo
 
     public Settings getThrottling() {
         return throttling;
+    }
+
+    public Settings getQueue() {
+        return queue;
     }
 
     /**
@@ -369,6 +426,11 @@ public class MutableWorkloadGroupFragment extends AbstractDiffable<MutableWorklo
     void setThrottling(Settings throttling) {
         WorkloadGroupThrottleSettings.validate(throttling);
         this.throttling = throttling != null ? throttling : Settings.EMPTY;
+    }
+
+    void setQueue(Settings queue) {
+        WorkloadGroupQueueSettings.validate(queue);
+        this.queue = queue != null ? queue : Settings.EMPTY;
     }
 
 }

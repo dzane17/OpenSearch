@@ -511,7 +511,7 @@ public class TransportSearchAction extends HandledTransportAction<SearchRequest,
                     }, outerListener::onFailure),
                     threadPool.getThreadContext()
                 );
-                workloadGroupService.acquireThrottlePermit(((WorkloadGroupTask) task).getWorkloadGroupId(), principal, admissionListener);
+                workloadGroupService.acquireThrottlePermit((WorkloadGroupTask) task, principal, admissionListener);
             } else {
                 proceedWithSearch(
                     task,
