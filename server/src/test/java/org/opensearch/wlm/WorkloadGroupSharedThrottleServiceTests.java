@@ -78,6 +78,27 @@ public class WorkloadGroupSharedThrottleServiceTests extends OpenSearchTestCase 
         when(clusterService.localNode()).thenReturn(localNode);
     }
 
+    // The owner resolves a bucket's shared_limit from its OWN cluster state (it no longer arrives on the RELEASE RPC), so
+    // any test that expects owner-push to be driven has to model the group. Without this the limit reads as UNSET and
+    // onSharedSlotFreed correctly declines to grant.
+    private void stubGroupFor(String bucketKey, int sharedLimit) {
+        final int idx = bucketKey.indexOf(':');
+        final String groupId = idx < 0 ? bucketKey : bucketKey.substring(0, idx);
+        Settings throttling = Settings.builder().put("attribute", "group").put("shared_limit", sharedLimit).build();
+        WorkloadGroup group = new WorkloadGroup(
+            groupId + "-name",
+            groupId,
+            new MutableWorkloadGroupFragment(
+                MutableWorkloadGroupFragment.ResiliencyMode.ENFORCED,
+                Map.of(ResourceType.MEMORY, 0.5),
+                Settings.EMPTY,
+                throttling
+            ),
+            1L
+        );
+        when(metadata.workloadGroups()).thenReturn(Map.of(groupId, group));
+    }
+
     private WorkloadGroupSharedThrottleService newService() {
         // Single data node => this node owns every bucket => acquire uses the local short-circuit (no real network).
         WorkloadGroupSharedThrottleService service = new WorkloadGroupSharedThrottleService(clusterService, threadPool, transportService);
@@ -236,6 +257,7 @@ public class WorkloadGroupSharedThrottleServiceTests extends OpenSearchTestCase 
         final int sharedLimit = 1;
         final String bucket = "b";
         WorkloadGroupSharedThrottleService service = newService();
+        stubGroupFor(bucket, sharedLimit);
 
         // A stubbed coordinator-side consumer standing in for the queue service: it holds `parked` requests and admits
         // one per grant, capturing the reserved permit so the test can "complete" that request by closing it (which

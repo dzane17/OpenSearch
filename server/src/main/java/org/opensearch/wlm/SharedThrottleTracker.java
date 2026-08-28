@@ -126,15 +126,23 @@ public class SharedThrottleTracker {
      *
      * @param bucketKey the throttle bucket identifier
      * @param permitId   the permit id returned to the coordinator at acquire time
+     * @return {@code true} if a live permit was actually removed, i.e. a slot genuinely just freed. This is the
+     *         authoritative answer to "did capacity become available?", and the owner is the only node that can give it:
+     *         a coordinator sending a speculative release (e.g. after a lost acquire reply) cannot know whether its
+     *         permit was ever recorded. Callers drive owner-push on {@code true} only, so a no-op release never produces
+     *         a phantom grant and — the case a coordinator-supplied hint used to get wrong — a release that DID free a
+     *         slot always drives one.
      */
-    public void release(String bucketKey, String permitId) {
+    public boolean release(String bucketKey, String permitId) {
+        final boolean[] removed = new boolean[1];
         permitsByBucket.computeIfPresent(bucketKey, (k, bucket) -> {
-            bucket.permits.remove(permitId);
+            removed[0] = bucket.permits.remove(permitId) != null;
             // minExpiry is intentionally left unchanged: removing a permit can only raise the true earliest expiry, so
             // the cached value stays a valid (possibly loose) lower bound. Recomputing here would add an O(size) scan
             // to the release hot path for no correctness benefit.
             return bucket.permits.isEmpty() ? null : bucket;
         });
+        return removed[0];
     }
 
     /**
