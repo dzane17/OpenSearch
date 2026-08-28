@@ -50,7 +50,7 @@ import java.util.concurrent.atomic.AtomicReference;
  * Availability: any failure to reach the owner (timeout, disconnect, missing handler on an old node, or an empty
  * ring) fails <em>open</em> — the request is admitted with no shared permit. This is a deliberate, un-toggleable
  * choice: a single unreachable owner must not turn a network blip into a cluster-wide rejection storm for its
- * share of buckets. A stuck lease is instead reclaimed by the owner's TTL sweep.
+ * share of buckets. A stuck permit is instead reclaimed by the owner's TTL sweep.
  */
 @ExperimentalApi
 public class WorkloadGroupSharedThrottleService implements ClusterStateListener {
@@ -66,17 +66,17 @@ public class WorkloadGroupSharedThrottleService implements ClusterStateListener 
     // Timeout for the acquire round-trip to a bucket's owner. Small so a slow/unreachable owner fails open quickly
     // rather than adding latency to the request path.
     static final TimeValue ACQUIRE_TIMEOUT = TimeValue.timeValueMillis(200);
-    // Time-to-live for a lease on the owner. Reclaims a lease left behind by a crashed coordinator or a lost release
-    // RPC. Set generously above the typical request duration so a still-running request's lease is not reclaimed early.
-    // Accepted tradeoff: leases are NOT renewed, so a search that runs longer than this TTL has its lease reclaimed
+    // Time-to-live for a permit on the owner. Reclaims a permit left behind by a crashed coordinator or a lost release
+    // RPC. Set generously above the typical request duration so a still-running request's permit is not reclaimed early.
+    // Accepted tradeoff: permits are NOT renewed, so a search that runs longer than this TTL has its permit reclaimed
     // while still executing, which can transiently admit one-or-more requests beyond shared_limit for that bucket
     // (self-correcting, fail-open direction — same flavor as the ring-rebalance transient breach). Long-running search
     // is uncommon (no default search timeout, but heavy aggs/scripts can exceed it); if it becomes a problem the fix is
-    // lease renewal or deriving the TTL from a request deadline, not a larger constant.
-    static final long LEASE_TTL_NANOS = TimeValue.timeValueMinutes(5).nanos();
-    // How often the owner sweeps expired leases. This is a pure memory-hygiene backstop, NOT a correctness mechanism:
-    // tryAcquire() already prunes a bucket's expired leases on every acquire, so an active bucket self-heals and can
-    // never over-reject due to a stuck lease. The sweep only reclaims the map entry for a bucket that abandoned a lease
+    // permit renewal or deriving the TTL from a request deadline, not a larger constant.
+    static final long PERMIT_TTL_NANOS = TimeValue.timeValueMinutes(5).nanos();
+    // How often the owner sweeps expired permits. This is a pure memory-hygiene backstop, NOT a correctness mechanism:
+    // tryAcquire() already prunes a bucket's expired permits on every acquire, so an active bucket self-heals and can
+    // never over-reject due to a stuck permit. The sweep only reclaims the map entry for a bucket that abandoned a permit
     // and then went completely idle (rejects nothing). An entry can't be reclaimed before its TTL elapses anyway, so
     // sweeping faster than the TTL is pointless; run it infrequently.
     static final TimeValue SWEEP_INTERVAL = TimeValue.timeValueMinutes(5);
@@ -124,7 +124,7 @@ public class WorkloadGroupSharedThrottleService implements ClusterStateListener 
             ThreadPool.Names.SAME,
             ReleaseRequest::new,
             (request, channel, task) -> {
-                tracker.release(request.bucketKey, request.leaseId);
+                tracker.release(request.bucketKey, request.permitId);
                 channel.sendResponse(TransportResponse.Empty.INSTANCE);
             }
         );
@@ -191,13 +191,13 @@ public class WorkloadGroupSharedThrottleService implements ClusterStateListener 
             return;
         }
 
-        final String leaseId = leaseId();
-        final long ttlNanos = LEASE_TTL_NANOS;
+        final String permitId = permitId();
+        final long ttlNanos = PERMIT_TTL_NANOS;
 
         // Local-owner short-circuit: this coordinator owns the bucket, so hit the tracker directly with no network hop.
         if (owner.getId().equals(clusterService.localNode().getId())) {
-            if (tracker.tryAcquire(bucketKey, sharedLimit, leaseId, ttlNanos)) {
-                listener.onResponse(releaseLocal(bucketKey, leaseId));
+            if (tracker.tryAcquire(bucketKey, sharedLimit, permitId, ttlNanos)) {
+                listener.onResponse(releaseLocal(bucketKey, permitId));
             } else {
                 listener.onFailure(deniedMarker());
             }
@@ -217,7 +217,7 @@ public class WorkloadGroupSharedThrottleService implements ClusterStateListener 
         transportService.sendRequest(
             owner,
             ACQUIRE_ACTION_NAME,
-            new AcquireRequest(bucketKey, sharedLimit, leaseId, ttlNanos),
+            new AcquireRequest(bucketKey, sharedLimit, permitId, ttlNanos),
             options,
             new TransportResponseHandler<AcquireResponse>() {
                 @Override
@@ -228,7 +228,7 @@ public class WorkloadGroupSharedThrottleService implements ClusterStateListener 
                 @Override
                 public void handleResponse(AcquireResponse response) {
                     if (response.granted) {
-                        listener.onResponse(releaseRemote(owner, bucketKey, leaseId));
+                        listener.onResponse(releaseRemote(owner, bucketKey, permitId));
                     } else {
                         listener.onFailure(deniedMarker());
                     }
@@ -236,13 +236,13 @@ public class WorkloadGroupSharedThrottleService implements ClusterStateListener 
 
                 @Override
                 public void handleException(TransportException exp) {
-                    // Owner unreachable / timed out -> fail open. The owner may have GRANTED this lease before the
+                    // Owner unreachable / timed out -> fail open. The owner may have GRANTED this permit before the
                     // response was lost (e.g. the acquire arrived but the reply timed out), which would otherwise
                     // occupy a shared slot until its TTL and cause false 429s once connectivity recovers. Send a
-                    // best-effort release for this leaseId to reclaim it immediately; release-by-id is idempotent, so
-                    // if no lease was created it is a harmless no-op. Then admit (fail open).
+                    // best-effort release for this permitId to reclaim it immediately; release-by-id is idempotent, so
+                    // if no permit was created it is a harmless no-op. Then admit (fail open).
                     logger.debug("Shared throttle acquire to owner [{}] for bucket [{}] failed; failing open", owner.getId(), bucketKey);
-                    sendRelease(owner, bucketKey, leaseId);
+                    sendRelease(owner, bucketKey, permitId);
                     listener.onResponse(null);
                 }
 
@@ -256,27 +256,27 @@ public class WorkloadGroupSharedThrottleService implements ClusterStateListener 
 
     // Owner-side admission. Package-private for tests.
     AcquireResponse handleAcquire(AcquireRequest request) {
-        boolean granted = tracker.tryAcquire(request.bucketKey, request.sharedLimit, request.leaseId, request.ttlNanos);
+        boolean granted = tracker.tryAcquire(request.bucketKey, request.sharedLimit, request.permitId, request.ttlNanos);
         return new AcquireResponse(granted);
     }
 
-    private Releasable releaseLocal(String bucketKey, String leaseId) {
-        return releaseOnce(() -> tracker.release(bucketKey, leaseId));
+    private Releasable releaseLocal(String bucketKey, String permitId) {
+        return releaseOnce(() -> tracker.release(bucketKey, permitId));
     }
 
-    private Releasable releaseRemote(DiscoveryNode owner, String bucketKey, String leaseId) {
-        return releaseOnce(() -> sendRelease(owner, bucketKey, leaseId));
+    private Releasable releaseRemote(DiscoveryNode owner, String bucketKey, String permitId) {
+        return releaseOnce(() -> sendRelease(owner, bucketKey, permitId));
     }
 
     // Fire-and-forget RELEASE RPC to the bucket owner. Bounded by the same timeout as acquire so a half-open
     // connection can't leave the response handler pending until the connection is torn down. A lost release is not
-    // fatal — the owner's TTL sweep reclaims the lease — so failures are logged at debug only.
-    private void sendRelease(DiscoveryNode owner, String bucketKey, String leaseId) {
+    // fatal — the owner's TTL sweep reclaims the permit — so failures are logged at debug only.
+    private void sendRelease(DiscoveryNode owner, String bucketKey, String permitId) {
         final TransportRequestOptions options = TransportRequestOptions.builder().withTimeout(ACQUIRE_TIMEOUT).build();
         transportService.sendRequest(
             owner,
             RELEASE_ACTION_NAME,
-            new ReleaseRequest(bucketKey, leaseId),
+            new ReleaseRequest(bucketKey, permitId),
             options,
             new TransportResponseHandler<TransportResponse.Empty>() {
                 @Override
@@ -314,7 +314,7 @@ public class WorkloadGroupSharedThrottleService implements ClusterStateListener 
         };
     }
 
-    private static String leaseId() {
+    private static String permitId() {
         return UUIDs.base64UUID();
     }
 
@@ -341,13 +341,13 @@ public class WorkloadGroupSharedThrottleService implements ClusterStateListener 
     public static class AcquireRequest extends TransportRequest {
         final String bucketKey;
         final int sharedLimit;
-        final String leaseId;
+        final String permitId;
         final long ttlNanos;
 
-        AcquireRequest(String bucketKey, int sharedLimit, String leaseId, long ttlNanos) {
+        AcquireRequest(String bucketKey, int sharedLimit, String permitId, long ttlNanos) {
             this.bucketKey = bucketKey;
             this.sharedLimit = sharedLimit;
-            this.leaseId = leaseId;
+            this.permitId = permitId;
             this.ttlNanos = ttlNanos;
         }
 
@@ -355,7 +355,7 @@ public class WorkloadGroupSharedThrottleService implements ClusterStateListener 
             super(in);
             this.bucketKey = in.readString();
             this.sharedLimit = in.readVInt();
-            this.leaseId = in.readString();
+            this.permitId = in.readString();
             this.ttlNanos = in.readVLong();
         }
 
@@ -364,7 +364,7 @@ public class WorkloadGroupSharedThrottleService implements ClusterStateListener 
             super.writeTo(out);
             out.writeString(bucketKey);
             out.writeVInt(sharedLimit);
-            out.writeString(leaseId);
+            out.writeString(permitId);
             out.writeVLong(ttlNanos);
         }
     }
@@ -390,28 +390,28 @@ public class WorkloadGroupSharedThrottleService implements ClusterStateListener 
     }
 
     /**
-     * Release RPC: fire-and-forget, tells the owner to drop a previously-granted lease.
+     * Release RPC: fire-and-forget, tells the owner to drop a previously-granted permit.
      */
     public static class ReleaseRequest extends TransportRequest {
         final String bucketKey;
-        final String leaseId;
+        final String permitId;
 
-        ReleaseRequest(String bucketKey, String leaseId) {
+        ReleaseRequest(String bucketKey, String permitId) {
             this.bucketKey = bucketKey;
-            this.leaseId = leaseId;
+            this.permitId = permitId;
         }
 
         ReleaseRequest(StreamInput in) throws IOException {
             super(in);
             this.bucketKey = in.readString();
-            this.leaseId = in.readString();
+            this.permitId = in.readString();
         }
 
         @Override
         public void writeTo(StreamOutput out) throws IOException {
             super.writeTo(out);
             out.writeString(bucketKey);
-            out.writeString(leaseId);
+            out.writeString(permitId);
         }
     }
 }

@@ -28,7 +28,7 @@ import java.util.concurrent.atomic.AtomicInteger;
  * <p>
  * This tier is fully local — no cross-node coordination — mirroring the acquire/rollback + {@link Releasable}
  * release shape of {@link org.opensearch.index.IndexingPressure}. Because acquire and release happen in the same
- * process, a permit is a self-releasing {@link Releasable} and needs no lease id or TTL (contrast
+ * process, a permit is a self-releasing {@link Releasable} and needs no permit id or TTL (contrast
  * {@link SharedThrottleTracker}, whose distributed acquire/release requires both). When a two-tier throttle is
  * configured, an exhausted local tier falls through to the cluster-level {@link SharedThrottleTracker} rather than
  * rejecting outright; see {@link #tryAcquire}, which returns {@code null} on exhaustion instead of throwing.

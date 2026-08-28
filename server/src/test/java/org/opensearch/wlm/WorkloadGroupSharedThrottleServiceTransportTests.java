@@ -144,7 +144,7 @@ public class WorkloadGroupSharedThrottleServiceTransportTests extends OpenSearch
         Releasable permit = listener.response.get();
         assertNotNull("remote owner granted a permit, so a non-null Releasable is expected", permit);
         // The grant was recorded on the OWNER node's tracker (the acquire handler ran there before responding).
-        assertEquals("owner tracker must hold exactly one in-flight lease", 1, ownerService.tracker().inFlight(remoteKey));
+        assertEquals("owner tracker must hold exactly one in-flight permit", 1, ownerService.tracker().inFlight(remoteKey));
 
         // Closing the permit fires the RELEASE RPC (fire-and-forget), which the owner applies asynchronously.
         permit.close();
@@ -157,7 +157,7 @@ public class WorkloadGroupSharedThrottleServiceTransportTests extends OpenSearch
      */
     public void testRemoteAcquireDeniedReturns429() throws Exception {
         // Pre-fill the owner's tracker to the limit directly so the next acquire is denied at the source.
-        assertTrue(ownerService.tracker().tryAcquire(remoteKey, 1, "pre", WorkloadGroupSharedThrottleService.LEASE_TTL_NANOS));
+        assertTrue(ownerService.tracker().tryAcquire(remoteKey, 1, "pre", WorkloadGroupSharedThrottleService.PERMIT_TTL_NANOS));
         assertEquals(1, ownerService.tracker().inFlight(remoteKey));
 
         CapturingListener listener = new CapturingListener();
