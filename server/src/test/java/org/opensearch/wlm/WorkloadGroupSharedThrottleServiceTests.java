@@ -225,12 +225,22 @@ public class WorkloadGroupSharedThrottleServiceTests extends OpenSearchTestCase 
         // Directly exercise the owner-side handler (what a remote coordinator's RPC would hit).
         assertTrue(
             service.handleAcquire(
-                new WorkloadGroupSharedThrottleService.AcquireRequest("b", 1, "lease-1", WorkloadGroupSharedThrottleService.LEASE_TTL_NANOS)
+                new WorkloadGroupSharedThrottleService.AcquireRequest(
+                    "b",
+                    1,
+                    "permit-1",
+                    WorkloadGroupSharedThrottleService.PERMIT_TTL_NANOS
+                )
             ).granted
         );
         assertFalse(
             service.handleAcquire(
-                new WorkloadGroupSharedThrottleService.AcquireRequest("b", 1, "lease-2", WorkloadGroupSharedThrottleService.LEASE_TTL_NANOS)
+                new WorkloadGroupSharedThrottleService.AcquireRequest(
+                    "b",
+                    1,
+                    "permit-2",
+                    WorkloadGroupSharedThrottleService.PERMIT_TTL_NANOS
+                )
             ).granted
         );
         assertEquals(1, service.tracker().inFlight("b"));
@@ -240,7 +250,7 @@ public class WorkloadGroupSharedThrottleServiceTests extends OpenSearchTestCase 
         WorkloadGroupSharedThrottleService.AcquireRequest original = new WorkloadGroupSharedThrottleService.AcquireRequest(
             "grp1:username:alice",
             42,
-            "lease-xyz",
+            "permit-xyz",
             123_456_789L
         );
         WorkloadGroupSharedThrottleService.AcquireRequest copy = copyWriteable(
@@ -250,7 +260,7 @@ public class WorkloadGroupSharedThrottleServiceTests extends OpenSearchTestCase 
         );
         assertEquals(original.bucketKey, copy.bucketKey);
         assertEquals(original.sharedLimit, copy.sharedLimit);
-        assertEquals(original.leaseId, copy.leaseId);
+        assertEquals(original.permitId, copy.permitId);
         assertEquals(original.ttlNanos, copy.ttlNanos);
     }
 
@@ -269,7 +279,7 @@ public class WorkloadGroupSharedThrottleServiceTests extends OpenSearchTestCase 
     public void testReleaseRequestSerializationRoundTrip() throws Exception {
         WorkloadGroupSharedThrottleService.ReleaseRequest original = new WorkloadGroupSharedThrottleService.ReleaseRequest(
             "grp1:group",
-            "lease-abc"
+            "permit-abc"
         );
         WorkloadGroupSharedThrottleService.ReleaseRequest copy = copyWriteable(
             original,
@@ -277,6 +287,6 @@ public class WorkloadGroupSharedThrottleServiceTests extends OpenSearchTestCase 
             WorkloadGroupSharedThrottleService.ReleaseRequest::new
         );
         assertEquals(original.bucketKey, copy.bucketKey);
-        assertEquals(original.leaseId, copy.leaseId);
+        assertEquals(original.permitId, copy.permitId);
     }
 }

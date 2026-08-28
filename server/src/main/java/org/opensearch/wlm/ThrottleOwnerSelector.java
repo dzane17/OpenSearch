@@ -46,8 +46,8 @@ import java.util.TreeMap;
  * discovery-node set changes.
  * <p>
  * <b>Transient ceiling breach on rebalance.</b> When a bucket remaps to a new owner (node join/leave), the previous
- * owner still holds leases for that bucket's in-flight requests while the new owner starts counting from zero, so the
- * bucket's cluster-wide in-flight count can briefly exceed {@code shared_limit} (up to ~2x) until the old leases drain
+ * owner still holds permits for that bucket's in-flight requests while the new owner starts counting from zero, so the
+ * bucket's cluster-wide in-flight count can briefly exceed {@code shared_limit} (up to ~2x) until the old permits drain
  * or TTL out. This is inherent to stateless consistent hashing and is accepted for this experimental feature.
  */
 @ExperimentalApi
