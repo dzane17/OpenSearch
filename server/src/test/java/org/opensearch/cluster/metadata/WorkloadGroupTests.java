@@ -41,7 +41,9 @@ public class WorkloadGroupTests extends AbstractSerializingTestCase<WorkloadGrou
         // Generate a valid throttling config: either disabled (empty), or enabled with a required attribute plus
         // at least one positive limit (so the effective ceiling is >= 1).
         Settings.Builder throttling = Settings.builder();
+        boolean throttlingConfigured = false;
         if (randomBoolean()) {
+            throttlingConfigured = true;
             throttling.put("attribute", randomFrom("group", "username", "role"));
             if (randomBoolean()) {
                 throttling.put("node_limit", randomIntBetween(1, 100));
@@ -55,10 +57,16 @@ public class WorkloadGroupTests extends AbstractSerializingTestCase<WorkloadGrou
                 }
             }
         }
+        // Queue config is only valid alongside a throttle limit (a queue with nothing to queue is rejected).
+        // size_per_bucket is the only queue setting.
+        Settings.Builder queue = Settings.builder();
+        if (throttlingConfigured && randomBoolean()) {
+            queue.put("size_per_bucket", randomIntBetween(1, 1000));
+        }
         return new WorkloadGroup(
             name,
             _id,
-            new MutableWorkloadGroupFragment(randomMode(), resourceLimit, Settings.EMPTY, throttling.build()),
+            new MutableWorkloadGroupFragment(randomMode(), resourceLimit, Settings.EMPTY, throttling.build(), queue.build()),
             Instant.now().getMillis()
         );
     }
@@ -752,5 +760,98 @@ public class WorkloadGroupTests extends AbstractSerializingTestCase<WorkloadGrou
         MutableWorkloadGroupFragment fragment = builder.getMutableWorkloadGroupFragment();
         // Settings should be empty (cleared)
         assertTrue(fragment.getSettings().isEmpty());
+    }
+
+    public void testQueueRequiresThrottleLimit() {
+        // A queue with no throttle limit has nothing to queue -> rejected at the workload-group level.
+        IllegalArgumentException e = expectThrows(
+            IllegalArgumentException.class,
+            () -> new WorkloadGroup(
+                "test",
+                "test_id",
+                new MutableWorkloadGroupFragment(
+                    ResiliencyMode.ENFORCED,
+                    Map.of(ResourceType.MEMORY, 0.5),
+                    Settings.EMPTY,
+                    Settings.EMPTY, // no throttling
+                    Settings.builder().put("size_per_bucket", 100).build()
+                ),
+                System.currentTimeMillis()
+            )
+        );
+        assertTrue(e.getMessage(), e.getMessage().contains("queue requires a throttle limit"));
+    }
+
+    public void testQueueTimeoutIsRejectedAsUnknownSetting() {
+        // queue.timeout was removed: a client bounds its wait via cancel_after_time_interval, and the queue has no
+        // wall-clock deadline. A stale queue.timeout config must be rejected as an unknown key, not silently accepted.
+        Settings throttling = Settings.builder().put("attribute", "username").put("node_limit", 10).build();
+        IllegalArgumentException e = expectThrows(
+            IllegalArgumentException.class,
+            () -> new WorkloadGroup(
+                "test",
+                "test_id",
+                new MutableWorkloadGroupFragment(
+                    ResiliencyMode.ENFORCED,
+                    Map.of(ResourceType.MEMORY, 0.5),
+                    Settings.EMPTY,
+                    throttling,
+                    Settings.builder().put("size_per_bucket", 10).put("timeout", "30s").build()
+                ),
+                System.currentTimeMillis()
+            )
+        );
+        assertTrue(e.getMessage(), e.getMessage().contains("Unknown queue setting"));
+    }
+
+    public void testToXContentEmitsQueue() throws IOException {
+        long currentTimeInMillis = Instant.now().getMillis();
+        String workloadGroupId = UUIDs.randomBase64UUID();
+        Settings throttling = Settings.builder().put("attribute", "username").put("node_limit", 10).build();
+        Settings queue = Settings.builder().put("size_per_bucket", 200).build();
+        WorkloadGroup workloadGroup = new WorkloadGroup(
+            "TestWorkloadGroup",
+            workloadGroupId,
+            new MutableWorkloadGroupFragment(ResiliencyMode.ENFORCED, Map.of(ResourceType.CPU, 0.30), Settings.EMPTY, throttling, queue),
+            currentTimeInMillis
+        );
+        XContentBuilder builder = JsonXContent.contentBuilder();
+        workloadGroup.toXContent(builder, ToXContent.EMPTY_PARAMS);
+        String expected = String.format(
+            Locale.ROOT,
+            "{\"_id\":\"%s\",\"name\":\"TestWorkloadGroup\",\"resiliency_mode\":\"enforced\","
+                + "\"resource_limits\":{\"cpu\":0.3},"
+                + "\"settings\":{},"
+                + "\"throttling\":{\"attribute\":\"username\",\"node_limit\":10},"
+                + "\"queue\":{\"size_per_bucket\":200},"
+                + "\"updated_at\":%d}",
+            workloadGroupId,
+            currentTimeInMillis
+        );
+        assertEquals(expected, builder.toString());
+    }
+
+    public void testToXContentOmitsUnsetQueue() throws IOException {
+        Settings throttling = Settings.builder().put("attribute", "username").put("node_limit", 10).build();
+        WorkloadGroup workloadGroup = new WorkloadGroup(
+            "test",
+            "test_id",
+            new MutableWorkloadGroupFragment(ResiliencyMode.ENFORCED, Map.of(ResourceType.MEMORY, 0.5), Settings.EMPTY, throttling),
+            System.currentTimeMillis()
+        );
+        XContentBuilder builder = JsonXContent.contentBuilder();
+        workloadGroup.toXContent(builder, ToXContent.EMPTY_PARAMS);
+        assertFalse(builder.toString().contains("queue"));
+    }
+
+    public void testQueueNullFromXContentClearsQueue() throws IOException {
+        String json = "{\"_id\":\"test_id\",\"name\":\"test\",\"resiliency_mode\":\"enforced\","
+            + "\"resource_limits\":{\"memory\":0.5},"
+            + "\"queue\":null,"
+            + "\"updated_at\":1720047207}";
+        XContentParser parser = createParser(JsonXContent.jsonXContent, json);
+        WorkloadGroup.Builder builder = WorkloadGroup.Builder.fromXContent(parser);
+        MutableWorkloadGroupFragment fragment = builder.getMutableWorkloadGroupFragment();
+        assertTrue(fragment.getQueue().isEmpty());
     }
 }

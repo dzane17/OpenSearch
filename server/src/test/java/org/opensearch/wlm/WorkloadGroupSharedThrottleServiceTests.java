@@ -10,12 +10,15 @@ package org.opensearch.wlm;
 
 import org.opensearch.cluster.ClusterChangedEvent;
 import org.opensearch.cluster.ClusterState;
+import org.opensearch.cluster.metadata.Metadata;
+import org.opensearch.cluster.metadata.WorkloadGroup;
 import org.opensearch.cluster.node.DiscoveryNode;
 import org.opensearch.cluster.node.DiscoveryNodeRole;
 import org.opensearch.cluster.node.DiscoveryNodes;
 import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.io.stream.BytesStreamOutput;
 import org.opensearch.common.lease.Releasable;
+import org.opensearch.common.settings.Settings;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.common.io.stream.StreamInput;
 import org.opensearch.core.common.io.stream.StreamOutput;
@@ -26,11 +29,14 @@ import org.opensearch.threadpool.ThreadPool;
 import org.opensearch.transport.TransportService;
 
 import java.io.IOException;
+import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 
 import org.mockito.Mockito;
@@ -43,6 +49,7 @@ public class WorkloadGroupSharedThrottleServiceTests extends OpenSearchTestCase 
     private ThreadPool threadPool;
     private TransportService transportService;
     private DiscoveryNode localNode;
+    private Metadata metadata;
 
     @Override
     public void setUp() throws Exception {
@@ -62,8 +69,34 @@ public class WorkloadGroupSharedThrottleServiceTests extends OpenSearchTestCase 
         ClusterState state = Mockito.mock(ClusterState.class);
         DiscoveryNodes singleDataNode = DiscoveryNodes.builder().add(localNode).localNodeId("local").build();
         when(state.nodes()).thenReturn(singleDataNode);
+        // The TTL sweep resolves a bucket's live shared_limit from cluster-state metadata, so every test needs a
+        // metadata stub. Default to "no workload groups"; tests that need a real limit re-stub workloadGroups().
+        metadata = Mockito.mock(Metadata.class);
+        when(metadata.workloadGroups()).thenReturn(Map.of());
+        when(state.metadata()).thenReturn(metadata);
         when(clusterService.state()).thenReturn(state);
         when(clusterService.localNode()).thenReturn(localNode);
+    }
+
+    // The owner resolves a bucket's shared_limit from its OWN cluster state (it no longer arrives on the RELEASE RPC), so
+    // any test that expects owner-push to be driven has to model the group. Without this the limit reads as UNSET and
+    // onSharedSlotFreed correctly declines to grant.
+    private void stubGroupFor(String bucketKey, int sharedLimit) {
+        final int idx = bucketKey.indexOf(':');
+        final String groupId = idx < 0 ? bucketKey : bucketKey.substring(0, idx);
+        Settings throttling = Settings.builder().put("attribute", "group").put("shared_limit", sharedLimit).build();
+        WorkloadGroup group = new WorkloadGroup(
+            groupId + "-name",
+            groupId,
+            new MutableWorkloadGroupFragment(
+                MutableWorkloadGroupFragment.ResiliencyMode.ENFORCED,
+                Map.of(ResourceType.MEMORY, 0.5),
+                Settings.EMPTY,
+                throttling
+            ),
+            1L
+        );
+        when(metadata.workloadGroups()).thenReturn(Map.of(groupId, group));
     }
 
     private WorkloadGroupSharedThrottleService newService() {
@@ -92,6 +125,65 @@ public class WorkloadGroupSharedThrottleServiceTests extends OpenSearchTestCase 
             throw failure.get() instanceof RuntimeException re ? re : new RuntimeException(failure.get());
         }
         return permit.get();
+    }
+
+    public void testTtlSweepDrivesOwnerPushForALeaseExpiredSlot() {
+        // Regression: a permit reclaimed by the TTL sweep frees a shared slot with NO release RPC behind it (the holder
+        // crashed, or its release was lost), so the sweep is the ONLY observer of that free slot. It must drive
+        // owner-push. Previously sweepExpired() returned void and the sweep ignored the freed capacity, so a coordinator
+        // with a parked request stayed registered as a waiter while the slot sat idle — and since parked requests have no
+        // deadline, it stranded until some unrelated release happened to re-drive the bucket.
+        final int sharedLimit = 1;
+        final String groupId = "g1";
+        final String bucket = groupId + ":group";
+
+        // Controllable clock so the permit can be expired deterministically instead of sleeping past the 5-minute TTL.
+        final AtomicLong nanos = new AtomicLong(0L);
+        WorkloadGroupSharedThrottleService service = new WorkloadGroupSharedThrottleService(
+            clusterService,
+            threadPool,
+            transportService,
+            new SharedThrottleTracker(nanos::get)
+        );
+        deliverNodesChanged(service, clusterService.state().nodes());
+
+        // The sweep resolves shared_limit from cluster state (an expiry carries no limit, unlike a release).
+        Settings throttling = Settings.builder().put("attribute", "group").put("shared_limit", sharedLimit).build();
+        WorkloadGroup group = new WorkloadGroup(
+            "g1-name",
+            groupId,
+            new MutableWorkloadGroupFragment(
+                MutableWorkloadGroupFragment.ResiliencyMode.ENFORCED,
+                Map.of(ResourceType.MEMORY, 0.5),
+                Settings.EMPTY,
+                throttling
+            ),
+            1L
+        );
+        when(metadata.workloadGroups()).thenReturn(Map.of(groupId, group));
+
+        final AtomicInteger admits = new AtomicInteger(0);
+        service.setGrantConsumer((bucketKey, reservedPermit) -> {
+            admits.incrementAndGet();
+            return true; // stands in for the queue service admitting one parked request
+        });
+
+        // Take the only shared slot, then deny an acquire with wantsQueue=true so this coordinator is a registered waiter
+        // with a parked request. Both happen at t=0, while the holder's permit is still live.
+        assertNotNull("first acquire takes the only shared slot", awaitGrant(service, bucket, sharedLimit));
+        AtomicReference<Exception> denial = new AtomicReference<>();
+        service.acquireAsync(bucket, sharedLimit, true, ActionListener.wrap(p -> fail("must be denied while at limit"), denial::set));
+        assertTrue("acquire at limit must be denied", denial.get() instanceof OpenSearchRejectedExecutionException);
+        assertEquals("coordinator is registered as a waiter", 1, service.waiterCountForTest(bucket));
+
+        // Simulate the holder vanishing: advance past the permit TTL WITHOUT any release RPC. Nothing has pruned the
+        // permit yet (no acquire has touched the bucket), so the slot is expired-but-unreclaimed.
+        nanos.set(WorkloadGroupSharedThrottleService.PERMIT_TTL_NANOS + 1);
+        assertEquals("nothing can have been admitted before the sweep runs", 0, admits.get());
+
+        // One sweep pass must reclaim the expired permit AND hand the freed slot to the waiting coordinator.
+        service.sweepExpiredAndDrive();
+        assertEquals("the sweep must drive owner-push for the slot it freed", 1, admits.get());
     }
 
     public void testRingPopulatesWhenNodeSetUnchangedVsPreviousState() {
@@ -155,6 +247,64 @@ public class WorkloadGroupSharedThrottleServiceTests extends OpenSearchTestCase 
         // release frees the shared slot
         p1.close();
         assertNotNull(awaitGrant(service, "b", 1));
+    }
+
+    public void testOwnerPushDrainsEveryParkedRequestOnOneCoordinator() {
+        // Regression: one coordinator (here the local owner) parks SEVERAL requests for a shared bucket, but the owner
+        // waiter registry holds one Set membership per coordinator. A grant must NOT deregister the coordinator on a
+        // successful admit — it may still have more queued requests — so each successive freed slot drains the next
+        // parked request. The bug drained only the first and stranded the rest until queue.timeout despite free capacity.
+        final int sharedLimit = 1;
+        final String bucket = "b";
+        WorkloadGroupSharedThrottleService service = newService();
+        stubGroupFor(bucket, sharedLimit);
+
+        // A stubbed coordinator-side consumer standing in for the queue service: it holds `parked` requests and admits
+        // one per grant, capturing the reserved permit so the test can "complete" that request by closing it (which
+        // re-drives owner-push, exactly like a real request finishing).
+        final AtomicInteger parked = new AtomicInteger(3);
+        final AtomicInteger admits = new AtomicInteger(0);
+        final List<Releasable> heldPermits = new ArrayList<>();
+        service.setGrantConsumer((bucketKey, reservedPermit) -> {
+            if (parked.get() <= 0) {
+                return false; // nothing left to admit -> caller returns the unused grant and deregisters this waiter
+            }
+            parked.decrementAndGet();
+            admits.incrementAndGet();
+            heldPermits.add(reservedPermit);
+            return true;
+        });
+
+        // Fill the single shared slot, then issue 3 denied acquires with wantsQueue=true. Each denial registers this
+        // (local) coordinator as a waiter — idempotently, so the Set holds exactly ONE membership for 3 parked requests.
+        Releasable slotHolder = awaitGrant(service, bucket, sharedLimit);
+        assertNotNull("first acquire takes the only shared slot", slotHolder);
+        for (int i = 0; i < 3; i++) {
+            AtomicReference<Exception> denial = new AtomicReference<>();
+            service.acquireAsync(bucket, sharedLimit, true, ActionListener.wrap(p -> fail("must be denied while at limit"), denial::set));
+            assertTrue("acquire at limit must be denied (429)", denial.get() instanceof OpenSearchRejectedExecutionException);
+        }
+        assertEquals("one Set membership for the coordinator regardless of parked count", 1, service.waiterCountForTest(bucket));
+
+        // Release the in-flight slot -> owner-push admits the FIRST parked request and the coordinator stays registered.
+        slotHolder.close();
+        assertEquals("first freed slot drains exactly one parked request", 1, admits.get());
+        assertEquals("coordinator must remain registered while it still has parked requests", 1, service.waiterCountForTest(bucket));
+
+        // Each admitted request completing frees the slot again and must drain the NEXT parked request.
+        heldPermits.remove(0).close();
+        assertEquals("second freed slot drains the second parked request", 2, admits.get());
+        assertEquals(1, service.waiterCountForTest(bucket));
+
+        heldPermits.remove(0).close();
+        assertEquals("third freed slot drains the third (last) parked request", 3, admits.get());
+
+        // The last request completes with nothing left queued: the next grant comes back unused, so the coordinator
+        // self-deregisters and the freed slot returns to the pool. No stranding, no leaked permit.
+        heldPermits.remove(0).close();
+        assertEquals("no further admits once the queue is empty", 3, admits.get());
+        assertEquals("coordinator self-reconciles out of the registry when it has nothing queued", 0, service.waiterCountForTest(bucket));
+        assertEquals("no shared permit leaked after the burst fully drains", 0, service.tracker().inFlight(bucket));
     }
 
     public void testDoubleCloseReleasesOnce() {

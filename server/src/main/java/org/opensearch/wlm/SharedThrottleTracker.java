@@ -10,7 +10,9 @@ package org.opensearch.wlm;
 
 import org.opensearch.common.annotation.ExperimentalApi;
 
+import java.util.ArrayList;
 import java.util.Iterator;
+import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.LongAdder;
@@ -124,29 +126,51 @@ public class SharedThrottleTracker {
      *
      * @param bucketKey the throttle bucket identifier
      * @param permitId   the permit id returned to the coordinator at acquire time
+     * @return {@code true} if a live permit was actually removed, i.e. a slot genuinely just freed. This is the
+     *         authoritative answer to "did capacity become available?", and the owner is the only node that can give it:
+     *         a coordinator sending a speculative release (e.g. after a lost acquire reply) cannot know whether its
+     *         permit was ever recorded. Callers drive owner-push on {@code true} only, so a no-op release never produces
+     *         a phantom grant and — the case a coordinator-supplied hint used to get wrong — a release that DID free a
+     *         slot always drives one.
      */
-    public void release(String bucketKey, String permitId) {
+    public boolean release(String bucketKey, String permitId) {
+        final boolean[] removed = new boolean[1];
         permitsByBucket.computeIfPresent(bucketKey, (k, bucket) -> {
-            bucket.permits.remove(permitId);
+            removed[0] = bucket.permits.remove(permitId) != null;
             // minExpiry is intentionally left unchanged: removing a permit can only raise the true earliest expiry, so
             // the cached value stays a valid (possibly loose) lower bound. Recomputing here would add an O(size) scan
             // to the release hot path for no correctness benefit.
             return bucket.permits.isEmpty() ? null : bucket;
         });
+        return removed[0];
     }
 
     /**
      * Reclaims all expired permits across every bucket. Intended to be called periodically by the owning service.
      * Safe to run concurrently with {@link #tryAcquire}/{@link #release} thanks to per-key {@code compute}.
+     *
+     * @return the bucket keys for which at least one permit was reclaimed, i.e. those that just gained free capacity.
+     *         The caller must drive owner-push for these: an expiring permit is the only free-slot signal available when
+     *         the holder crashed or its release RPC was lost, so ignoring it strands a waiting coordinator's parked
+     *         request (there is no queue timeout to rescue it). Empty when nothing expired, which is the common case.
      */
-    public void sweepExpired() {
+    public List<String> sweepExpired() {
         final long now = nanoTimeSupplier.getAsLong();
+        final List<String> freedBuckets = new ArrayList<>();
         for (String bucketKey : permitsByBucket.keySet()) {
             permitsByBucket.computeIfPresent(bucketKey, (k, bucket) -> {
+                final int before = bucket.permits.size();
                 pruneExpired(bucket, now);
+                if (bucket.permits.size() < before) {
+                    // At least one slot just freed for this bucket. Reclaiming a permit here is the ONLY signal for a
+                    // holder that crashed or whose release RPC was lost — there is no release RPC to drive owner-push —
+                    // so the caller must be told, or a coordinator's parked request can strand with free capacity.
+                    freedBuckets.add(bucketKey);
+                }
                 return bucket.permits.isEmpty() ? null : bucket;
             });
         }
+        return freedBuckets;
     }
 
     // Current live (non-expired-at-read-time) count for a bucket. Package-private for tests.

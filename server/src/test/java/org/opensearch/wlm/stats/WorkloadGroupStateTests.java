@@ -70,4 +70,27 @@ public class WorkloadGroupStateTests extends OpenSearchTestCase {
         assertEquals(5, workloadGroupState.getResourceState().get(ResourceType.MEMORY).cancellations.count());
     }
 
+    public void testRecordQueueWaitAggregates() {
+        WorkloadGroupState state = new WorkloadGroupState();
+        assertEquals(0, state.getQueueWaitCount());
+        assertEquals(0, state.getTotalQueueWaitMillis());
+        assertEquals(0, state.getMaxQueueWaitMillis());
+
+        state.recordQueueWaitMillis(100);
+        state.recordQueueWaitMillis(300);
+        state.recordQueueWaitMillis(50);
+
+        assertEquals(3, state.getQueueWaitCount());
+        assertEquals(450, state.getTotalQueueWaitMillis()); // sum -> mean = 150
+        assertEquals(300, state.getMaxQueueWaitMillis()); // high-water mark, does not decrease
+    }
+
+    public void testRecordQueueWaitClampsNegative() {
+        WorkloadGroupState state = new WorkloadGroupState();
+        state.recordQueueWaitMillis(-5); // clock skew guard
+        assertEquals(1, state.getQueueWaitCount());
+        assertEquals(0, state.getTotalQueueWaitMillis());
+        assertEquals(0, state.getMaxQueueWaitMillis());
+    }
+
 }
