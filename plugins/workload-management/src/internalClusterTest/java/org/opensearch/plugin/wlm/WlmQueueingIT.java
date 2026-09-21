@@ -44,6 +44,8 @@ import org.opensearch.wlm.ResourceType;
 import org.opensearch.wlm.WorkloadGroupQueueSettings;
 import org.opensearch.wlm.WorkloadGroupThrottleSettings;
 import org.opensearch.wlm.WorkloadManagementSettings;
+import org.opensearch.wlm.stats.WlmStats;
+import org.opensearch.wlm.stats.WorkloadGroupStats.WorkloadGroupStatsHolder;
 import org.joda.time.Instant;
 import org.junit.After;
 import org.junit.Before;
@@ -59,6 +61,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Function;
+import java.util.function.ToLongFunction;
 
 import static org.opensearch.index.query.QueryBuilders.scriptQuery;
 import static org.opensearch.test.hamcrest.OpenSearchAssertions.assertAcked;
@@ -128,9 +131,9 @@ public class WlmQueueingIT extends OpenSearchIntegTestCase {
 
         // Wait for rule propagation: a (non-blocking) search must be tagged to the group before the scenario.
         assertBusy(() -> {
-            int before = getStat(workloadGroupId, "total_completions");
+            long before = getCompletions(workloadGroupId);
             client().prepareSearch(indexName).setQuery(org.opensearch.index.query.QueryBuilders.matchAllQuery()).get();
-            int after = getStat(workloadGroupId, "total_completions");
+            long after = getCompletions(workloadGroupId);
             assertTrue("Expected search to be tagged to the workload group", after > before);
         }, 30, TimeUnit.SECONDS);
 
@@ -140,19 +143,25 @@ public class WlmQueueingIT extends OpenSearchIntegTestCase {
         ActionFuture<SearchResponse> firstBlocked = blockingSearch(indexName).execute();
         awaitForBlock(plugins);
 
-        int queuedBefore = getStat(workloadGroupId, "total_queued");
-        int throttledBefore = getStat(workloadGroupId, "total_throttled");
+        long queuedBefore = getTotalQueued(workloadGroupId);
+        long throttledBefore = getThrottled(workloadGroupId);
 
-        // Second search while the first is in-flight: it must be QUEUED (parked), not rejected. Run it async and assert
-        // it gets parked (total_queued increments) and does NOT fail with a 429.
+        // Second search while the first is in-flight: it must be QUEUED (parked), not rejected. Run it async and wait for
+        // the park to show up as live depth — total_queued is deliberately NOT the signal here, because it counts a wait
+        // when the wait ENDS (on admission), so while the request is still parked it has not moved yet.
         ActionFuture<SearchResponse> secondQueued = blockingSearch(indexName).execute();
-        assertBusy(() -> {
-            assertEquals("second search should be parked in the queue", queuedBefore + 1, getStat(workloadGroupId, "total_queued"));
-        }, 30, TimeUnit.SECONDS);
+        assertBusy(
+            () -> assertEquals("second search should be parked in the queue", 1, getQueuedCurrent(workloadGroupId)),
+            30,
+            TimeUnit.SECONDS
+        );
         // It was queued, not throttle-rejected.
-        assertEquals("a queued request must not be counted as throttled", throttledBefore, getStat(workloadGroupId, "total_throttled"));
-        // queued_current reflects the one parked request.
-        assertEquals("one request should currently be queued", 1, getStat(workloadGroupId, "queued_current"));
+        assertEquals("a queued request must not be counted as throttled", throttledBefore, getThrottled(workloadGroupId));
+        assertEquals(
+            "a still-parked request has not finished waiting, so it is not counted yet",
+            queuedBefore,
+            getTotalQueued(workloadGroupId)
+        );
 
         // Release the block. The first search completes, frees the permit, and the node-completion drain admits the
         // parked second search — which then also runs (and completes, since blocks are now disabled).
@@ -161,18 +170,18 @@ public class WlmQueueingIT extends OpenSearchIntegTestCase {
         assertNotNull("the queued search must be admitted and complete once a permit frees", secondQueued.actionGet(TIMEOUT));
 
         // The queue drains back to empty.
-        assertBusy(() -> assertEquals("queue must drain to empty", 0, getStat(workloadGroupId, "queued_current")), 30, TimeUnit.SECONDS);
+        assertBusy(() -> assertEquals("queue must drain to empty", 0, getQueuedCurrent(workloadGroupId)), 30, TimeUnit.SECONDS);
 
-        // The admitted-from-queue request contributed to the queue-wait aggregate: exactly one recorded wait. The
-        // magnitude is not asserted (the test releases the block as soon as the park is observed, so the actual wait
+        // NOW the wait has ended, so total_queued counts it — one genuinely-waiting request, admitted by the node-completion
+        // drain. There is no separate wait count: total_queued IS the denominator, written by the same call as the sum.
+        // The magnitude is not asserted (the test releases the block as soon as the park is observed, so the actual wait
         // can be sub-millisecond; the arithmetic of sum/mean/max is covered deterministically in unit tests). Total and
-        // max must be internally consistent: max <= total when there is a single sample, and both non-negative.
-        int waitCount = getStat(workloadGroupId, "queue_wait_count");
-        int totalWait = getStat(workloadGroupId, "total_queue_wait_millis");
-        int maxWait = getStat(workloadGroupId, "max_queue_wait_millis");
-        assertEquals("one admitted request should have a recorded queue wait", 1, waitCount);
-        assertThat("total queue wait must be non-negative", totalWait, greaterThanOrEqualTo(0));
-        assertThat("max queue wait must be non-negative", maxWait, greaterThanOrEqualTo(0));
+        // max must be internally consistent: with a single sample they are equal, and both non-negative.
+        long totalWait = getTotalQueueWaitMillis(workloadGroupId);
+        long maxWait = getMaxQueueWaitMillis(workloadGroupId);
+        assertEquals("exactly one request should have waited", queuedBefore + 1, getTotalQueued(workloadGroupId));
+        assertThat("total queue wait must be non-negative", totalWait, greaterThanOrEqualTo(0L));
+        assertThat("max queue wait must be non-negative", maxWait, greaterThanOrEqualTo(0L));
         assertEquals("with a single sample, max equals total", totalWait, maxWait);
     }
 
@@ -193,9 +202,9 @@ public class WlmQueueingIT extends OpenSearchIntegTestCase {
         indexDocument(indexName);
 
         assertBusy(() -> {
-            int before = getStat(workloadGroupId, "total_completions");
+            long before = getCompletions(workloadGroupId);
             client().prepareSearch(indexName).setQuery(org.opensearch.index.query.QueryBuilders.matchAllQuery()).get();
-            int after = getStat(workloadGroupId, "total_completions");
+            long after = getCompletions(workloadGroupId);
             assertTrue("Expected search to be tagged to the workload group", after > before);
         }, 30, TimeUnit.SECONDS);
 
@@ -207,13 +216,9 @@ public class WlmQueueingIT extends OpenSearchIntegTestCase {
 
         // Second search parks (fills the single queue slot).
         ActionFuture<SearchResponse> secondQueued = blockingSearch(indexName).execute();
-        assertBusy(
-            () -> assertEquals("second search should be parked", 1, getStat(workloadGroupId, "queued_current")),
-            30,
-            TimeUnit.SECONDS
-        );
+        assertBusy(() -> assertEquals("second search should be parked", 1, getQueuedCurrent(workloadGroupId)), 30, TimeUnit.SECONDS);
 
-        int queueRejectionsBefore = getStat(workloadGroupId, "total_queue_rejections");
+        long queueRejectionsBefore = getQueueRejections(workloadGroupId);
 
         // Third concurrent search: permit taken, queue full -> 429.
         Throwable rejection = expectThrows(Throwable.class, () -> blockingSearch(indexName).get());
@@ -224,7 +229,7 @@ public class WlmQueueingIT extends OpenSearchIntegTestCase {
         assertEquals(
             "queue-full rejection should increment total_queue_rejections",
             queueRejectionsBefore + 1,
-            getStat(workloadGroupId, "total_queue_rejections")
+            getQueueRejections(workloadGroupId)
         );
 
         // Release; the first and the queued second both complete.
@@ -247,30 +252,46 @@ public class WlmQueueingIT extends OpenSearchIntegTestCase {
         return false;
     }
 
-    private int getStat(String groupId, String fieldName) throws Exception {
+    // Sums a per-group stat across all nodes using the typed WlmStats response (no brittle string parsing).
+    private long sumAcrossNodes(String groupId, ToLongFunction<WorkloadGroupStatsHolder> extractor) throws Exception {
         WlmStatsRequest request = new WlmStatsRequest(null, new HashSet<>(Collections.singletonList(groupId)), null);
         WlmStatsResponse response = client().execute(WlmStatsAction.INSTANCE, request).get();
-        return extractStatField(response.toString(), groupId, fieldName);
-    }
-
-    private int extractStatField(String responseBody, String workloadGroupId, String fieldName) {
-        int total = 0;
-        String groupKey = "\"" + workloadGroupId + "\"";
-        String field = "\"" + fieldName + "\"";
-        int index = 0;
-        while ((index = responseBody.indexOf(groupKey, index)) != -1) {
-            int groupStart = responseBody.indexOf("{", index);
-            int fieldIndex = responseBody.indexOf(field, groupStart);
-            if (fieldIndex == -1) break;
-            int colonIndex = responseBody.indexOf(":", fieldIndex);
-            int commaIndex = responseBody.indexOf(",", colonIndex);
-            int braceIndex = responseBody.indexOf("}", colonIndex);
-            int end = (commaIndex == -1 || (braceIndex != -1 && braceIndex < commaIndex)) ? braceIndex : commaIndex;
-            String numberStr = responseBody.substring(colonIndex + 1, end).trim();
-            total += Integer.parseInt(numberStr);
-            index = end;
+        long total = 0;
+        for (WlmStats nodeStats : response.getNodes()) {
+            WorkloadGroupStatsHolder holder = nodeStats.getWorkloadGroupStats().getStats().get(groupId);
+            if (holder != null) {
+                total += extractor.applyAsLong(holder);
+            }
         }
         return total;
+    }
+
+    private long getCompletions(String groupId) throws Exception {
+        return sumAcrossNodes(groupId, WorkloadGroupStatsHolder::getCompletions);
+    }
+
+    private long getThrottled(String groupId) throws Exception {
+        return sumAcrossNodes(groupId, WorkloadGroupStatsHolder::getThrottled);
+    }
+
+    private long getTotalQueued(String groupId) throws Exception {
+        return sumAcrossNodes(groupId, WorkloadGroupStatsHolder::getQueued);
+    }
+
+    private long getQueuedCurrent(String groupId) throws Exception {
+        return sumAcrossNodes(groupId, WorkloadGroupStatsHolder::getQueuedCurrent);
+    }
+
+    private long getQueueRejections(String groupId) throws Exception {
+        return sumAcrossNodes(groupId, WorkloadGroupStatsHolder::getQueueRejections);
+    }
+
+    private long getTotalQueueWaitMillis(String groupId) throws Exception {
+        return sumAcrossNodes(groupId, WorkloadGroupStatsHolder::getTotalQueueWaitMillis);
+    }
+
+    private long getMaxQueueWaitMillis(String groupId) throws Exception {
+        return sumAcrossNodes(groupId, WorkloadGroupStatsHolder::getMaxQueueWaitMillis);
     }
 
     private SearchRequestBuilder blockingSearch(String indexName) {

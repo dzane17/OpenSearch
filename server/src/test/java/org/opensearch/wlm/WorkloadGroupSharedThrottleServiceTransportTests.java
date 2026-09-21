@@ -11,6 +11,8 @@ package org.opensearch.wlm;
 import org.opensearch.Version;
 import org.opensearch.cluster.ClusterChangedEvent;
 import org.opensearch.cluster.ClusterState;
+import org.opensearch.cluster.metadata.Metadata;
+import org.opensearch.cluster.metadata.WorkloadGroup;
 import org.opensearch.cluster.node.DiscoveryNode;
 import org.opensearch.cluster.node.DiscoveryNodes;
 import org.opensearch.cluster.service.ClusterService;
@@ -198,6 +200,200 @@ public class WorkloadGroupSharedThrottleServiceTransportTests extends OpenSearch
         assertTrue("fail-open must invoke onResponse, not onFailure", listener.responded.get());
         assertNull("fail-open on transport error must yield a null permit (admit, untracked)", listener.response.get());
         assertNull("fail-open must never propagate a failure to the listener", listener.failure.get());
+    }
+
+    /**
+     * A denial with the coordinator reachable from the owner: the owner registers it as a waiter and reports
+     * {@code registered=true}, so the coordinator surfaces the plain 429 marker and its parked request keeps waiting for
+     * owner-push. The no-waiter callback must NOT fire.
+     */
+    public void testDeniedRegistersWaiterWhenCoordinatorReachableFromOwner() throws Exception {
+        // The owner must both SEE the coordinator in its applied state and hold a connection to it.
+        ownerSees(coordinatorNode);
+        ownerTransport.connectToNode(coordinatorNode);
+
+        fillOwnerToLimit();
+
+        CapturingListener listener = new CapturingListener();
+        AtomicBoolean noWaiter = new AtomicBoolean(false);
+        coordinatorService.acquireAsync(remoteKey, 1, listener, () -> noWaiter.set(true));
+        listener.await();
+
+        assertFalse("owner could register us, so the no-waiter path must not fire", noWaiter.get());
+        assertTrue(
+            "denial must surface as the plain 429 marker, was: " + listener.failure.get(),
+            listener.failure.get() instanceof OpenSearchRejectedExecutionException
+        );
+        assertEquals("owner must have registered the coordinator as a waiter", 1, ownerService.waiterCountForTest(remoteKey));
+    }
+
+    /**
+     * The JOIN race: the coordinator's acquire reaches the owner before the owner has applied the cluster state that
+     * contains it (an inbound channel needs no membership). The owner cannot address it, so it must report
+     * {@code registered=false} rather than silently skipping registration — otherwise the coordinator's parked request
+     * would wait for a grant that never comes, with no deadline to rescue it.
+     */
+    public void testDeniedReportsNoWaiterWhenCoordinatorAbsentFromOwnerState() throws Exception {
+        ownerSees(); // owner's applied state does not contain the coordinator yet
+        fillOwnerToLimit();
+
+        CapturingListener listener = new CapturingListener();
+        AtomicBoolean noWaiter = new AtomicBoolean(false);
+        CountDownLatch noWaiterLatch = new CountDownLatch(1);
+        coordinatorService.acquireAsync(remoteKey, 1, listener, () -> {
+            noWaiter.set(true);
+            noWaiterLatch.countDown();
+        });
+
+        assertTrue("the no-waiter callback must fire", noWaiterLatch.await(10, TimeUnit.SECONDS));
+        assertTrue(noWaiter.get());
+        assertFalse("the listener must not be completed on this path", listener.responded.get());
+        assertNull("the no-waiter callback replaces onFailure, it does not add to it", listener.failure.get());
+        assertEquals("no waiter can be registered for a node the owner cannot address", 0, ownerService.waiterCountForTest(remoteKey));
+    }
+
+    /**
+     * The RESTART case, which a presence-only check would get WRONG: the owner's applied state still holds the PREVIOUS
+     * incarnation of the coordinator — same persistent node id, different ephemeral id — so {@code nodes().get(id)}
+     * returns non-null. Registering that stale node would look like success and then be silently dropped by the first
+     * freed slot (it is absent from the connection map, which is keyed on ephemeral id). The reachability check must
+     * catch it and report {@code registered=false}.
+     */
+    public void testDeniedReportsNoWaiterWhenCoordinatorPresentButStale() throws Exception {
+        DiscoveryNode staleCoordinator = new DiscoveryNode(
+            coordinatorNode.getName(),
+            coordinatorNode.getId(),            // same PERSISTENT id ...
+            "stale-ephemeral-id",               // ... but a previous incarnation's ephemeral id
+            coordinatorNode.getHostName(),
+            coordinatorNode.getHostAddress(),
+            coordinatorNode.getAddress(),
+            coordinatorNode.getAttributes(),
+            coordinatorNode.getRoles(),
+            coordinatorNode.getVersion()
+        );
+        assertEquals(
+            "precondition: the stale node resolves under the same persistent id",
+            coordinatorNode.getId(),
+            staleCoordinator.getId()
+        );
+        assertNotEquals(
+            "precondition: DiscoveryNode identity is the ephemeral id, so it is a DIFFERENT node",
+            coordinatorNode,
+            staleCoordinator
+        );
+
+        ownerSees(staleCoordinator);
+        // Even a live connection to the CURRENT coordinator must not make the stale entry look reachable.
+        ownerTransport.connectToNode(coordinatorNode);
+        fillOwnerToLimit();
+
+        CapturingListener listener = new CapturingListener();
+        AtomicBoolean noWaiter = new AtomicBoolean(false);
+        CountDownLatch noWaiterLatch = new CountDownLatch(1);
+        coordinatorService.acquireAsync(remoteKey, 1, listener, () -> {
+            noWaiter.set(true);
+            noWaiterLatch.countDown();
+        });
+
+        assertTrue("a stale-identity resolve must be reported as not registered", noWaiterLatch.await(10, TimeUnit.SECONDS));
+        assertTrue(noWaiter.get());
+        assertEquals("a stale node must never be registered as a waiter", 0, ownerService.waiterCountForTest(remoteKey));
+    }
+
+    /**
+     * PROBE 6 — the NON-queueing path passes a null no-waiter callback, so {@code wantsQueue} is false and the owner
+     * reports {@code registered=false}. The coordinator must fall through to the plain 429 marker and must NOT
+     * dereference the null Runnable.
+     */
+    public void testNonQueueingDenialDoesNotTouchTheNullCallback() throws Exception {
+        ownerSees(); // owner cannot see the coordinator, so registered would be false if it were even consulted
+        fillOwnerToLimit();
+
+        CapturingListener listener = new CapturingListener();
+        coordinatorService.acquireAsync(remoteKey, 1, listener); // 3-arg overload => null callback, wantsQueue=false
+        listener.await();
+
+        assertFalse("must not admit", listener.responded.get());
+        assertTrue(
+            "non-queueing denial must surface the plain 429, not NPE on the null callback, was: " + listener.failure.get(),
+            listener.failure.get() instanceof OpenSearchRejectedExecutionException
+        );
+        assertNull("a NullPointerException here would mean the wantsQueue guard is missing", listener.failure.get().getCause());
+        assertEquals("wantsQueue=false must never register a waiter", 0, ownerService.waiterCountForTest(remoteKey));
+    }
+
+    /**
+     * PROBE 7 — a waiter registered while connected, that then disconnects before a slot frees. The owner must reclaim
+     * the reserved slot (no permit leak), drop the dead waiter, and terminate its bounded drain loop.
+     */
+    public void testDisconnectAfterRegistrationReclaimsSlotAndDropsWaiter() throws Exception {
+        ownerSeesWithGroup(coordinatorNode);
+        ownerTransport.connectToNode(coordinatorNode);
+        fillOwnerToLimit();
+
+        // Register the coordinator as a waiter while it is reachable.
+        CapturingListener listener = new CapturingListener();
+        coordinatorService.acquireAsync(remoteKey, 1, listener, () -> fail("owner could see and reach us, so it must register"));
+        listener.await();
+        assertEquals("waiter registered", 1, ownerService.waiterCountForTest(remoteKey));
+        assertEquals("the pre-filled permit still holds the only slot", 1, ownerService.tracker().inFlight(remoteKey));
+
+        // The coordinator now goes away before any slot frees.
+        ownerTransport.disconnectFromNode(coordinatorNode);
+        assertFalse("precondition: owner must no longer see a connection", ownerTransport.nodeConnected(coordinatorNode));
+
+        // Free the slot -> owner-push picks the dead waiter, reclaims, drops it, and the loop must terminate.
+        ownerService.handleRelease(new WorkloadGroupSharedThrottleService.ReleasePermitRequest(remoteKey, "pre"));
+
+        assertEquals("the reserved slot must be reclaimed, not leaked until TTL", 0, ownerService.tracker().inFlight(remoteKey));
+        assertEquals("the disconnected waiter must be dropped", 0, ownerService.waiterCountForTest(remoteKey));
+    }
+
+    /** Takes the bucket's only shared slot on the owner so the next acquire is denied at the source. */
+    private void fillOwnerToLimit() {
+        assertTrue(ownerService.tracker().tryAcquire(remoteKey, 1, "pre", WorkloadGroupSharedThrottleService.PERMIT_TTL_NANOS));
+        assertEquals(1, ownerService.tracker().inFlight(remoteKey));
+    }
+
+    /** Stubs the OWNER's applied cluster state to contain itself plus {@code others} (the coordinator, or nothing). */
+    private void ownerSees(DiscoveryNode... others) {
+        DiscoveryNodes.Builder builder = DiscoveryNodes.builder().add(ownerNode).localNodeId(ownerNode.getId());
+        for (DiscoveryNode other : others) {
+            builder.add(other);
+        }
+        ClusterState state = mock(ClusterState.class);
+        when(state.nodes()).thenReturn(builder.build());
+        when(ownerClusterService.state()).thenReturn(state);
+    }
+
+    /**
+     * As {@link #ownerSees}, but also stubs the bucket's workload group so the owner can resolve {@code shared_limit}
+     * from its own state — required by the release path, which drives owner-push only for a resolvable limit.
+     */
+    private void ownerSeesWithGroup(DiscoveryNode... others) {
+        DiscoveryNodes.Builder builder = DiscoveryNodes.builder().add(ownerNode).localNodeId(ownerNode.getId());
+        for (DiscoveryNode other : others) {
+            builder.add(other);
+        }
+        final int idx = remoteKey.indexOf(':');
+        final String groupId = idx < 0 ? remoteKey : remoteKey.substring(0, idx);
+        WorkloadGroup group = new WorkloadGroup(
+            groupId + "-name",
+            groupId,
+            new MutableWorkloadGroupFragment(
+                MutableWorkloadGroupFragment.ResiliencyMode.ENFORCED,
+                java.util.Map.of(ResourceType.MEMORY, 0.5),
+                Settings.EMPTY,
+                Settings.builder().put("attribute", "group").put("shared_limit", 1).build()
+            ),
+            1L
+        );
+        Metadata metadata = mock(Metadata.class);
+        when(metadata.workloadGroups()).thenReturn(java.util.Map.of(groupId, group));
+        ClusterState state = mock(ClusterState.class);
+        when(state.nodes()).thenReturn(builder.build());
+        when(state.metadata()).thenReturn(metadata);
+        when(ownerClusterService.state()).thenReturn(state);
     }
 
     /** Captures the outcome of an async acquire, distinguishing onResponse(null) from an unfired listener via a latch. */

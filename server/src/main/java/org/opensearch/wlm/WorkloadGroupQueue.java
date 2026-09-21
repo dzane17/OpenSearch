@@ -12,8 +12,13 @@ import org.opensearch.common.annotation.ExperimentalApi;
 import org.opensearch.common.lease.Releasable;
 import org.opensearch.core.action.ActionListener;
 
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.Iterator;
 import java.util.LinkedHashSet;
+import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
@@ -157,7 +162,7 @@ public class WorkloadGroupQueue {
         if (bucket == null) {
             return null;
         }
-        java.util.Iterator<QueuedRequest> it = bucket.iterator();
+        Iterator<QueuedRequest> it = bucket.iterator();
         return it.hasNext() ? it.next() : null; // head = oldest (insertion order)
     }
 
@@ -170,7 +175,7 @@ public class WorkloadGroupQueue {
         if (bucket == null) {
             return null;
         }
-        java.util.Iterator<QueuedRequest> it = bucket.iterator();
+        Iterator<QueuedRequest> it = bucket.iterator();
         QueuedRequest req = null;
         if (it.hasNext()) {
             req = it.next(); // head = oldest (insertion order)
@@ -192,13 +197,13 @@ public class WorkloadGroupQueue {
      * no time-based eviction — a still-live parked request is never removed here regardless of how long it has waited;
      * a corrupt/dead but uncancelled entry self-heals when it drains to the head and fails on execution.
      */
-    java.util.List<QueuedRequest> evictCancelled(String bucketKey) {
+    List<QueuedRequest> evictCancelled(String bucketKey) {
         LinkedHashSet<QueuedRequest> bucket = byBucket.get(bucketKey);
         if (bucket == null) {
-            return java.util.Collections.emptyList();
+            return Collections.emptyList();
         }
-        java.util.List<QueuedRequest> evicted = new java.util.ArrayList<>();
-        for (java.util.Iterator<QueuedRequest> it = bucket.iterator(); it.hasNext();) {
+        List<QueuedRequest> evicted = new ArrayList<>();
+        for (Iterator<QueuedRequest> it = bucket.iterator(); it.hasNext();) {
             QueuedRequest req = it.next();
             if (req.task().isCancelled()) {
                 it.remove();
@@ -234,7 +239,7 @@ public class WorkloadGroupQueue {
     }
 
     /** Snapshot of the bucket keys that currently have at least one parked request. */
-    java.util.Set<String> bucketKeys() {
+    Set<String> bucketKeys() {
         return byBucket.keySet();
     }
 

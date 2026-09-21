@@ -279,7 +279,9 @@ public class WlmClusterThrottlingIT extends OpenSearchIntegTestCase {
             TimeUnit.SECONDS
         );
         assertEquals("a parked request must not be counted as throttled", throttledBefore, getThrottled(workloadGroupId));
-        assertEquals("the parked request should be counted as queued", totalQueuedBefore + 1, getTotalQueued(workloadGroupId));
+        // total_queued counts a wait when it ENDS (on admission), so a still-parked request has not moved it yet — it is
+        // visible as queued_current above, and asserted below once owner-push admits it.
+        assertEquals("a still-parked request is not yet counted as queued", totalQueuedBefore, getTotalQueued(workloadGroupId));
 
         // Release the blocks. The first completes and frees the single shared slot; the owner pushes a grant to the
         // coordinator holding the parked second search, which then drains and completes. With no node tier, this can
@@ -290,6 +292,18 @@ public class WlmClusterThrottlingIT extends OpenSearchIntegTestCase {
 
         // The queue drains back to empty.
         assertBusy(() -> assertEquals("queue must drain to empty", 0, getQueuedCurrent(workloadGroupId)), 30, TimeUnit.SECONDS);
+
+        // Only NOW is the wait counted, and it must be counted exactly once: the admission came from a cross-node
+        // owner-push grant, i.e. capacity the request did not supply itself.
+        assertBusy(
+            () -> assertEquals(
+                "the owner-push admission counts exactly one genuinely-waiting request",
+                totalQueuedBefore + 1,
+                getTotalQueued(workloadGroupId)
+            ),
+            30,
+            TimeUnit.SECONDS
+        );
     }
 
     // Helpers

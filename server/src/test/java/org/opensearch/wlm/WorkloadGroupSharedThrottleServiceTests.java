@@ -172,7 +172,12 @@ public class WorkloadGroupSharedThrottleServiceTests extends OpenSearchTestCase 
         // with a parked request. Both happen at t=0, while the holder's permit is still live.
         assertNotNull("first acquire takes the only shared slot", awaitGrant(service, bucket, sharedLimit));
         AtomicReference<Exception> denial = new AtomicReference<>();
-        service.acquireAsync(bucket, sharedLimit, true, ActionListener.wrap(p -> fail("must be denied while at limit"), denial::set));
+        service.acquireAsync(
+            bucket,
+            sharedLimit,
+            ActionListener.wrap(p -> fail("must be denied while at limit"), denial::set),
+            () -> fail("local owner must always be able to register itself as a waiter")
+        );
         assertTrue("acquire at limit must be denied", denial.get() instanceof OpenSearchRejectedExecutionException);
         assertEquals("coordinator is registered as a waiter", 1, service.waiterCountForTest(bucket));
 
@@ -281,7 +286,12 @@ public class WorkloadGroupSharedThrottleServiceTests extends OpenSearchTestCase 
         assertNotNull("first acquire takes the only shared slot", slotHolder);
         for (int i = 0; i < 3; i++) {
             AtomicReference<Exception> denial = new AtomicReference<>();
-            service.acquireAsync(bucket, sharedLimit, true, ActionListener.wrap(p -> fail("must be denied while at limit"), denial::set));
+            service.acquireAsync(
+                bucket,
+                sharedLimit,
+                ActionListener.wrap(p -> fail("must be denied while at limit"), denial::set),
+                () -> fail("local owner must always be able to register itself as a waiter")
+            );
             assertTrue("acquire at limit must be denied (429)", denial.get() instanceof OpenSearchRejectedExecutionException);
         }
         assertEquals("one Set membership for the coordinator regardless of parked count", 1, service.waiterCountForTest(bucket));
@@ -567,6 +577,69 @@ public class WorkloadGroupSharedThrottleServiceTests extends OpenSearchTestCase 
             );
             assertTrue(e.getMessage(), e.getMessage().contains(omitted));
         }
+    }
+
+    /**
+     * PROBE 4 — LOCAL-OWNER path. Registration there does not go through the cluster-state lookup at all (the waiter IS
+     * this node), so it can never report "not registered". Verified even with the local node ABSENT from its own applied
+     * state, which is the condition that defeats the remote path: the ring still routes the bucket here, the local
+     * short-circuit registers {@code clusterService.localNode()} directly, and the no-waiter callback must stay unused.
+     */
+    public void testLocalOwnerAlwaysRegistersEvenWhenAbsentFromItsOwnAppliedState() {
+        final String bucket = "grp-local:group";
+        final int sharedLimit = 1;
+        WorkloadGroupSharedThrottleService service = newService(); // ring built while the local node IS present
+        stubGroupFor(bucket, sharedLimit);
+
+        // Now make the local node vanish from the applied state, while the ring keeps routing this bucket to it.
+        ClusterState nodeless = Mockito.mock(ClusterState.class);
+        when(nodeless.nodes()).thenReturn(DiscoveryNodes.EMPTY_NODES);
+        when(nodeless.metadata()).thenReturn(metadata);
+        when(clusterService.state()).thenReturn(nodeless);
+        assertNull("precondition: the local node must not resolve from its own state", clusterService.state().nodes().get("local"));
+
+        assertNotNull("first acquire takes the only shared slot", awaitGrant(service, bucket, sharedLimit));
+
+        AtomicReference<Exception> denial = new AtomicReference<>();
+        service.acquireAsync(
+            bucket,
+            sharedLimit,
+            ActionListener.wrap(p -> fail("must be denied while at limit"), denial::set),
+            () -> fail("the local owner must never report itself unregisterable")
+        );
+
+        assertTrue("acquire at limit must be denied", denial.get() instanceof OpenSearchRejectedExecutionException);
+        assertEquals("the local waiter must still be registered", 1, service.waiterCountForTest(bucket));
+    }
+
+    /**
+     * PROBE 4b — the local-owner denial must be reported through the listener (the plain 429 marker), never by diverting
+     * to the no-waiter callback, for BOTH the queueing and non-queueing overloads.
+     */
+    public void testLocalOwnerDenialUsesTheListenerForBothOverloads() {
+        final String bucket = "grp-local2:group";
+        final int sharedLimit = 1;
+        WorkloadGroupSharedThrottleService service = newService();
+        stubGroupFor(bucket, sharedLimit);
+        assertNotNull(awaitGrant(service, bucket, sharedLimit));
+
+        // Non-queueing overload: null callback, so a divert here would NPE.
+        AtomicReference<Exception> plain = new AtomicReference<>();
+        service.acquireAsync(bucket, sharedLimit, ActionListener.wrap(p -> fail("must be denied"), plain::set));
+        assertTrue(plain.get() instanceof OpenSearchRejectedExecutionException);
+        assertNull("no NPE cause", plain.get().getCause());
+        assertEquals("wantsQueue=false must not register a waiter", 0, service.waiterCountForTest(bucket));
+
+        // Queueing overload: the callback is supplied but must remain unused.
+        AtomicReference<Exception> queued = new AtomicReference<>();
+        service.acquireAsync(
+            bucket,
+            sharedLimit,
+            ActionListener.wrap(p -> fail("must be denied"), queued::set),
+            () -> fail("local registration cannot fail")
+        );
+        assertTrue(queued.get() instanceof OpenSearchRejectedExecutionException);
+        assertEquals("now a local waiter is registered", 1, service.waiterCountForTest(bucket));
     }
 
 }

@@ -41,28 +41,29 @@ public class WorkloadGroupStatsTests extends AbstractWireSerializingTestCase<Wor
         workloadGroupStats.toXContent(builder, ToXContent.EMPTY_PARAMS);
         builder.endObject();
         assertEquals(
-            "{\"workload_groups\":{\"afakjklaj304041-afaka\":{\"total_completions\":123456789,\"total_rejections\":13,\"total_cancellations\":0,\"total_throttled\":5,\"total_queued\":0,\"total_queue_rejections\":0,\"queued_current\":0,\"queue_peak\":0,\"total_queue_wait_millis\":0,\"queue_wait_count\":0,\"max_queue_wait_millis\":0,\"cpu\":{\"current_usage\":0.3,\"cancellations\":13,\"rejections\":2}}}}",
+            "{\"workload_groups\":{\"afakjklaj304041-afaka\":{\"total_completions\":123456789,\"total_rejections\":13,\"total_cancellations\":0,\"total_throttled\":5,\"total_queued\":0,\"total_queue_rejections\":0,\"queued_current\":0,\"queue_peak\":0,\"total_queue_wait_millis\":0,\"max_queue_wait_millis\":0,\"cpu\":{\"current_usage\":0.3,\"cancellations\":13,\"rejections\":2}}}}",
             builder.toString()
         );
     }
 
-    // The randomized createTestInstance() builds holders via the constructor, which leaves the three queue-wait fields
-    // at 0 (they are only populated from WorkloadGroupState via from(...)). This explicit round-trip drives them
-    // non-zero through the real production path so a write/read order or mapping bug among them is caught.
+    // The randomized createTestInstance() builds holders via the constructor, which leaves the queue-wait fields at 0
+    // (they are only populated from WorkloadGroupState via from(...)). This explicit round-trip drives them non-zero
+    // through the real production path so a write/read order or mapping bug among them is caught. total_queued is set
+    // too, since it is the denominator paired with the wait sum and shares the same version-gated block on the wire.
     public void testQueueWaitFieldsSurviveWireRoundTrip() throws IOException {
         WorkloadGroupState state = new WorkloadGroupState();
         state.recordQueueWaitMillis(100);
-        state.recordQueueWaitMillis(300); // sum=400, count=2, max=300
+        state.recordQueueWaitMillis(300); // two samples => queued=2, sum=400, max=300 -> mean=200
         WorkloadGroupStats.WorkloadGroupStatsHolder holder = WorkloadGroupStats.WorkloadGroupStatsHolder.from(state, 7L, 9L);
+        assertEquals(2L, holder.getQueued());
         assertEquals(400L, holder.getTotalQueueWaitMillis());
-        assertEquals(2L, holder.getQueueWaitCount());
         assertEquals(300L, holder.getMaxQueueWaitMillis());
 
         WorkloadGroupStats original = new WorkloadGroupStats(Map.of("g", holder));
         WorkloadGroupStats roundTripped = copyWriteable(original, writableRegistry(), WorkloadGroupStats::new);
         WorkloadGroupStats.WorkloadGroupStatsHolder rt = roundTripped.getStats().get("g");
+        assertEquals(2L, rt.getQueued());
         assertEquals(400L, rt.getTotalQueueWaitMillis());
-        assertEquals(2L, rt.getQueueWaitCount());
         assertEquals(300L, rt.getMaxQueueWaitMillis());
         assertEquals(7L, rt.getQueuedCurrent());
         assertEquals(9L, rt.getQueuePeak());

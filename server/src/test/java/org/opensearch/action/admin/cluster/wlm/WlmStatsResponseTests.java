@@ -87,7 +87,6 @@ public class WlmStatsResponseTests extends OpenSearchTestCase {
                 + "        \"queued_current\" : 0,\n"
                 + "        \"queue_peak\" : 0,\n"
                 + "        \"total_queue_wait_millis\" : 0,\n"
-                + "        \"queue_wait_count\" : 0,\n"
                 + "        \"max_queue_wait_millis\" : 0,\n"
                 + "        \"cpu\" : {\n"
                 + "          \"current_usage\" : 0.0,\n"

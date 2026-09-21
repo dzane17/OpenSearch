@@ -93,10 +93,20 @@ public class WorkloadGroup extends AbstractDiffable<WorkloadGroup> implements To
 
         // Cross-field checks on the merged throttling config (attribute required with a limit; ceiling must be >= 1).
         WorkloadGroupThrottleSettings.validateMergedConfig(mutableWorkloadGroupFragment.getThrottling());
-        // A queue with no throttle limit has nothing to queue: queueing engages only on a throttle denial.
-        if (mutableWorkloadGroupFragment.getQueue().isEmpty() == false && mutableWorkloadGroupFragment.getThrottling().isEmpty()) {
-            throw new IllegalArgumentException("queue requires a throttle limit; set throttling.node_limit or throttling.shared_limit");
-        }
+        // A queue is deliberately NOT required to come with a throttle limit. Queueing engages only on a throttle denial,
+        // so a queue configured without one is simply inert — admission fails open before it can ever reach the queue, and
+        // the queue object is allocated lazily on first enqueue, so it costs nothing at all. Rejecting the combination
+        // would buy nothing and cost two things:
+        // - It would make disabling a throttle destructive. Validation runs against the fully MERGED config, so
+        // clearing throttling.* would force clearing queue.* in the same request — losing the queue sizing an
+        // operator has to retype when re-enabling.
+        // - Every check here also runs on the cluster-state READ path (see the StreamInput constructor below), so a
+        // throw is not a rejected API call, it is a node that cannot apply metadata. Today nothing can create such a
+        // group, but the moment any other build persists one (a later relaxation, a queue-only default) every node
+        // enforcing the rule would fail to deserialize the group. An inert setting is a much better failure mode
+        // than unreadable metadata.
+        // The runtime already treats "queue present, throttling absent" as a first-class state: WorkloadGroupService's
+        // clusterChanged releases any existing backlog untracked once neither limit is set.
 
         this.name = name;
         this._id = _id;

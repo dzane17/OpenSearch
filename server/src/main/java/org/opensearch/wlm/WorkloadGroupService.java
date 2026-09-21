@@ -471,38 +471,65 @@ public class WorkloadGroupService extends AbstractLifecycleComponent
                     listener.onFailure(new OpenSearchRejectedExecutionException("Request throttled: " + plan.describeBreach(false) + "."));
                     return;
                 }
-                // Request is parked (its listener is held by the queue). Ask the owner for a shared slot; wantsQueue=true
-                // so a denial registers this coordinator for owner-push. This callback NEVER completes the request's
-                // listener directly — it only supplies a permit to the queue.
-                sharedThrottleService.acquireAsync(plan.bucketKey, plan.sharedLimit, true, ActionListener.wrap(permit -> {
+                // Request is parked (its listener is held by the queue). Ask the owner for a shared slot; passing the
+                // no-waiter callback requests waiter registration, so a denial sets up owner-push. This callback NEVER
+                // completes the request's listener directly — it only supplies a permit to the queue.
+                sharedThrottleService.acquireAsync(plan.bucketKey, plan.sharedLimit, ActionListener.wrap(permit -> {
                     if (permit != null) {
-                        // Granted a shared slot: hand it to the oldest queued request. If a concurrent drain (owner-push
-                        // or node-tier completion) already emptied the bucket, release the slot rather than hold it.
-                        if (qs.admitWithPermit(plan.bucketKey, permit) == false) {
+                        // Granted a shared slot: hand it to the oldest queued request with admitWithOwnPermit, so the
+                        // admission is not counted as a queue wait — capacity was available all along and this park was
+                        // only the enqueue-first optimisation. If a concurrent drain (owner-push or node-tier completion)
+                        // already emptied the bucket, release the slot rather than hold it.
+                        if (qs.admitWithOwnPermit(plan.bucketKey, permit) == false) {
                             permit.close();
                         }
                     } else {
                         // Fail-open (owner unreachable / empty ring): admit one queued request with no shared permit
-                        // (untracked), matching the shipped fail-open semantics. No-op if the bucket already drained.
-                        qs.admitWithPermit(plan.bucketKey, () -> {});
+                        // (untracked), matching the shipped fail-open semantics. Also self-supplied — nothing was
+                        // throttled, so it is not a queue wait. No-op if the bucket already drained.
+                        qs.admitWithOwnPermit(plan.bucketKey, () -> {});
                     }
                 }, e -> {
                     // acquireAsync only ever fails with the message-less denial marker (transport errors fail open via
-                    // onResponse(null)). Denied: the request stays parked and the owner has registered this coordinator
-                    // (wantsQueue), so owner-push drains it when a slot frees. Nothing to complete here.
+                    // onResponse(null); a denial the owner could not register diverts to the callback below). Denied and
+                    // registered: the request stays parked and owner-push drains it when a slot frees, so there is
+                    // genuinely nothing to do here. In particular this is NOT where total_queued is counted — a denial
+                    // means "will wait", not "has waited", and the count is taken on admission so it cannot disagree with
+                    // the wait sum (see WorkloadGroupState#recordQueueWaitMillis).
                     if (e instanceof OpenSearchRejectedExecutionException == false) {
                         logger.warn(
                             "Unexpected shared-acquire failure for a queued request in workload group [" + workloadGroupId + "]",
                             e
                         );
                     }
-                }));
+                }), () -> {
+                    // Denied AND the owner could not register this coordinator as a waiter, so no grant will ever arrive.
+                    // Leaving a request parked on that promise would hang it indefinitely (no queue timeout, and the
+                    // sweep only reaps cancelled tasks), so fail one with the same 429 a full queue produces.
+                    //
+                    // FIFO picks the victim, so the request failed here is the bucket's OLDEST parked request, not
+                    // necessarily the one whose acquire was refused registration — that one may well run, admitted by
+                    // someone else's capacity. Count-wise it balances (one unregisterable denial means exactly one
+                    // request in this bucket cannot be served), and rejecting from the head keeps the queue ordered.
+                    //
+                    // Count the throttle ONLY if a request was really failed: a racing drain (owner-push grant,
+                    // node-tier completion, cancellation eviction) may have emptied the bucket inside the acquire
+                    // round-trip, in which case rejectOldest rejects nothing and every request here succeeded —
+                    // incrementing unconditionally would report a rejection that never happened. No total_queued either
+                    // way: this request never waited for capacity to free, it was refused outright.
+                    if (qs.rejectOldest(
+                        plan.bucketKey,
+                        new OpenSearchRejectedExecutionException("Request throttled: " + plan.describeBreach(false) + ".")
+                    )) {
+                        incrementThrottled(plan.workloadGroupId);
+                    }
+                });
                 return;
             }
 
             // Non-queueing shared path (queue disabled or MONITOR mode): unchanged — acquire with the request's own
             // listener; a denial admits (monitor) or 429s via onThrottleBreach.
-            sharedThrottleService.acquireAsync(plan.bucketKey, plan.sharedLimit, false, ActionListener.wrap(listener::onResponse, e -> {
+            sharedThrottleService.acquireAsync(plan.bucketKey, plan.sharedLimit, ActionListener.wrap(listener::onResponse, e -> {
                 if (e instanceof OpenSearchRejectedExecutionException) {
                     onThrottleBreach(plan, false, task, listener);
                 } else {
@@ -598,6 +625,9 @@ public class WorkloadGroupService extends AbstractLifecycleComponent
         if (qs != null
             && plan.queueSizePerBucket > 0
             && qs.tryEnqueue(plan.workloadGroupId, plan.bucketKey, task, plan.queueSizePerBucket, listener)) {
+            // Parked, not counted: total_queued is taken when the wait ENDS (on admission), not when it starts, so that it
+            // and total_queue_wait_millis are written by the same call and can never describe different request sets. The
+            // request is visible as queued_current until then.
             return; // parked; listener completed later
         }
         incrementThrottled(plan.workloadGroupId);

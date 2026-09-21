@@ -9,8 +9,10 @@
 package org.opensearch.cluster.metadata;
 
 import org.opensearch.common.UUIDs;
+import org.opensearch.common.io.stream.BytesStreamOutput;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.common.xcontent.json.JsonXContent;
+import org.opensearch.core.common.io.stream.StreamInput;
 import org.opensearch.core.common.io.stream.Writeable;
 import org.opensearch.core.xcontent.ToXContent;
 import org.opensearch.core.xcontent.XContentBuilder;
@@ -19,6 +21,7 @@ import org.opensearch.test.AbstractSerializingTestCase;
 import org.opensearch.wlm.MutableWorkloadGroupFragment;
 import org.opensearch.wlm.MutableWorkloadGroupFragment.ResiliencyMode;
 import org.opensearch.wlm.ResourceType;
+import org.opensearch.wlm.WorkloadGroupQueueSettings;
 import org.opensearch.wlm.WorkloadGroupThrottleSettings;
 import org.joda.time.Instant;
 
@@ -762,24 +765,93 @@ public class WorkloadGroupTests extends AbstractSerializingTestCase<WorkloadGrou
         assertTrue(fragment.getSettings().isEmpty());
     }
 
-    public void testQueueRequiresThrottleLimit() {
-        // A queue with no throttle limit has nothing to queue -> rejected at the workload-group level.
-        IllegalArgumentException e = expectThrows(
-            IllegalArgumentException.class,
-            () -> new WorkloadGroup(
-                "test",
-                "test_id",
-                new MutableWorkloadGroupFragment(
-                    ResiliencyMode.ENFORCED,
-                    Map.of(ResourceType.MEMORY, 0.5),
-                    Settings.EMPTY,
-                    Settings.EMPTY, // no throttling
-                    Settings.builder().put("size_per_bucket", 100).build()
-                ),
-                System.currentTimeMillis()
+    public void testQueueWithoutThrottleLimitIsAccepted() {
+        // A queue with no throttle limit is INERT, not invalid: queueing engages only on a throttle denial, so admission
+        // fails open long before it could reach the queue. Accepting it keeps "disable the throttle" non-destructive (the
+        // queue sizing survives, because validation runs against the merged config) and — more importantly — keeps this
+        // constructor from throwing on the cluster-state READ path, where a throw is an unreadable-metadata failure rather
+        // than a rejected API call.
+        WorkloadGroup group = new WorkloadGroup(
+            "test",
+            "test_id",
+            new MutableWorkloadGroupFragment(
+                ResiliencyMode.ENFORCED,
+                Map.of(ResourceType.MEMORY, 0.5),
+                Settings.EMPTY,
+                Settings.EMPTY, // no throttling
+                Settings.builder().put("size_per_bucket", 100).build()
+            ),
+            System.currentTimeMillis()
+        );
+        assertTrue("throttling must stay empty", group.getMutableWorkloadGroupFragment().getThrottling().isEmpty());
+        assertEquals(
+            "the queue setting must be preserved verbatim",
+            100,
+            WorkloadGroupQueueSettings.SIZE_PER_BUCKET.get(group.getMutableWorkloadGroupFragment().getQueue()).intValue()
+        );
+    }
+
+    public void testUpdateCanClearThrottlingWhileKeepingTheQueue() {
+        // The operator-facing consequence: an update that clears throttling.* while the group keeps its queue must be
+        // ACCEPTED, so re-enabling the throttle later does not require retyping the queue sizing. Before the rule was
+        // dropped this threw, because validation runs against the fully merged config.
+        WorkloadGroup throttledWithQueue = new WorkloadGroup(
+            "test",
+            "test_id",
+            new MutableWorkloadGroupFragment(
+                ResiliencyMode.ENFORCED,
+                Map.of(ResourceType.MEMORY, 0.5),
+                Settings.EMPTY,
+                Settings.builder().put("attribute", "username").put("node_limit", 5).build(),
+                Settings.builder().put("size_per_bucket", 100).build()
+            ),
+            System.currentTimeMillis()
+        );
+        // Go through the real update path. Null-valued keys are the per-key "clear" markers, so this clears both throttling
+        // keys while restating the queue (this constructor normalizes a null bag to EMPTY, which would mean "clear", so the
+        // queue has to be passed explicitly here — the REST path expresses "absent" via the setters instead).
+        WorkloadGroup updated = WorkloadGroup.updateExistingWorkloadGroup(
+            throttledWithQueue,
+            new MutableWorkloadGroupFragment(
+                ResiliencyMode.ENFORCED,
+                Map.of(ResourceType.MEMORY, 0.5),
+                Settings.EMPTY,
+                Settings.builder().putNull("attribute").putNull("node_limit").build(),
+                Settings.builder().put("size_per_bucket", 100).build()
             )
         );
-        assertTrue(e.getMessage(), e.getMessage().contains("queue requires a throttle limit"));
+        assertTrue("throttling must be cleared", updated.getMutableWorkloadGroupFragment().getThrottling().isEmpty());
+        assertEquals(
+            "clearing throttling alone must not force the queue to be cleared too",
+            100,
+            WorkloadGroupQueueSettings.SIZE_PER_BUCKET.get(updated.getMutableWorkloadGroupFragment().getQueue()).intValue()
+        );
+    }
+
+    public void testQueueWithoutThrottleLimitSurvivesWireRoundTrip() {
+        // The reason the check could not live in this constructor: it also guards the deserialization path. A group with a
+        // queue but no throttle must round-trip through the wire, or a node receiving it could not apply cluster state.
+        WorkloadGroup group = new WorkloadGroup(
+            "test",
+            "test_id",
+            new MutableWorkloadGroupFragment(
+                ResiliencyMode.ENFORCED,
+                Map.of(ResourceType.MEMORY, 0.5),
+                Settings.EMPTY,
+                Settings.EMPTY,
+                Settings.builder().put("size_per_bucket", 100).build()
+            ),
+            System.currentTimeMillis()
+        );
+        try (BytesStreamOutput out = new BytesStreamOutput()) {
+            group.writeTo(out);
+            try (StreamInput in = out.bytes().streamInput()) {
+                WorkloadGroup roundTripped = new WorkloadGroup(in);
+                assertEquals(group, roundTripped);
+            }
+        } catch (IOException e) {
+            throw new AssertionError("a queue-without-throttle group must deserialize, not throw", e);
+        }
     }
 
     public void testQueueTimeoutIsRejectedAsUnknownSetting() {

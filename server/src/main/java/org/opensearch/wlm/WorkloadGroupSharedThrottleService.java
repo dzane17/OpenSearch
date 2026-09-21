@@ -16,6 +16,7 @@ import org.opensearch.cluster.metadata.WorkloadGroup;
 import org.opensearch.cluster.node.DiscoveryNode;
 import org.opensearch.cluster.node.DiscoveryNodes;
 import org.opensearch.cluster.service.ClusterService;
+import org.opensearch.common.Nullable;
 import org.opensearch.common.UUIDs;
 import org.opensearch.common.annotation.ExperimentalApi;
 import org.opensearch.common.lease.Releasable;
@@ -34,6 +35,7 @@ import org.opensearch.transport.TransportResponseHandler;
 import org.opensearch.transport.TransportService;
 
 import java.io.IOException;
+import java.util.Iterator;
 import java.util.LinkedHashSet;
 import java.util.Map;
 import java.util.Set;
@@ -222,15 +224,30 @@ public class WorkloadGroupSharedThrottleService implements ClusterStateListener 
      * The listener may be invoked inline (local-owner short-circuit) or on a transport thread.
      */
     public void acquireAsync(String bucketKey, int sharedLimit, ActionListener<Releasable> listener) {
-        acquireAsync(bucketKey, sharedLimit, false, listener);
+        acquireAsync(bucketKey, sharedLimit, listener, null);
     }
 
     /**
-     * As {@link #acquireAsync(String, int, ActionListener)}, but {@code wantsQueue} tells the owner to register this
-     * coordinator as a waiter for the bucket if the acquire is denied, so a later freed slot is pushed back here as a
-     * grant (owner-push queue draining). Pass {@code true} only when this group has queueing enabled.
+     * As {@link #acquireAsync(String, int, ActionListener)}, but for a caller that has PARKED the request and wants the
+     * owner to register it as a waiter on the bucket, so a later freed slot is pushed back here as a grant (owner-push
+     * queue draining). Passing a non-null {@code onNoWaiterRegistered} is what requests registration — the callback and
+     * the request to register are one parameter deliberately, because a caller that parks without a way to hear "you
+     * were not registered" is exactly the stranding bug this guards against.
+     * <p>
+     * {@code onNoWaiterRegistered} runs INSTEAD of {@link ActionListener#onFailure} when the acquire was denied and the
+     * owner reported that it could not register this coordinator — see {@link AcquirePermitResponse#registered}. No grant
+     * will ever arrive in that case, and a parked request has no deadline, so the caller must fail the request rather
+     * than wait. Every other outcome is reported through {@code listener} exactly as documented above.
+     *
+     * @param onNoWaiterRegistered run on a denial the owner could not register; {@code null} to not request registration
      */
-    public void acquireAsync(String bucketKey, int sharedLimit, boolean wantsQueue, ActionListener<Releasable> listener) {
+    public void acquireAsync(
+        String bucketKey,
+        int sharedLimit,
+        ActionListener<Releasable> listener,
+        @Nullable Runnable onNoWaiterRegistered
+    ) {
+        final boolean wantsQueue = onNoWaiterRegistered != null;
         final ThrottleOwnerSelector currentRing = ring.get();
         final DiscoveryNode owner = currentRing.ownerFor(bucketKey).orElse(null);
         if (owner == null) {
@@ -246,6 +263,8 @@ public class WorkloadGroupSharedThrottleService implements ClusterStateListener 
             if (tracker.tryAcquire(bucketKey, sharedLimit, permitId, ttlNanos)) {
                 listener.onResponse(releaseLocal(bucketKey, permitId));
             } else {
+                // Local owner: the waiter is this very node, always resolvable and always "connected" (nodeConnected
+                // short-circuits on the local node), so registration cannot fail the way the remote path's can.
                 if (wantsQueue) {
                     registerWaiter(bucketKey, clusterService.localNode());
                 }
@@ -279,6 +298,15 @@ public class WorkloadGroupSharedThrottleService implements ClusterStateListener 
                 public void handleResponse(AcquirePermitResponse response) {
                     if (response.granted) {
                         listener.onResponse(releaseRemote(owner, bucketKey, permitId));
+                    } else if (wantsQueue && response.registered == false) {
+                        // Denied, and the owner cannot push us a grant (we are absent from its applied cluster state, or
+                        // present but unreachable, or it predates queueing). Waiting would strand the parked request.
+                        logger.debug(
+                            "Owner [{}] denied bucket [{}] without registering this node as a waiter; failing the parked request",
+                            owner.getId(),
+                            bucketKey
+                        );
+                        onNoWaiterRegistered.run();
                     } else {
                         listener.onFailure(deniedMarker());
                     }
@@ -309,24 +337,38 @@ public class WorkloadGroupSharedThrottleService implements ClusterStateListener 
     // Owner-side admission. Package-private for tests.
     AcquirePermitResponse handleAcquire(AcquirePermitRequest request) {
         boolean granted = tracker.tryAcquire(request.bucketKey, request.sharedLimit, request.permitId, request.ttlNanos);
+        boolean registered = false;
         if (granted == false && request.wantsQueue && request.requestingNodeId.isEmpty() == false) {
             // Denied and the coordinator will park the request -> remember it so a freed slot is pushed back as a grant.
             // The RPC carries only the coordinator's persistent node id, so resolve it to the live DiscoveryNode here:
-            // the waiter set must hold the real node because sendGrant needs its transport address. A node that has since
-            // left the cluster resolves to null and is simply not registered, which is correct — there is nothing to push
-            // a grant to.
+            // the waiter set must hold the real node because sendGrant needs its transport address.
+            //
+            // Register ONLY if we can actually reach that node, and tell the coordinator either way (the `registered` bit
+            // on the response). Presence in cluster state alone is not enough, for two reasons, both rooted in this
+            // node's applied state being able to lag the coordinator's:
+            // - NOT PRESENT: a node that just joined (or left) resolves to null. Registering is impossible.
+            // - PRESENT BUT STALE: a node that restarted keeps its persistent id but gets a NEW ephemeral id, and
+            // DiscoveryNode identity IS the ephemeral id — so until this node applies the rejoin, get() hands back the
+            // PREVIOUS incarnation. Registering that would look like success, then the first freed slot would find it
+            // absent from the connection map, reclaim, and quietly deregister it (see onSharedSlotFreed).
+            // nodeConnected covers both, plus a transient disconnect, in one lock-free connection-map lookup. (The
+            // coordinator makes the mirror-image check about the OWNER before sending an acquire — same method, opposite
+            // direction.) A coordinator told `registered=false` fails the request with the normal throttle 429 instead of
+            // parking it for a grant that is never coming.
             final DiscoveryNode requestingNode = clusterService.state().nodes().get(request.requestingNodeId);
-            if (requestingNode != null) {
+            registered = requestingNode != null && transportService.nodeConnected(requestingNode);
+            if (registered) {
                 registerWaiter(request.bucketKey, requestingNode);
             } else {
                 logger.debug(
-                    "Not registering waiter for bucket [{}]: node [{}] is no longer in the cluster",
+                    "Not registering waiter for bucket [{}]: node [{}] is not reachable from this node (absent from the "
+                        + "applied cluster state, or present but not connected — e.g. a restart this node has not applied yet)",
                     request.bucketKey,
                     request.requestingNodeId
                 );
             }
         }
-        return new AcquirePermitResponse(granted);
+        return new AcquirePermitResponse(granted, registered);
     }
 
     // A local release path must also drive owner-push when this node owns the bucket: releasing frees a slot that a
@@ -621,7 +663,7 @@ public class WorkloadGroupSharedThrottleService implements ClusterStateListener 
     private DiscoveryNode pickAndRotate(String bucketKey) {
         final DiscoveryNode[] picked = new DiscoveryNode[1];
         waitersByBucket.computeIfPresent(bucketKey, (k, nodes) -> {
-            final java.util.Iterator<DiscoveryNode> it = nodes.iterator();
+            final Iterator<DiscoveryNode> it = nodes.iterator();
             if (it.hasNext()) {
                 final DiscoveryNode head = it.next();
                 picked[0] = head;
@@ -827,9 +869,10 @@ public class WorkloadGroupSharedThrottleService implements ClusterStateListener 
 
     // --- fields added after the map format shipped: optional, with a safe default. See the rule above. ---
     //
-    // Queueing added four such fields (requesting_node_id / wants_queue on acquire, shared_limit /
-    // queue_empty_on_node_id on release). A peer predating queueing sends none of them, so reading them strictly would
-    // throw on every message from every such node. Each default reproduces the pre-queueing behaviour exactly.
+    // Queueing added four such fields: requesting_node_id / wants_queue on the acquire request, registered on the
+    // acquire response, and queue_empty_on_node_id on the release request. A peer predating queueing sends none of them,
+    // so reading them strictly would throw on every message from every such node. Each default reproduces the
+    // pre-queueing behaviour exactly.
 
     private static String optionalString(Map<String, Object> body, String key, String fallback) {
         final Object value = body.get(key);
@@ -838,17 +881,6 @@ public class WorkloadGroupSharedThrottleService implements ClusterStateListener 
         }
         if (value != null) {
             logger.debug("wlm shared-throttle: key [{}] is not a String ([{}]); using [{}]", key, value, fallback);
-        }
-        return fallback;
-    }
-
-    private static long optionalLong(Map<String, Object> body, String key, long fallback) {
-        final Object value = body.get(key);
-        if (value instanceof Number n) {
-            return n.longValue();
-        }
-        if (value != null) {
-            logger.debug("wlm shared-throttle: key [{}] is not a Number ([{}]); using [{}]", key, value, fallback);
         }
         return fallback;
     }
@@ -954,25 +986,53 @@ public class WorkloadGroupSharedThrottleService implements ClusterStateListener 
     }
 
     /**
-     * {@code owner -> coord}. Acquire RPC response: whether the owner granted a shared permit.
+     * {@code owner -> coord}. Acquire RPC response: whether the owner granted a shared permit, and — when it did not —
+     * whether it registered the asking coordinator for owner-push.
      */
     public static class AcquirePermitResponse extends TransportResponse {
         static final String KEY_GRANTED = "granted";
+        static final String KEY_REGISTERED = "registered";
 
         final boolean granted;
+        /**
+         * Owner-push contract on a DENIAL: {@code true} means "I have you in this bucket's waiter set and I will push a
+         * grant when a slot frees", {@code false} means "no grant will ever come from me" — so a coordinator that parked
+         * the request must fail it rather than wait forever (there is no queue timeout).
+         * <p>
+         * Meaningful only when the acquire set {@code wants_queue}; it is {@code false} otherwise, since the owner does
+         * not register a waiter for a caller that is not going to park.
+         * <p>
+         * Defaults to {@code false} when the key is absent, which is what makes a PRE-QUEUEING owner behave correctly:
+         * such an owner ignores {@code wants_queue}, never registers a waiter and never sends a grant, so a coordinator
+         * that parked on its denial would strand for the whole upgrade window. Reading the missing key as "not
+         * registered" turns that into the pre-queueing 429 instead.
+         */
+        final boolean registered;
 
         AcquirePermitResponse(boolean granted) {
+            this(granted, false);
+        }
+
+        AcquirePermitResponse(boolean granted, boolean registered) {
             this.granted = granted;
+            this.registered = registered;
         }
 
         AcquirePermitResponse(StreamInput in) throws IOException {
             final Map<String, Object> body = readBody(in);
             this.granted = requireBoolean(body, KEY_GRANTED);
+            // Added by queueing, so optional; see the field javadoc for why `false` is the right default.
+            this.registered = optionalBoolean(body, KEY_REGISTERED, false);
+            // Any other key is a field this build does not know about: ignored on purpose. That is the tolerance.
         }
 
         @Override
         public void writeTo(StreamOutput out) throws IOException {
-            out.writeMap(Map.of(KEY_GRANTED, granted), StreamOutput::writeString, StreamOutput::writeGenericValue);
+            out.writeMap(
+                Map.of(KEY_GRANTED, granted, KEY_REGISTERED, registered),
+                StreamOutput::writeString,
+                StreamOutput::writeGenericValue
+            );
         }
     }
 

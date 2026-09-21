@@ -102,7 +102,6 @@ public class WorkloadGroupStats implements ToXContentObject, Writeable {
         public static final String QUEUED_CURRENT = "queued_current";
         public static final String QUEUE_PEAK = "queue_peak";
         public static final String TOTAL_QUEUE_WAIT_MILLIS = "total_queue_wait_millis";
-        public static final String QUEUE_WAIT_COUNT = "queue_wait_count";
         public static final String MAX_QUEUE_WAIT_MILLIS = "max_queue_wait_millis";
         private long completions;
         private long rejections;
@@ -113,10 +112,10 @@ public class WorkloadGroupStats implements ToXContentObject, Writeable {
         private long queueRejections;
         private long queuedCurrent;
         private long queuePeak;
-        // Cumulative parked time + count (mean = sum/count) and the single-request high-water mark, for queued-then-
-        // admitted requests. Populated from WorkloadGroupState in from(...); 0 via the plain constructors.
+        // Cumulative parked time and the single-request high-water mark, over the requests that genuinely waited. The
+        // mean is totalQueueWaitMillis / queued: `queued` counts the same population, so it needs no separate
+        // denominator. Populated from WorkloadGroupState in from(...); 0 via the plain constructors.
         private long totalQueueWaitMillis;
-        private long queueWaitCount;
         private long maxQueueWaitMillis;
         private Map<ResourceType, ResourceStats> resourceStats;
 
@@ -171,7 +170,6 @@ public class WorkloadGroupStats implements ToXContentObject, Writeable {
                 this.queuedCurrent = in.readVLong();
                 this.queuePeak = in.readVLong();
                 this.totalQueueWaitMillis = in.readVLong();
-                this.queueWaitCount = in.readVLong();
                 this.maxQueueWaitMillis = in.readVLong();
             }
             this.resourceStats = in.readMap((i) -> ResourceType.fromName(i.readString()), ResourceStats::new);
@@ -211,10 +209,6 @@ public class WorkloadGroupStats implements ToXContentObject, Writeable {
 
         public long getTotalQueueWaitMillis() {
             return totalQueueWaitMillis;
-        }
-
-        public long getQueueWaitCount() {
-            return queueWaitCount;
         }
 
         public long getMaxQueueWaitMillis() {
@@ -262,7 +256,6 @@ public class WorkloadGroupStats implements ToXContentObject, Writeable {
             statsHolder.queuedCurrent = queuedCurrent;
             statsHolder.queuePeak = queuePeak;
             statsHolder.totalQueueWaitMillis = workloadGroupState.getTotalQueueWaitMillis();
-            statsHolder.queueWaitCount = workloadGroupState.getQueueWaitCount();
             statsHolder.maxQueueWaitMillis = workloadGroupState.getMaxQueueWaitMillis();
             statsHolder.resourceStats = resourceStatsMap;
             return statsHolder;
@@ -287,7 +280,6 @@ public class WorkloadGroupStats implements ToXContentObject, Writeable {
                 out.writeVLong(statsHolder.queuedCurrent);
                 out.writeVLong(statsHolder.queuePeak);
                 out.writeVLong(statsHolder.totalQueueWaitMillis);
-                out.writeVLong(statsHolder.queueWaitCount);
                 out.writeVLong(statsHolder.maxQueueWaitMillis);
             }
             out.writeMap(statsHolder.resourceStats, (o, val) -> o.writeString(val.getName()), ResourceStats::writeTo);
@@ -311,7 +303,6 @@ public class WorkloadGroupStats implements ToXContentObject, Writeable {
             builder.field(QUEUED_CURRENT, queuedCurrent);
             builder.field(QUEUE_PEAK, queuePeak);
             builder.field(TOTAL_QUEUE_WAIT_MILLIS, totalQueueWaitMillis);
-            builder.field(QUEUE_WAIT_COUNT, queueWaitCount);
             builder.field(MAX_QUEUE_WAIT_MILLIS, maxQueueWaitMillis);
 
             for (ResourceType resourceType : ResourceType.getSortedValues()) {
@@ -340,7 +331,6 @@ public class WorkloadGroupStats implements ToXContentObject, Writeable {
                 && queuedCurrent == that.queuedCurrent
                 && queuePeak == that.queuePeak
                 && totalQueueWaitMillis == that.totalQueueWaitMillis
-                && queueWaitCount == that.queueWaitCount
                 && maxQueueWaitMillis == that.maxQueueWaitMillis;
         }
 
@@ -357,7 +347,6 @@ public class WorkloadGroupStats implements ToXContentObject, Writeable {
                 queuedCurrent,
                 queuePeak,
                 totalQueueWaitMillis,
-                queueWaitCount,
                 maxQueueWaitMillis,
                 resourceStats
             );

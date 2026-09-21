@@ -76,6 +76,7 @@ public class WorkloadGroupQueueService {
      * @param sizePerBucket the group's configured {@code queue.size_per_bucket}
      * @param listener      the parked admission listener (already context-preserving)
      * @return {@code true} if enqueued, {@code false} if rejected (disabled / bucket full / group full)
+     * @see WorkloadGroupState#totalQueued why parking does not itself count towards {@code total_queued}
      */
     public boolean tryEnqueue(
         String groupId,
@@ -96,7 +97,9 @@ public class WorkloadGroupQueueService {
             incrementQueueRejection(groupId); // bucket or group queue full
             return false;
         }
-        incrementQueued(groupId);
+        // Deliberately NOT counted as total_queued here: on the shared tier this park happens BEFORE the owner's verdict
+        // is known (enqueue-first), so most requests that pass through leave again on their own granted permit without
+        // ever waiting. The count is taken when a wait ENDS, in recordQueueWait via admit(..., recordWait=true).
         return true;
     }
 
@@ -147,7 +150,7 @@ public class WorkloadGroupQueueService {
                 return;
             }
         }
-        admit(req, permit);
+        admit(req, permit, true);
     }
 
     /**
@@ -158,6 +161,27 @@ public class WorkloadGroupQueueService {
      * @return {@code true} if a waiter was admitted with the permit, {@code false} if there was none (caller releases)
      */
     public boolean admitWithPermit(String bucketKey, Releasable permit) {
+        return admitOldest(bucketKey, permit, true);
+    }
+
+    /**
+     * As {@link #admitWithPermit}, but for a permit the parked request supplied <em>itself</em> — the coordinator's own
+     * shared acquire came back granted (or failed open), so this admission represents capacity that was available all
+     * along rather than capacity that freed up while waiting.
+     * <p>
+     * Behaviourally identical except that it does not record a queue wait: under enqueue-first such a request typically
+     * parks for no longer than the owner round-trip, and counting that as queue latency would drag the mean toward zero.
+     * Note FIFO still admits the OLDEST parked request, which may be an older genuinely-waiting one rather than the
+     * request whose acquire produced the permit; the populations stay the same size either way (see
+     * {@link WorkloadGroupState#totalQueued}).
+     *
+     * @return {@code true} if a waiter was admitted with the permit, {@code false} if there was none (caller releases)
+     */
+    public boolean admitWithOwnPermit(String bucketKey, Releasable permit) {
+        return admitOldest(bucketKey, permit, false);
+    }
+
+    private boolean admitOldest(String bucketKey, Releasable permit, boolean recordWait) {
         String groupId = groupIdOf(bucketKey);
         WorkloadGroupQueue queue = queuesByGroup.get(groupId);
         if (queue == null) {
@@ -170,7 +194,44 @@ public class WorkloadGroupQueueService {
         if (req == null) {
             return false;
         }
-        admit(req, permit);
+        admit(req, permit, recordWait);
+        return true;
+    }
+
+    /**
+     * Removes the oldest parked request for {@code bucketKey} and fails it with {@code failure}, or returns
+     * {@code false} if the bucket is empty.
+     * <p>
+     * Used when the coordinator learns that no grant will ever arrive for a parked request — the owner denied the
+     * acquire AND reported that it could not register this coordinator as a waiter (it is absent from the owner's applied
+     * cluster state, unreachable, or the owner predates queueing entirely). Parking such a request would strand it:
+     * there is no queue timeout, {@code search.cancel_after_time_interval} is unset by default, and the sweep only reaps
+     * <em>cancelled</em> tasks — so it would hang until the client gave up. Failing it immediately restores the
+     * pre-queueing behaviour (a throttle 429) for exactly the cases where queueing cannot work.
+     * <p>
+     * As everywhere else, FIFO order decides the victim: the oldest parked request is failed, not necessarily the one
+     * whose acquire was refused registration. One unregisterable denial means exactly one request in this bucket cannot
+     * be served, and rejecting from the head keeps the queue ordered.
+     *
+     * @return {@code true} if a request was removed and failed, {@code false} if the bucket was empty
+     */
+    public boolean rejectOldest(String bucketKey, Exception failure) {
+        String groupId = groupIdOf(bucketKey);
+        WorkloadGroupQueue queue = queuesByGroup.get(groupId);
+        if (queue == null) {
+            return false;
+        }
+        WorkloadGroupQueue.QueuedRequest req;
+        try (Releasable ignored = bucketLocks.acquire(lockKey(groupId, bucketKey))) {
+            req = queue.pollOldest(bucketKey);
+        }
+        if (req == null) {
+            return false;
+        }
+        req.releaseCancellationHandle();
+        // Dispatched, not completed inline: consistent with admit(), so a listener is never completed on the caller's
+        // transport thread (this runs from the shared-acquire response handler, which executes on ThreadPool.Names.SAME).
+        threadPool.executor(ThreadPool.Names.GENERIC).execute(() -> req.listener().onFailure(failure));
         return true;
     }
 
@@ -223,7 +284,7 @@ public class WorkloadGroupQueueService {
             }
         }
         for (WorkloadGroupQueue.QueuedRequest req : drained) {
-            admit(req, () -> {});
+            admit(req, () -> {}, true);
         }
         return drained.size();
     }
@@ -313,12 +374,15 @@ public class WorkloadGroupQueueService {
     // on the caller thread would let a run of consecutively-cancelled waiters recurse close -> drainNode -> admit ->
     // close ... one synchronous frame per waiter (StackOverflow under a cancel storm). Dispatching first means each such
     // hop is a fresh executor task, so the chain unwinds across tasks rather than down one stack.
-    private void admit(WorkloadGroupQueue.QueuedRequest req, Releasable permit) {
+    private void admit(WorkloadGroupQueue.QueuedRequest req, Releasable permit, boolean recordWait) {
         req.releaseCancellationHandle();
         // Record the queue wait at the admission instant (this thread), before the executor hop, so the metric is the
-        // true time parked and not inflated by dispatch latency. Only requests that actually parked reach admit(), so
-        // this counts wait among queued requests. Recorded even for a task cancelled-while-queued: it still waited.
-        recordQueueWait(groupIdOf(req.bucketKey()), TimeUnit.NANOSECONDS.toMillis(req.waitNanos(threadPool.relativeTimeInNanos())));
+        // true time parked and not inflated by dispatch latency. Recorded even for a task cancelled-while-queued: it
+        // still waited. Skipped when the request supplied its own permit (see admitWithOwnPermit), so the wait sum spans
+        // the same population total_queued counts.
+        if (recordWait) {
+            recordQueueWait(groupIdOf(req.bucketKey()), TimeUnit.NANOSECONDS.toMillis(req.waitNanos(threadPool.relativeTimeInNanos())));
+        }
         threadPool.executor(ThreadPool.Names.GENERIC).execute(() -> {
             if (req.task().isCancelled()) {
                 permit.close();
@@ -362,13 +426,8 @@ public class WorkloadGroupQueueService {
         return groupId + '\0' + bucketKey;
     }
 
-    private void incrementQueued(String groupId) {
-        WorkloadGroupState state = stateAccessor.getWorkloadGroupStateMap().get(groupId);
-        if (state != null) {
-            state.totalQueued.inc();
-        }
-    }
-
+    // Counts one finished queue wait: total_queued plus the wait sum/max, all inside recordQueueWaitMillis so they cannot
+    // diverge (see WorkloadGroupState#recordQueueWaitMillis). Called only for admissions the request did not supply itself.
     private void recordQueueWait(String groupId, long waitMillis) {
         WorkloadGroupState state = stateAccessor.getWorkloadGroupStateMap().get(groupId);
         if (state != null) {
