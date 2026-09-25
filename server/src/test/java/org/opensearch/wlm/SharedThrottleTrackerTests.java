@@ -10,6 +10,8 @@ package org.opensearch.wlm;
 
 import org.opensearch.test.OpenSearchTestCase;
 
+import java.util.List;
+import java.util.Map;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -36,7 +38,7 @@ public class SharedThrottleTrackerTests extends OpenSearchTestCase {
         assertTrue("slot freed after release", tracker.tryAcquire("b", 1, "l3", TTL));
     }
 
-    public void testReleaseByUnknownLeaseIsNoOp() {
+    public void testReleaseByUnknownPermitIsNoOp() {
         SharedThrottleTracker tracker = new SharedThrottleTracker();
         assertTrue(tracker.tryAcquire("b", 2, "l1", TTL));
         // Unknown permit (already swept, double release, or belonged to a previous owner of a remapped bucket).
@@ -62,7 +64,7 @@ public class SharedThrottleTrackerTests extends OpenSearchTestCase {
         assertEquals("bucket entry removed when it drains to zero", 0, tracker.activeBuckets());
     }
 
-    public void testExpiredLeaseIsReclaimedBySweep() {
+    public void testExpiredPermitIsReclaimedBySweep() {
         AtomicLong clock = new AtomicLong(0);
         SharedThrottleTracker tracker = new SharedThrottleTracker(clock::get);
         assertTrue(tracker.tryAcquire("b", 1, "l1", 100));
@@ -73,7 +75,7 @@ public class SharedThrottleTrackerTests extends OpenSearchTestCase {
         assertTrue("slot reclaimed after TTL sweep", tracker.tryAcquire("b", 1, "l3", 100));
     }
 
-    public void testExpiredLeaseReclaimedLazilyOnAcquire() {
+    public void testExpiredPermitReclaimedLazilyOnAcquire() {
         AtomicLong clock = new AtomicLong(0);
         SharedThrottleTracker tracker = new SharedThrottleTracker(clock::get);
         assertTrue(tracker.tryAcquire("b", 1, "l1", 100));
@@ -82,7 +84,7 @@ public class SharedThrottleTrackerTests extends OpenSearchTestCase {
         assertEquals(1, tracker.inFlight("b"));
     }
 
-    public void testSaturatedBucketWithExpiredLeaseIsReclaimedOnAcquire() {
+    public void testSaturatedBucketWithExpiredPermitIsReclaimedOnAcquire() {
         // Prune now runs only when the bucket is at/over its limit; verify a fully-saturated bucket with one expired
         // permit still admits the next acquire (the case the "prune only when full" optimization must not break).
         AtomicLong clock = new AtomicLong(0);
@@ -150,7 +152,7 @@ public class SharedThrottleTrackerTests extends OpenSearchTestCase {
         assertEquals(2, tracker.activeBuckets());
     }
 
-    public void testSaturatedBucketWithFreshLeasesSkipsPruneScan() {
+    public void testSaturatedBucketWithFreshPermitsSkipsPruneScan() {
         // The minExpiry guard: while a full bucket's permits are all still live, repeated denied acquires must not
         // trigger the O(size) expiry scan at all.
         AtomicLong clock = new AtomicLong(0);
@@ -164,8 +166,8 @@ public class SharedThrottleTrackerTests extends OpenSearchTestCase {
         assertEquals("no expiry scan runs while every permit is still live", 0, tracker.pruneScanCount());
     }
 
-    public void testSaturatedBucketScansOnceLeasesCanExpire() {
-        // The flip side: the instant a permit could have expired (minExpiry <= now), a full-bucket acquire runs exactly
+    public void testSaturatedBucketScansOncePermitsCanExpire() {
+        // The flip side: the first full-bucket acquire once a permit could have expired (minExpiry <= now) runs exactly
         // one scan, reclaims, and admits.
         AtomicLong clock = new AtomicLong(0);
         SharedThrottleTracker tracker = new SharedThrottleTracker(clock::get);
@@ -214,5 +216,45 @@ public class SharedThrottleTrackerTests extends OpenSearchTestCase {
             assertFalse(tracker.tryAcquire("b", 2, "denied-" + i, 1_000));
         }
         assertEquals("no further scans while survivors are fresh", 1, tracker.pruneScanCount());
+    }
+
+    public void testSweepExpiredReportsOnlyBucketsThatActuallyFreedCapacity() {
+        // The owning service drives owner-push from this return value, so it must name exactly the buckets that gained
+        // free capacity: a miss strands a waiting coordinator (an expiry has no release RPC to re-drive the bucket), and
+        // a false positive would make the owner reserve-and-grant a slot that does not exist.
+        AtomicLong now = new AtomicLong(0L);
+        SharedThrottleTracker tracker = new SharedThrottleTracker(now::get);
+        assertTrue(tracker.tryAcquire("expiring", 5, "permit-a", 1000L));
+        assertTrue(tracker.tryAcquire("surviving", 5, "permit-b", 100_000L));
+
+        // Nothing has expired yet.
+        assertTrue("no expiry yet -> no bucket reported", tracker.sweepExpired().isEmpty());
+
+        // Past only the first permit's TTL.
+        now.set(1001L);
+        List<String> freed = tracker.sweepExpired();
+        assertEquals("exactly the bucket whose permit was reclaimed", List.of("expiring"), freed);
+        assertEquals(0, tracker.inFlight("expiring"));
+        assertEquals(1, tracker.inFlight("surviving"));
+
+        // Idempotent: a second pass has nothing left to reclaim for that bucket.
+        assertTrue("a repeat sweep must not re-report an already-reclaimed bucket", tracker.sweepExpired().isEmpty());
+    }
+
+    public void testSweepExpiredReportsExactReclaimedCountPerBucket() {
+        AtomicLong now = new AtomicLong(0L);
+        SharedThrottleTracker tracker = new SharedThrottleTracker(now::get);
+        assertTrue(tracker.tryAcquire("many", 5, "permit-a", 100L));
+        assertTrue(tracker.tryAcquire("many", 5, "permit-b", 100L));
+        assertTrue(tracker.tryAcquire("many", 5, "permit-c", 1_000L));
+
+        now.set(101L);
+
+        assertEquals(
+            "the owner needs one wake-up budget entry for every permit reclaimed in the same bucket",
+            Map.of("many", 2),
+            tracker.sweepExpiredCounts()
+        );
+        assertEquals(1, tracker.inFlight("many"));
     }
 }
