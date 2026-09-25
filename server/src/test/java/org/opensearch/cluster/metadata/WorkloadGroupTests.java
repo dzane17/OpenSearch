@@ -60,8 +60,8 @@ public class WorkloadGroupTests extends AbstractSerializingTestCase<WorkloadGrou
                 }
             }
         }
-        // Queue config is only valid alongside a throttle limit (a queue with nothing to queue is rejected).
-        // size_per_bucket is the only queue setting.
+        // This random factory generates active queueing configurations by pairing queue settings with a throttle.
+        // Dedicated tests below cover the also-valid queue-without-throttle case, where the queue is inert.
         Settings.Builder queue = Settings.builder();
         if (throttlingConfigured && randomBoolean()) {
             queue.put("size_per_bucket", randomIntBetween(1, 1000));

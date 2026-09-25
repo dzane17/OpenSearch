@@ -23,7 +23,8 @@ import java.util.function.LongSupplier;
  * Cluster-level tier of workload-group request throttling: the authoritative, cluster-wide in-flight counter for a
  * throttle bucket, enforcing the bucket's {@code shared_limit}. Its node-local sibling is {@link NodeThrottleTracker},
  * and {@code WorkloadGroupService.acquireThrottlePermit} composes the two (local first, then shared on overflow). On the node that
- * owns a bucket (chosen by {@link ThrottleOwnerSelector}), this holds one live-permit set per active bucket.
+ * owns a bucket (chosen by {@link ThrottleOwnerSelector}), this holds one recorded-permit set per active or recently
+ * active bucket.
  * <p>
  * Unlike the node tier, acquire and release happen on different nodes (a coordinator acquires from the owner, then
  * releases via a separate RPC), so each permit is a permit with an id and a TTL rather than a self-releasing
@@ -32,30 +33,32 @@ import java.util.function.LongSupplier;
  * Correctness under concurrency and node churn:
  * <ul>
  *   <li><b>Atomic admission.</b> The check-count-then-add step runs inside {@link ConcurrentHashMap#compute},
- *       which holds the per-key bin lock, so many coordinators racing on the same bucket can never push the live
+ *       which holds the per-key bin lock, so many coordinators racing on the same bucket can never push the recorded
  *       count over the limit.</li>
- *   <li><b>Count = size of the live-permit map</b>, never a bare integer. This makes {@link #release} and
- *       {@link #sweepExpired} idempotent: removing by permit id is a no-op if the permit is already gone (already
- *       swept, or the bucket was remapped to a different owner), so a sweep racing a late release cannot
- *       double-decrement, and a stray release after ring remap cannot corrupt a live count.</li>
+ *   <li><b>Count = size of the recorded-permit map</b>, never a bare integer. This makes {@link #release} and
+ *       {@link #sweepExpired} idempotent: removing by permit id is a no-op if the permit is absent (already released or
+ *       swept, or the release reached a different owner after remapping), so a sweep racing a late release cannot
+ *       double-decrement and a stray release after ring remap cannot corrupt the current owner's count.</li>
  *   <li><b>TTL permits.</b> Every permit carries an expiry. A coordinator that crashes (or whose release RPC is
  *       lost) leaves a permit that {@link #sweepExpired} reclaims after the TTL, so a bucket cannot get wedged at
- *       its limit forever. A rejoining owner starts empty — no phantom permits.</li>
+ *       its limit forever. A different newly-selected owner process starts empty; records on a former owner remain until
+ *       release or TTL. If the same live process later regains that bucket, an old record may count until it expires.</li>
  * </ul>
- * A bucket entry exists only while it has at least one live permit, so memory scales with concurrently-active
- * buckets, not the total user/role population.
+ * A bucket entry exists only while it has at least one recorded permit. An expired record can remain until a saturated
+ * acquire or the periodic sweep prunes it, so memory scales with active or recently-active buckets rather than the total
+ * user/role population.
  * <p>
  * Prune cost: reclaiming expired permits is an O(size) scan of the bucket's permit map. To keep a saturated hot bucket
  * from paying that scan on every denied acquire, each bucket caches the earliest permit expiry ({@code minExpiry}); the
  * scan is skipped whenever the bucket is full but nothing can have expired yet ({@code minExpiry > now}), which is the
- * common case under sustained load (fresh permits, long TTL). The scan still runs promptly the moment a permit actually
- * expires, so reclamation is never delayed.
+ * common case under sustained load (fresh permits, long TTL). The first saturated acquire at or after the cached expiry
+ * prunes the bucket; without another acquire, reclamation waits for the periodic sweep.
  */
 @ExperimentalApi
 public class SharedThrottleTracker {
 
     /**
-     * Per-bucket state: the live permits plus the earliest expiry among them. Both fields are only read and written
+     * Per-bucket state: the recorded permits plus the earliest expiry among them. Both fields are only read and written
      * inside a {@code permitsByBucket.compute(...)} block, i.e. under the outer map's per-key bin lock, so the plain
      * {@code long} needs no additional synchronization. {@code minExpiry} is a lower bound on the true earliest expiry:
      * it is tightened on insert and recomputed exactly during a prune, but deliberately left stale (small) on
@@ -89,8 +92,8 @@ public class SharedThrottleTracker {
      * @param sharedLimit the maximum concurrent in-flight requests allowed across the cluster for this bucket
      * @param permitId     a globally-unique permit id minted by the requesting coordinator
      * @param ttlNanos    how long the permit may live before {@link #sweepExpired} may reclaim it
-     * @return {@code true} if the permit was granted (live count was below the limit), {@code false} if the bucket
-     *         is already at the limit
+     * @return {@code true} if the permit was granted (the recorded count was below the limit after any eligible expiry
+     *         pruning), {@code false} if the bucket is already at the limit
      */
     public boolean tryAcquire(String bucketKey, int sharedLimit, String permitId, long ttlNanos) {
         final long now = nanoTimeSupplier.getAsLong();
@@ -103,7 +106,7 @@ public class SharedThrottleTracker {
             // Only scan when the bucket looks full AND some permit could actually have expired. Below the limit there
             // is a free slot regardless; and while minExpiry > now every permit is still live, so the O(size) scan
             // could not free anything. Skipping it keeps the common saturated-but-fresh acquire O(1) while still
-            // self-healing stuck permits the instant one expires.
+            // self-healing stuck permits on the first saturated acquire at or after an expiry.
             if (bucket.permits.size() >= sharedLimit && bucket.minExpiry <= now) {
                 pruneExpired(bucket, now);
             }
@@ -114,7 +117,7 @@ public class SharedThrottleTracker {
                 }
                 granted[0] = true;
             }
-            // Never leave an empty bucket behind (keeps the live set == active buckets).
+            // Never leave an empty bucket behind (keeps the map limited to buckets with recorded accounting).
             return bucket.permits.isEmpty() ? null : bucket;
         });
         return granted[0];
@@ -122,12 +125,12 @@ public class SharedThrottleTracker {
 
     /**
      * Releases a previously-granted permit. Removing by permit id makes this idempotent and safe: an unknown id
-     * (already swept, double release, or a permit that belonged to a previous owner of a since-remapped bucket) is
-     * a no-op and can never decrement a live permit that belongs to some other request.
+     * (already swept, double release, or a release that reached a different owner after remapping) is a no-op and can
+     * never remove a recorded permit that belongs to some other request.
      *
      * @param bucketKey the throttle bucket identifier
      * @param permitId   the permit id returned to the coordinator at acquire time
-     * @return {@code true} if a live permit was actually removed, i.e. a slot genuinely just freed. This is the
+     * @return {@code true} if a recorded permit was actually removed, i.e. a slot genuinely just freed. This is the
      *         authoritative answer to "did capacity become available?", and the owner is the only node that can give it:
      *         a coordinator sending a speculative release (e.g. after a lost acquire reply) cannot know whether its
      *         permit was ever recorded. Callers drive owner-push on {@code true} only, so a no-op release never produces
@@ -181,7 +184,8 @@ public class SharedThrottleTracker {
         return freedByBucket;
     }
 
-    // Current live (non-expired-at-read-time) count for a bucket. Package-private for tests.
+    // Current recorded count for a bucket. This can include expired permits until an acquire or sweep prunes them.
+    // Package-private for tests.
     int inFlight(String bucketKey) {
         Bucket bucket = permitsByBucket.get(bucketKey);
         return bucket == null ? 0 : bucket.permits.size();

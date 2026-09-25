@@ -219,10 +219,11 @@ public class WlmSharedDenialAccountingTests extends OpenSearchTestCase {
     }
 
     /**
-     * A concurrent pushed grant admits the provisional request before a denied-and-unregistered reply lands. The
-     * delayed reply must target the now-gone exact token, count no throttle, and affect no other request.
+     * A concurrent drain admits the provisional request before the denied-and-unregistered reply lands. The exact
+     * pending token is therefore already gone when the reply tries to reject it. The request was served, so no
+     * rejection occurred and {@code total_throttled} must not increase.
      */
-    public void testUnregisteredDenialAfterRacingDrainDoesNotCountSpuriousThrottle() {
+    public void testUnregisteredDenialAfterRacingDrainDoesNotCountAThrottle() {
         stubAcquire((listener, noWaiter) -> {
             // A racing owner-push grant / node-tier drain serves the parked request first...
             assertTrue("precondition: the racing drain must find the parked request", queueService.admitWithPermit(BUCKET, () -> {}));

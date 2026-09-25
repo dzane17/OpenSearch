@@ -237,7 +237,7 @@ public class WlmQueueingIT extends OpenSearchIntegTestCase {
         assertNotNull(secondQueued.actionGet(TIMEOUT));
     }
 
-    public void testGlobalDisableImmediatelyDrainsQueuedSearch() throws Exception {
+    public void testGlobalDisableDrainsQueuedSearchUntracked() throws Exception {
         String workloadGroupId = "wlm_global_drain_group";
         String ruleId = "wlm_global_drain_rule";
         String indexName = "global_drain_index";
@@ -263,9 +263,9 @@ public class WlmQueueingIT extends OpenSearchIntegTestCase {
         ActionFuture<SearchResponse> secondQueued = blockingSearch(indexName).execute();
         assertBusy(() -> assertEquals("second search should be parked", 1, getQueuedCurrent(workloadGroupId)), 30, TimeUnit.SECONDS);
 
-        // The setting update must submit an immediate queue drain. The first search remains blocked and still owns the
-        // only node permit, so the second can reach the script before that permit is released only if it was run
-        // untracked by the global ENABLED -> DISABLED callback.
+        // The setting update must submit a queue drain without waiting for the periodic service sweep. The first search
+        // remains blocked and still owns the only node permit, so the second can reach the script before that permit is
+        // released only if it was run untracked by the global ENABLED -> DISABLED callback.
         setWlmMode("disabled");
         awaitBlockedCount(plugins, 2);
         assertBusy(() -> assertEquals("global disable must empty the queue", 0, getQueuedCurrent(workloadGroupId)));
@@ -276,7 +276,7 @@ public class WlmQueueingIT extends OpenSearchIntegTestCase {
         assertNotNull(secondQueued.actionGet(TIMEOUT));
     }
 
-    public void testThrottleTierSwitchImmediatelyDrainsQueuedSearch() throws Exception {
+    public void testThrottleTierSwitchDrainsQueuedSearchUntracked() throws Exception {
         String workloadGroupId = "wlm_tier_switch_drain_group";
         String ruleId = "wlm_tier_switch_drain_rule";
         String indexName = "tier_switch_drain_index";

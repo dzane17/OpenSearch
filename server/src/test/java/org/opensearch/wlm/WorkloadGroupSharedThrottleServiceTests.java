@@ -132,12 +132,12 @@ public class WorkloadGroupSharedThrottleServiceTests extends OpenSearchTestCase 
         return permit.get();
     }
 
-    public void testTtlSweepDrivesOwnerPushForALeaseExpiredSlot() {
+    public void testTtlSweepDrivesOwnerPushForAnExpiredPermitSlot() {
         // Regression: a permit reclaimed by the TTL sweep frees a shared slot with NO release RPC behind it (the holder
-        // crashed, or its release was lost), so the sweep is the ONLY observer of that free slot. It must drive
-        // owner-push. Previously sweepExpired() returned void and the sweep ignored the freed capacity, so a coordinator
-        // with a parked request stayed registered as a waiter while the slot sat idle — and since parked requests have no
-        // deadline, it stranded until some unrelated release happened to re-drive the bucket.
+        // crashed, or its release was lost). With no subsequent acquire, the sweep is the only observer of that free
+        // slot, so it must drive owner-push. Previously sweepExpired() returned void and the sweep ignored the freed
+        // capacity, leaving a retained request registered while the slot sat idle until an unrelated release re-drove
+        // the bucket.
         final int sharedLimit = 1;
         final String groupId = "g1";
         final String bucket = groupId + ":group";
@@ -621,7 +621,7 @@ public class WorkloadGroupSharedThrottleServiceTests extends OpenSearchTestCase 
         // Regression: one coordinator (here the local owner) parks SEVERAL requests for a shared bucket, but the owner
         // waiter registry holds one Set membership per coordinator. A grant must NOT deregister the coordinator on a
         // successful admit — it may still have more queued requests — so each successive freed slot drains the next
-        // parked request. The bug drained only the first and stranded the rest until queue.timeout despite free capacity.
+        // parked request. The bug drained only the first and stranded the rest indefinitely despite free capacity.
         final int sharedLimit = 1;
         final String bucket = "b";
         WorkloadGroupSharedThrottleService service = newService();

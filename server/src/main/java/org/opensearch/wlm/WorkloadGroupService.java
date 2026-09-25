@@ -50,7 +50,9 @@ import java.util.concurrent.atomic.AtomicLong;
 import static org.opensearch.wlm.tracker.WorkloadGroupResourceUsageTrackerService.TRACKED_RESOURCES;
 
 /**
- * As of now this is a stub and main implementation PR will be raised soon.Coming PR will collate these changes with core WorkloadGroupService changes
+ * Coordinates workload-group enforcement, task cancellation, throttle admission, retained-request queueing, and
+ * workload-group statistics on this node.
+ *
  * @opensearch.experimental
  */
 public class WorkloadGroupService extends AbstractLifecycleComponent
@@ -286,7 +288,8 @@ public class WorkloadGroupService extends AbstractLifecycleComponent
     }
 
     /**
-     * Submits one asynchronous task to release every retained request for the supplied groups. Config updates run on
+     * Submits one asynchronous best-effort task to release retained requests observed for the supplied groups. Concurrent
+     * arrivals may land after the queue snapshot and remain governed by the new policy. Config updates run on
      * cluster-state/settings application threads; polling deep queues and completing one listener per request must not.
      */
     private void drainQueuedRequestsUntracked(Set<String> groupIds, String reason) {
@@ -451,9 +454,10 @@ public class WorkloadGroupService extends AbstractLifecycleComponent
     }
 
     /**
-     * Late-binds the coordinator-local request-queue service. When unset, a throttle denial rejects immediately (the
-     * pre-queueing behavior); when set, a denial may park the request instead (if the group's
-     * {@code queue.size_per_bucket} > 0).
+     * Late-binds the coordinator-local retained-request service. When unset, a throttle denial rejects immediately (the
+     * pre-queueing behavior). When set and queueing is enabled, a node-tier denial can enter WAITING, while a shared-tier
+     * request is retained as PENDING_ACQUIRE before the owner verdict and transitions to WAITING only after a registered
+     * denial.
      */
     public void setQueueService(WorkloadGroupQueueService queueService) {
         this.queueService = queueService;
@@ -466,8 +470,9 @@ public class WorkloadGroupService extends AbstractLifecycleComponent
      *       permit (works for both a node-local and a cluster-level shared permit);</li>
      *   <li>{@code null} — admitted but not throttle-tracked (throttling disabled/not configured for this request,
      *       request not attributable to a bucket, or a fail-open path); nothing to release;</li>
-     *   <li>{@link ActionListener#onFailure} with an {@link OpenSearchRejectedExecutionException} (HTTP 429) — the
-     *       bucket is at its limit.</li>
+     *   <li>{@link ActionListener#onFailure} with an {@link OpenSearchRejectedExecutionException} (HTTP 429) — an enforced
+     *       throttle denied admission and the request could not remain retained (for example queueing was disabled/full
+     *       or shared waiter registration failed).</li>
      * </ul>
      * The node-local tier is checked synchronously (zero added latency on the common path); only an overflow to the
      * shared tier does the asynchronous owner round-trip, so the calling thread is never blocked. The listener may
@@ -513,9 +518,9 @@ public class WorkloadGroupService extends AbstractLifecycleComponent
 
             if (queueingActive) {
                 // Register this exact request as PENDING_ACQUIRE before contacting the owner. That closes the
-                // grant-before-local-registration race without consuming queue.size_per_bucket: only a real owner
-                // denial transitions the entry to WAITING and reserves a configured bucket slot. The fixed group
-                // ceiling still bounds all retained PENDING_ACQUIRE + WAITING entries.
+                // grant-before-local-registration race without consuming queue.size_per_bucket: only a registered owner
+                // denial that fits the bucket cap transitions the entry to WAITING and reserves a configured slot. The
+                // fixed group ceiling still bounds all retained PENDING_ACQUIRE + WAITING entries.
                 final WorkloadGroupQueue.QueuedRequest pending = qs.tryRegisterPendingAcquire(
                     plan.workloadGroupId,
                     plan.bucketKey,
@@ -621,9 +626,9 @@ public class WorkloadGroupService extends AbstractLifecycleComponent
         return WorkloadGroupThrottleSettings.NODE_LIMIT.get(workloadGroup.getMutableWorkloadGroupFragment().getThrottling());
     }
 
-    // Wraps a raw node permit so its close() atomically hands the still-held tracker slot to the oldest queued request
+    // Wraps a raw node permit so its close() atomically hands the still-held tracker slot to the oldest retained request
     // for this bucket. The tracker count remains occupied while the queue lock is held, so a racing new arrival cannot
-    // barge ahead in the old release-then-reacquire window. Only when there is no eligible waiter is the raw slot
+    // barge ahead in the old release-then-reacquire window. Only when there is no retained request is the raw slot
     // released. Every handed-off request receives a fresh one-shot wrapper around the same raw permit, so the chain can
     // continue until the queue empties, at which point the underlying tracker permit is closed exactly once.
     //
@@ -682,17 +687,17 @@ public class WorkloadGroupService extends AbstractLifecycleComponent
             return;
         }
         // Queue-then-reject: hold the request instead of rejecting, if queueing is enabled and both the request's bucket
-        // and the group have room. A parked request holds no thread — only its listener + open connection — and is
-        // admitted later by a node-completion drain or an owner grant, or evicted by task cancellation (client
-        // disconnect / cancel_after_time_interval). There is no queue timeout: a parked request has no wall-clock
-        // deadline.
+        // and the group have room. This is the node-tier WAITING path; shared-tier queueing is handled above by
+        // PENDING_ACQUIRE. A retained request holds no thread — only its listener + open connection — and is selected
+        // later by node-permit handoff/recovery or a live-configuration drain, or evicted by task cancellation
+        // (client disconnect / cancel_after_time_interval). There is no queue timeout.
         final WorkloadGroupQueueService qs = queueService;
         if (qs != null
             && plan.queueSizePerBucket > 0
             && qs.tryEnqueue(plan.workloadGroupId, plan.bucketKey, task, plan.queueSizePerBucket, listener)) {
-            // Parked, not counted: total_queued is taken when the wait ENDS (on admission), not when it starts, so that it
-            // and total_queue_wait_millis are written by the same call and can never describe different request sets. The
-            // request is visible as queued_current until then.
+            // Retained, not counted yet: total_queued is taken when WAITING ends (selection/dequeue), not when it starts,
+            // so it and total_queue_wait_millis are written by the same call. The request is visible as queued_current
+            // until then; cancellation can still win the final post-dequeue check.
             return; // parked; listener completed later
         }
         incrementThrottled(plan.workloadGroupId);
@@ -700,7 +705,7 @@ public class WorkloadGroupService extends AbstractLifecycleComponent
     }
 
     /**
-     * Node-tier backstop drain for the sweep: admit the oldest waiter for {@code bucketKey} against a freshly acquired
+     * Node-tier backstop drain for the sweep: admit the oldest retained request for {@code bucketKey} against a freshly acquired
      * node permit if one is free; a no-op otherwise. Wired into {@link WorkloadGroupQueueService#sweep}. This recovers
      * a request the node-completion chain missed without re-running full admission or re-contacting the shared owner
      * (the owner recovers its own lost grants and reservations), and — crucially — without dequeuing-and-re-parking, so

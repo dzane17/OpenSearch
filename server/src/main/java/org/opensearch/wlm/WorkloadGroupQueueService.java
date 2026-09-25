@@ -27,16 +27,18 @@ import java.util.function.Function;
 
 /**
  * Coordinator-local owner of the per-workload-group retained-request queues. A node-tier denial is parked directly as
- * WAITING. A shared-tier overflow is registered as PENDING_ACQUIRE before the owner RPC, then atomically transitions to
- * WAITING only if the owner denies it. A retained request holds no thread — only its {@link ActionListener}, task, and
- * open connection — and is admitted later when a permit becomes available:
+ * WAITING. A shared-tier overflow is registered as PENDING_ACQUIRE before the owner RPC. A direct grant or fail-open
+ * result admits that exact entry; a registered denial attempts to transition it to WAITING, while an unregistered
+ * denial or full waiting bucket rejects it. A retained request holds no thread — only its {@link ActionListener}, task,
+ * and open connection — and is admitted later when a permit becomes available:
  * <ul>
- *   <li><b>node tier</b> — a completing request's {@code close()} calls {@link #drainNode} for the freed bucket
- *       (immediate, local);</li>
- *   <li><b>cluster tier</b> — a bucket owner pushes a grant carrying a reserved lease, handled via
+ *   <li><b>node tier</b> — a completing request first hands its still-held permit directly to the oldest retained
+ *       request; {@link #drainNode} is the fallback/recovery path after a slot is released;</li>
+ *   <li><b>cluster tier</b> — a bucket owner pushes a grant carrying a reserved permit, handled via
  *       {@link #admitWithPermit} (see {@link WorkloadGroupSharedThrottleService});</li>
- *   <li><b>backstop</b> — {@link #sweep} periodically re-attempts node admission for retained buckets in case an
- *       exceptional race or failure interrupted the primary handoff path.</li>
+ *   <li><b>node-tier backstop</b> — {@link #sweep} periodically re-attempts only node-tier admission for retained
+ *       buckets in case an exceptional race interrupted the primary handoff. Shared-tier recovery is owner-push and is
+ *       not driven by this sweep.</li>
  * </ul>
  * Concurrency: each bucket's request set is guarded by a per-bucket lock ({@link KeyedLock}); group totals are atomics
  * inside {@link WorkloadGroupQueue}. A retained listener is never completed while a bucket lock is held — every
@@ -97,7 +99,8 @@ public class WorkloadGroupQueueService {
             incrementQueueRejection(groupId); // bucket or group queue full
             return false;
         }
-        // Count the completed wait on admission, not here, so total_queued and the wait sum describe the same requests.
+        // Count the completed wait when this entry is selected for admission, not here, so total_queued and the wait sum
+        // describe the same completed WAITING intervals.
         return true;
     }
 
@@ -253,18 +256,18 @@ public class WorkloadGroupQueueService {
         WorkloadGroupQueue.QueuedRequest req;
         Releasable permit;
         try (Releasable ignored = bucketLocks.acquire(lockKey(groupId, bucketKey))) {
-            // Peek-then-acquire-then-remove under the lock: only remove a waiter once we hold a permit for it, so a
+            // Peek-then-acquire-then-remove under the lock: only remove a retained request once we hold a permit for it, so a
             // failed re-acquire never drops a request from the queue.
             if (hasRetainedRequest(queue, bucketKey) == false) {
                 return;
             }
             permit = nodeAcquire.apply(bucketKey);
             if (permit == null) {
-                return; // slot taken by a racing arrival; leave the waiter queued
+                return; // slot taken by a racing arrival; leave the retained request queued
             }
             req = queue.pollOldest(bucketKey);
             if (req == null) {
-                // No waiter after all (shouldn't happen under the lock, but be safe): release the permit we took.
+                // No retained request after all (shouldn't happen under the lock, but be safe): release the permit we took.
                 permit.close();
                 return;
             }
@@ -278,7 +281,8 @@ public class WorkloadGroupQueueService {
      * PENDING_ACQUIRE so a grant that races ahead of the original denial response always finds the request already
      * registered locally. If there is no request, returns {@code false} so the shared service returns the permit.
      *
-     * @return {@code true} if a waiter was admitted with the permit, {@code false} if there was none (caller releases)
+     * @return {@code true} if a retained request was admitted with the permit, {@code false} if there was none
+     *         (caller releases)
      */
     public boolean admitWithPermit(String bucketKey, Releasable permit) {
         return admitOldest(bucketKey, permit);
@@ -320,8 +324,9 @@ public class WorkloadGroupQueueService {
     }
 
     /**
-     * Releases a group's ENTIRE backlog across all of its buckets, untracked. See
-     * {@link #admitAllUntracked(String, String)} for why a no-op permit is the right thing to hand out here.
+     * Best-effort admission of a group's retained backlog across all bucket keys observed by this call, untracked. See
+     * {@link #admitAllUntracked(String, String)} for why a no-op permit is the right thing to hand out here. Concurrent
+     * arrivals may race this drain and obey either the old or new policy.
      *
      * @return the number of requests admitted
      */
@@ -339,10 +344,10 @@ public class WorkloadGroupQueueService {
     }
 
     /**
-     * Admits <em>every</em> request parked for {@code bucketKey} with an untracked (no-op) permit, i.e. releases the
-     * backlog without holding any throttle slot. Called when a live policy change invalidates the queue's old admission
-     * contract (for example a tier/attribute switch or a move to monitor/disabled operation), so re-running old queued
-     * requests through permit acquisition could strand them or apply a policy they were not queued under.
+     * Drains the retained requests ({@code PENDING_ACQUIRE} or {@code WAITING}) present for {@code bucketKey} while its
+     * lock is held, using an untracked (no-op) permit. Called when a live policy change invalidates the queue's old
+     * admission contract (for example a tier/attribute switch or a move to monitor/disabled operation), so re-running old
+     * requests through permit acquisition could strand them or apply a policy they were not retained under.
      * <p>
      * A no-op permit matches the established fail-open semantics ({@code admitWithPermit(bucketKey, () -> {})}): the
      * request runs untracked and its {@code close()} does nothing. Requests are collected under the bucket lock but
@@ -384,8 +389,8 @@ public class WorkloadGroupQueueService {
      * under the same bucket lock used by admission, and {@link #admit} rechecks cancellation after dequeueing. Those two
      * paths cover cancellation without an O(total queue depth) scan on every sweep.
      *
-     * @param drain admits the oldest waiter for a (groupId, bucketKey) against a freshly re-acquired node permit if one
-     *              is available; a no-op if the bucket is empty or no permit is free (typically
+     * @param drain admits the oldest retained request for a (groupId, bucketKey) against a freshly re-acquired node permit
+     *              if one is available; a no-op if the bucket is empty or no permit is free (typically
      *              {@link WorkloadGroupService#sweepDrainNode})
      */
     public void sweep(SweepDrain drain) {
@@ -399,11 +404,12 @@ public class WorkloadGroupQueueService {
                 drain.drain(groupId, bucketKey);
             }
         }
-        // Note: an emptied group queue's map entry is intentionally NOT pruned here. A concurrent tryEnqueue could
-        // offer to the same WorkloadGroupQueue between an "is it empty" check and its removal, which would orphan that
-        // freshly-parked request (present in the queue object but no longer reachable from queuesByGroup). The leak is
+        // Note: an emptied group queue's map entry is intentionally NOT pruned here. A concurrent tryEnqueue or
+        // tryRegisterPendingAcquire could add to the same WorkloadGroupQueue between an "is it empty" check and its
+        // removal, which would orphan that retained request (present in the queue object but no longer reachable from
+        // queuesByGroup). The leak is
         // one small empty object per group ever used — negligible (groups are few and long-lived) — and not worth a
-        // race to reclaim. A parked request whose task is cancelled (including a deleted group's tasks) is removed by
+        // race to reclaim. A retained request whose task is cancelled (including a deleted group's tasks) is removed by
         // its per-request cancellation callback, independently of this recovery sweep.
     }
 
@@ -439,17 +445,17 @@ public class WorkloadGroupQueueService {
     // Completes a retained listener with an acquired permit, off the caller's thread. Deregisters the cancellation
     // callback first (the request is leaving the queue).
     //
-    // The ENTIRE body — including the cancelled-task branch that closes the permit — runs on the GENERIC executor, never
-    // inline on the caller's (draining/completion) thread. This is load-bearing for recursion safety: for a node-tier
-    // permit, permit.close() is the wrapNodePermit wrapper whose close() re-enters drainNode -> admit. Running close()
-    // on the caller thread would let a run of consecutively-cancelled waiters recurse close -> drainNode -> admit ->
-    // close ... one synchronous frame per waiter (StackOverflow under a cancel storm). Dispatching first means each such
-    // hop is a fresh executor task, so the chain unwinds across tasks rather than down one stack.
+    // Listener completion — including the cancelled-task branch that closes the permit — runs on the GENERIC executor,
+    // never inline on the caller's (draining/completion) thread. Cancellation-handle removal and wait-stat recording
+    // happen before dispatch. This is load-bearing for recursion safety: closing a node-tier wrapper can synchronously
+    // hand its still-held slot to another retained request (or fall back to drainNode). Running close() on the caller
+    // thread would let consecutively-cancelled entries recurse close -> handoff/admit -> close, one frame per entry
+    // (StackOverflow under a cancellation storm). Dispatching listener completion first makes each hop a fresh task.
     private void admit(WorkloadGroupQueue.QueuedRequest req, Releasable permit, boolean recordWait) {
         req.releaseCancellationHandle();
-        // Record the queue wait at the admission instant (this thread), before the executor hop, so the metric is the
-        // true time parked and not inflated by dispatch latency. Recorded even for a task cancelled-while-queued: it
-        // still waited. PENDING_ACQUIRE admissions skip this so owner round-trip latency is not reported as queue wait.
+        // Record the queue wait when WAITING ends (selection/dequeue), before the executor hop, so dispatch latency is not
+        // included. A cancellation that wins the final check still completed a WAITING interval and is counted; an entry
+        // evicted before dequeue is not. PENDING_ACQUIRE skips this so owner round-trip latency is not queue latency.
         if (recordWait) {
             recordQueueWait(groupIdOf(req.bucketKey()), TimeUnit.NANOSECONDS.toMillis(req.waitNanos(threadPool.relativeTimeInNanos())));
         }
@@ -495,8 +501,8 @@ public class WorkloadGroupQueueService {
         return groupId + '\0' + bucketKey;
     }
 
-    // Counts one finished queue wait: total_queued plus the wait sum/max, all inside recordQueueWaitMillis so they cannot
-    // diverge (see WorkloadGroupState#recordQueueWaitMillis). Called only for admissions the request did not supply itself.
+    // Counts one completed WAITING interval: total_queued plus the wait sum/max, all inside recordQueueWaitMillis so they
+    // cannot diverge (see WorkloadGroupState#recordQueueWaitMillis). Called only after selecting a WAITING entry.
     private void recordQueueWait(String groupId, long waitMillis) {
         WorkloadGroupState state = stateAccessor.getWorkloadGroupStateMap().get(groupId);
         if (state != null) {
@@ -512,7 +518,7 @@ public class WorkloadGroupQueueService {
     }
 
     /**
-     * Node-tier backstop drain for the sweep: admit the oldest waiter for {@code (groupId, bucketKey)} against a
+     * Node-tier backstop drain for the sweep: admit the oldest retained request for {@code (groupId, bucketKey)} against a
      * freshly re-acquired node permit, if one is free; otherwise a no-op. Implemented by {@link WorkloadGroupService}
      * (which owns the node permit tracker) so the queue service holds no throttle logic.
      */

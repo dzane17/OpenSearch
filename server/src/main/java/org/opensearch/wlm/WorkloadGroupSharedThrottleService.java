@@ -60,7 +60,8 @@ import java.util.function.Supplier;
  * Availability: any failure to reach the owner (timeout, disconnect, missing handler on an old node, or an empty
  * ring) fails <em>open</em> — the request is admitted with no shared permit. This is a deliberate, un-toggleable
  * choice: a single unreachable owner must not turn a network blip into a cluster-wide rejection storm for its
- * share of buckets. A stuck permit is instead reclaimed by the owner's TTL sweep.
+ * share of buckets. An expired permit is reclaimed lazily by an acquire on the saturated bucket or by the owner's
+ * periodic TTL sweep; the sweep also offers reclaimed capacity to registered waiters.
  */
 @ExperimentalApi
 public class WorkloadGroupSharedThrottleService implements ClusterStateListener {
@@ -95,8 +96,8 @@ public class WorkloadGroupSharedThrottleService implements ClusterStateListener 
     // is uncommon (no default search timeout, but heavy aggs/scripts can exceed it); if it becomes a problem the fix is
     // permit renewal or deriving the TTL from a request deadline, not a larger constant.
     static final long PERMIT_TTL_NANOS = TimeValue.timeValueMinutes(5).nanos();
-    // How often the owner sweeps expired permits. Originally pure memory hygiene, on the reasoning that tryAcquire()
-    // prunes a bucket's expired permits on every acquire, so an active bucket self-heals and can never over-reject.
+    // How often the owner sweeps expired permits. Originally pure memory hygiene, on the reasoning that a saturated
+    // tryAcquire() prunes once minExpiry says a record may have expired, so an active bucket self-heals.
     // QUEUEING MADE THIS A CORRECTNESS PATH TOO: a bucket can now hold parked requests while receiving no new acquires
     // (the clients already in the queue are waiting, not arriving), so there may be no tryAcquire to do that pruning. For
     // such a bucket this sweep is the only thing that reclaims a crashed holder's permit AND the only thing that then
@@ -117,27 +118,30 @@ public class WorkloadGroupSharedThrottleService implements ClusterStateListener 
     private volatile Scheduler.Cancellable sweepTask;
 
     // OWNER-SIDE waiter registry for owner-push queue draining: for each bucket this node owns, the ordered SET of
-    // coordinators that have at least one request parked for the bucket. A set (not a count) so registration is
-    // idempotent and the registry is bounded at <= N coordinators per bucket — a coordinator that re-registers (e.g.
-    // still parked across several acquires) does not inflate it. INSERTION-ORDERED (LinkedHashSet) so a grant rotates
+    // coordinator process incarnations that have at least one retained request for the bucket. A set (not a count) makes
+    // registration idempotent per exact DiscoveryNode — repeated acquires from one incarnation do not inflate it. A
+    // stale and replacement incarnation can coexist during topology convergence, so this is not strictly bounded by the
+    // current node count. INSERTION-ORDERED (LinkedHashSet) so a grant rotates
     // the chosen coordinator to the tail (see pickAndRotateEligibleWaiter): membership persists across a successful
     // hand-off (the coordinator may still have more queued requests), and successive freed slots round-robin fairly
     // across coordinators instead of repeatedly serving whichever one hashes first. A coordinator is removed when a
-    // grant comes back unused (no more queued requests), it disconnects, or its GRANT response fails, so the registry
-    // self-reconciles with real demand. No request identity is held (the requests live on their coordinators).
+    // grant comes back unused, when an offer selects it while disconnected, when a failed GRANT has no fresh
+    // re-registration, or when this node loses ownership. Until one of those events, stale incarnations may remain.
+    // No request identity is held (the requests live on their coordinators).
     // LinkedHashSet is NOT thread-safe, so every access — read, size, add, remove, rotate — MUST go through
     // compute/computeIfPresent on this map, whose per-key exclusive remapping is the sole lock guarding the inner set.
     private final Map<String, LinkedHashSet<DiscoveryNode>> waitersByBucket = new ConcurrentHashMap<>();
-    // OWNER-SIDE transient delivery state. At most one remote GRANT may await a response for the same bucket and exact
-    // coordinator process incarnation. Without this fence a bulk capacity event can rotate back to one waiter and send
-    // several grants before the first response arrives; if that waiter is paused, it can reserve every shared slot.
+    // OWNER-SIDE transient delivery state. During one uninterrupted ownership tenure, at most one remote GRANT may await
+    // a response for the same bucket and exact coordinator process incarnation. Without this fence a bulk capacity event
+    // can rotate back to one waiter and send several grants before the first response arrives; if that waiter is paused,
+    // it can reserve every shared slot.
     //
     // This is deliberately not a permit ledger: the response handler already closes over the permit id. Each value is
     // only a unique callback token plus whether a fresh denial re-registered the coordinator while its grant was
-    // pending. The token prevents a late callback from an earlier ownership epoch from clearing a newer hand-off that
-    // reused the same bucket/coordinator key. On failure, an unchanged registration is removed before the permit is
-    // released; a fresh registration is preserved because it is evidence that the coordinator has resumed
-    // communicating.
+    // pending. Ownership cleanup cannot cancel an already-sent transport request, so if the bucket maps away and back an
+    // older hand-off may briefly coexist with a newer one. The token prevents the older callback from clearing the newer
+    // marker. On failure, an unchanged registration is removed before the permit is released; a fresh registration is
+    // preserved because it is evidence that the coordinator has resumed communicating.
     private final Map<PendingGrantKey, PendingGrant> grantsAwaitingResponse = new ConcurrentHashMap<>();
 
     // COORDINATOR-SIDE: how a pushed grant is turned into an admitted queued request. Late-bound (the queue service is
@@ -206,7 +210,7 @@ public class WorkloadGroupSharedThrottleService implements ClusterStateListener 
     public void start() {
         // The ring is populated by clusterChanged (see the constructor), not here: at node start the initial cluster
         // state may not be applied yet, so reading clusterService.state() here can throw "initial cluster state not
-        // set yet". This method only schedules the memory-hygiene sweep.
+        // set yet". This method only schedules expiry reclamation and the corresponding owner-push recovery.
         sweepTask = threadPool.scheduleWithFixedDelay(() -> {
             try {
                 sweepExpiredAndDrive();
@@ -242,8 +246,8 @@ public class WorkloadGroupSharedThrottleService implements ClusterStateListener 
             ring.set(currentRing);
 
             // This node is no longer authoritative for waiters on buckets that moved away. Drop that owner-only routing
-            // state immediately; old permit records deliberately remain in the tracker until release/TTL, but the
-            // isStillOwner fence prevents them from creating another permit.
+            // state immediately. Old permit records deliberately remain until release/TTL; while ownership is elsewhere,
+            // the isStillOwner fence prevents them from creating another permit.
             removeWaitersForLostOwnership(currentRing);
 
             // Every coordinator owns the authoritative request queue for searches that arrived there. Re-register only
@@ -264,9 +268,10 @@ public class WorkloadGroupSharedThrottleService implements ClusterStateListener 
                 waitersByBucket.remove(bucketKey);
             }
         }
-        // A callback for an old ownership epoch must not remove a waiter if this bucket quickly maps back here and the
-        // coordinator re-registers. Clearing the marker makes that callback a no-op; the old permit remains inert until
-        // release/TTL, matching the existing former-owner policy.
+        // A callback for a hand-off sent during an earlier ownership tenure must not remove a waiter if this bucket
+        // quickly maps back here and the coordinator re-registers. Clearing the marker makes that callback a no-op.
+        // The old permit remains recorded
+        // until release/TTL; if this process regains the bucket first, it may temporarily count against the live limit.
         grantsAwaitingResponse.keySet().removeIf(key -> isLocalOwner(currentRing, key.bucketKey) == false);
     }
 
@@ -424,7 +429,8 @@ public class WorkloadGroupSharedThrottleService implements ClusterStateListener 
      * <em>message-less</em> {@link OpenSearchRejectedExecutionException} — a pure "denied" marker. This service holds
      * only the opaque bucket key, not the human-readable group/attribute, so {@link WorkloadGroupService} recomposes
      * the user-facing 429 message; the exception's <em>type</em> (not its text) is what distinguishes a denial from a
-     * transport error (which also arrives via {@code onFailure} but must pass through as fail-open, not a 429).
+     * transport error. Transport failures are handled internally and reported as {@code onResponse(null)}; under normal
+     * operation only an actual owner denial reaches {@code onFailure}.
      * The listener may be invoked inline (local-owner short-circuit) or on a transport thread.
      */
     public void acquireAsync(String bucketKey, int sharedLimit, ActionListener<Releasable> listener) {
@@ -432,15 +438,15 @@ public class WorkloadGroupSharedThrottleService implements ClusterStateListener 
     }
 
     /**
-     * As {@link #acquireAsync(String, int, ActionListener)}, but for a caller that has PARKED the request and wants the
-     * owner to register it as a waiter on the bucket, so a later freed slot is pushed back here as a grant (owner-push
-     * queue draining). Passing a non-null {@code onNoWaiterRegistered} is what requests registration — the callback and
-     * the request to register are one parameter deliberately, because a caller that parks without a way to hear "you
-     * were not registered" is exactly the stranding bug this guards against.
+     * As {@link #acquireAsync(String, int, ActionListener)}, but for a caller that has already retained the exact request
+     * as PENDING_ACQUIRE before this RPC. On denial, the owner registers this coordinator as a bucket waiter so a later
+     * freed slot is pushed back here as a grant, and the coordinator then transitions the request to WAITING. Passing a
+     * non-null {@code onNoWaiterRegistered} requests registration and provides the required terminal path when the owner
+     * cannot register demand.
      * <p>
      * {@code onNoWaiterRegistered} runs INSTEAD of {@link ActionListener#onFailure} when the acquire was denied and the
      * owner reported that it could not register this coordinator — see {@link AcquirePermitResponse#registered}. No grant
-     * will ever arrive in that case, and a parked request has no deadline, so the caller must fail the request rather
+     * will ever arrive in that case, and the retained request has no future wake-up, so the caller must fail it rather
      * than wait. Every other outcome is reported through {@code listener} exactly as documented above.
      *
      * @param onNoWaiterRegistered run on a denial the owner could not register; {@code null} to not request registration
@@ -528,9 +534,9 @@ public class WorkloadGroupSharedThrottleService implements ClusterStateListener 
                         listener.onResponse(releaseRemote(owner, bucketKey, permitId));
                     } else if (wantsQueue && response.registered == false) {
                         // Denied, and the owner cannot push us a grant (we are absent from its applied cluster state, or
-                        // present but unreachable, or it predates queueing). Waiting would strand the parked request.
+                        // present but unreachable, or it predates queueing). Waiting would strand the retained request.
                         logger.debug(
-                            "Owner [{}] denied bucket [{}] without registering this node as a waiter; failing the parked request",
+                            "Owner [{}] denied bucket [{}] without registering this node as a waiter; failing the retained request",
                             owner.getId(),
                             bucketKey
                         );
@@ -548,8 +554,8 @@ public class WorkloadGroupSharedThrottleService implements ClusterStateListener 
                     // best-effort release for this permitId to reclaim it immediately; release-by-id is idempotent, so
                     // if no permit was created it is a harmless no-op. Then admit (fail open).
                     logger.debug("Shared throttle acquire to owner [{}] for bucket [{}] failed; failing open", owner.getId(), bucketKey);
-                    // Reclaim only (no owner-push): this permit likely never existed; UNSET_LIMIT tells the owner to
-                    // release without driving a grant.
+                    // Send a normal exact-id release. If the permit never existed this is a no-op; if it did, the owner
+                    // reclaims it and may offer the genuinely freed slot to another registered waiter.
                     sendRelease(owner, bucketKey, permitId, "");
                     listener.onResponse(null);
                 }
@@ -578,7 +584,8 @@ public class WorkloadGroupSharedThrottleService implements ClusterStateListener 
         }
         boolean registered = false;
         if (granted == false && request.wantsQueue && request.requestingNodeId.isEmpty() == false) {
-            // Denied and the coordinator will park the request -> remember it so a freed slot is pushed back as a grant.
+            // Denied and the coordinator already retained the request -> remember it so a freed slot is pushed back as a
+            // grant. A successful response lets the coordinator transition the exact PENDING_ACQUIRE entry to WAITING.
             // The RPC carries only the coordinator's persistent node id, so resolve it to the live DiscoveryNode here:
             // the waiter set must hold the real node because sendGrant needs its transport address.
             //
@@ -611,7 +618,7 @@ public class WorkloadGroupSharedThrottleService implements ClusterStateListener 
     }
 
     // A local release path must also drive owner-push when this node owns the bucket: releasing frees a slot that a
-    // registered waiter should get. sharedLimit is threaded so the reserve step can re-check the limit.
+    // registered waiter should get.
     private Releasable releaseLocal(String bucketKey, String permitId) {
         return releaseOnce(() -> {
             // Same rule as the remote path's handleRelease, so local-owner and remote-owner behave identically.
@@ -686,7 +693,9 @@ public class WorkloadGroupSharedThrottleService implements ClusterStateListener 
 
     /**
      * Late-binds the coordinator-side grant consumer (the queue service). A received grant admits one queued request
-     * via this; before it is set, a grant is returned to the owner (safe: the reserved slot re-enters the pool).
+     * via this; before it is set, a grant is returned using the current owner ring. This normally reclaims the reserved
+     * slot; after an ownership change the current owner may treat the old permit id as unknown, leaving the former
+     * owner's record to expire.
      */
     public void setGrantConsumer(GrantConsumer grantConsumer) {
         this.grantConsumer = grantConsumer;
@@ -763,8 +772,8 @@ public class WorkloadGroupSharedThrottleService implements ClusterStateListener 
     }
 
     // NEW-OWNER SIDE: restore one coordinator's waiter membership and immediately try to use capacity that may already
-    // be free. Registration alone is insufficient: a newly-created owner starts with an empty tracker and may receive
-    // no later release event to trigger owner-push.
+    // be free. Registration alone is insufficient because an ownership change may produce no later release event to
+    // trigger owner-push.
     ReRegisterWaiterAfterOwnerChangeResponse handleReRegisterWaiterAfterOwnerChange(ReRegisterWaiterAfterOwnerChangeRequest request) {
         if (isStillOwner(request.bucketKey) == false) {
             return new ReRegisterWaiterAfterOwnerChangeResponse(false);
@@ -783,16 +792,18 @@ public class WorkloadGroupSharedThrottleService implements ClusterStateListener 
         if (registerWaiter(request.bucketKey, requestingNode) == false) {
             return new ReRegisterWaiterAfterOwnerChangeResponse(false);
         }
-        // A new owner starts with no permit records. Offer up to the entire live limit so retained demand can resume
-        // without waiting for a release event that may never arrive on this owner.
+        // Offer up to the entire live limit so retained demand can resume without waiting for a release event that may
+        // never arrive on this owner. tryAcquire enforces the actual availability, including any old records retained
+        // if this same process previously owned and then regained the bucket.
         offerSharedSlots(request.bucketKey, sharedLimit);
         return new ReRegisterWaiterAfterOwnerChangeResponse(isStillOwner(request.bucketKey));
     }
 
     // OWNER-SIDE: record that a coordinator is waiting on a bucket this node owns. Idempotent (a set), so re-registering
     // an already-known waiter is a no-op — it keeps its existing queue position (LinkedHashSet.add does not reorder an
-    // element already present), so re-registration can't let a coordinator jump the rotation. Registry stays bounded at
-    // <= N coordinators per bucket.
+    // element already present), so re-registration can't let a coordinator jump the rotation. During topology
+    // convergence, stale and replacement incarnations may coexist until selected while disconnected, unused-grant
+    // cleanup, or ownership loss.
     private boolean registerWaiter(String bucketKey, DiscoveryNode coordinator) {
         if (isStillOwner(bucketKey) == false) {
             return false;
@@ -826,7 +837,7 @@ public class WorkloadGroupSharedThrottleService implements ClusterStateListener 
      * duplicated, so a test can drive it without the two copies drifting apart.
      * <p>
      * Both decisions are the OWNER's, not the coordinator's. Whether a slot freed comes from whether the remove actually
-     * hit a live permit — a coordinator's release may be speculative (see the lost acquire-reply path), so it cannot
+     * hit a recorded permit — a coordinator's release may be speculative (see the lost acquire-reply path), so it cannot
      * know. The ceiling is resolved from this node's cluster state, whose view is the one being enforced. Deciding here
      * means a no-op release never produces a phantom grant and — the case a coordinator-supplied hint got wrong — a
      * release that DID free a slot always drives one.
@@ -845,9 +856,9 @@ public class WorkloadGroupSharedThrottleService implements ClusterStateListener 
         }
     }
 
-    // OWNER-SIDE: drop a coordinator from a bucket's waiter set (it reported no more queued requests for the bucket,
-    // disconnected, or failed to acknowledge a grant). DiscoveryNode equality uses the ephemeral id, so this removes
-    // only the exact process incarnation and cannot erase a replacement node that reused the persistent id.
+    // OWNER-SIDE: drop a coordinator from a bucket's waiter set (it reported no more queued requests, was selected while
+    // disconnected, or failed a grant without a fresh registration). DiscoveryNode equality uses the ephemeral id, so
+    // this removes only the exact process incarnation and cannot erase a replacement node that reused the persistent id.
     private void removeWaiter(String bucketKey, DiscoveryNode coordinator) {
         waitersByBucket.computeIfPresent(bucketKey, (k, nodes) -> {
             nodes.remove(coordinator);
@@ -856,9 +867,10 @@ public class WorkloadGroupSharedThrottleService implements ClusterStateListener 
     }
 
     // Unlike removeWaiter's exact-incarnation removal, this is keyed on the coordinator's PERSISTENT node id because that
-    // is all the RELEASE RPC carries. The scan is O(n), which is irrelevant — n is bounded by the number of coordinators
-    // in the cluster. Stays inside computeIfPresent because that per-key remapping is the sole lock guarding the
-    // non-thread-safe LinkedHashSet, and removeIf preserves insertion order so round-robin order survives.
+    // is all the RELEASE RPC carries. The scan is O(n); n is normally small, although stale process incarnations can
+    // temporarily coexist until an offer or cleanup event observes them. Stays inside computeIfPresent because that
+    // per-key remapping is the sole lock guarding the non-thread-safe LinkedHashSet, and removeIf preserves insertion
+    // order so round-robin order survives.
     //
     // Note this also clears a stale entry left by a restarted coordinator: DiscoveryNode identity is ephemeralId, so a
     // restart leaves a second entry under the same persistent id, and matching on that id removes both. That is what we
@@ -875,9 +887,9 @@ public class WorkloadGroupSharedThrottleService implements ClusterStateListener 
      * Package-private so tests can run a sweep deterministically instead of waiting on the scheduler.
      * <p>
      * Reclaiming an expired permit frees a shared slot with NO release RPC behind it — the holder crashed, or its release
-     * was lost — so this is the only place that free slot is ever observed. Without the owner-push call a coordinator
-     * with a parked request stays registered as a waiter while capacity sits idle and, because parked requests have no
-     * deadline, strands until some unrelated release happens to re-drive the bucket.
+     * was lost. For a bucket with no subsequent acquire, this sweep is the only place that free slot is observed.
+     * Without the owner-push call a coordinator with a retained request stays registered while capacity sits idle and,
+     * because WAITING has no queue timeout, remains stranded until some unrelated release re-drives the bucket.
      */
     void sweepExpiredAndDrive() {
         for (Map.Entry<String, Integer> freed : tracker.sweepExpiredCounts().entrySet()) {
@@ -887,9 +899,9 @@ public class WorkloadGroupSharedThrottleService implements ClusterStateListener 
 
     /**
      * The current {@code shared_limit} for a bucket, resolved from cluster state, or
-     * {@link WorkloadGroupThrottleSettings#UNSET_LIMIT} if the group is gone or the shared tier is not configured. Used
-     * by the TTL sweep, which knows only a bucket key: unlike the release path, no {@code sharedLimit} travels with an
-     * expiry. An unresolvable bucket simply skips owner-push rather than guessing a limit.
+     * {@link WorkloadGroupThrottleSettings#UNSET_LIMIT} if the group is gone or the shared tier is not configured. All
+     * owner-push paths resolve the live value before reserving capacity, including releases, expiry sweeps, numeric limit
+     * increases, and owner-change recovery. An unresolvable bucket simply skips owner-push rather than guessing a limit.
      */
     private int currentSharedLimit(String bucketKey) {
         final ClusterState state = clusterService.state();
@@ -912,7 +924,7 @@ public class WorkloadGroupSharedThrottleService implements ClusterStateListener 
      *   <li>an ordinary permit return offers one;</li>
      *   <li>a {@code shared_limit} increase offers {@code newLimit - oldLimit} once from the cluster-change hook;</li>
      *   <li>a TTL sweep offers the number of permits reclaimed in that sweep;</li>
-     *   <li>a newly-selected owner may offer up to the live limit because its tracker starts empty.</li>
+     *   <li>a newly-selected owner may offer up to the live limit because no later release may trigger a drive.</li>
      * </ul>
      * Thus normal request completion stays O(one grant); only the uncommon event that creates several slots runs a
      * bulk offer. The owner intentionally tracks only waiter membership, not remote queue depth, so a bulk event can
@@ -922,8 +934,8 @@ public class WorkloadGroupSharedThrottleService implements ClusterStateListener 
      */
     private void offerSharedSlots(String bucketKey, int slotsToOffer) {
         if (isStillOwner(bucketKey) == false) {
-            // Old permit records are allowed to drain or expire after a remap, but they are inert: the former owner must
-            // never turn one into a new reservation. Prune any late waiter insertion left by an ownership race too.
+            // Old permit records are allowed to drain or expire after a remap. While this node is the former owner it
+            // must never turn one into a new reservation. Prune any late waiter insertion left by an ownership race too.
             waitersByBucket.remove(bucketKey);
             return;
         }
@@ -1028,8 +1040,8 @@ public class WorkloadGroupSharedThrottleService implements ClusterStateListener 
         try {
             admitted = consumer.admit(bucketKey, reservedPermit(owner, bucketKey, sharedLimit, reservedPermitId));
         } catch (Exception e) {
-            // admit() dispatches on GENERIC (which never rejects); a throw here means the executor is shutting down.
-            // Release the reserved slot and STOP the loop — do NOT retry. admitWithPermit polls the head request before
+            // A throw means dispatch is unavailable (typically executor shutdown). Release the reserved slot and STOP the
+            // loop — do NOT retry. admitWithPermit polls the head request before
             // admit() can throw, so a retry against the still-registered waiter would poll-and-drop a further request on
             // every iteration during a dispatch outage. The waiter stays registered; a later release re-drives it.
             logger.debug("Queue grant admit failed for bucket [" + bucketKey + "]", e);
@@ -1118,7 +1130,8 @@ public class WorkloadGroupSharedThrottleService implements ClusterStateListener 
     }
 
     // OWNER-SIDE: push one reserved permit to a waiting coordinator. The caller has already installed pendingGrantKey,
-    // which remains present until the transport response or failure. Returns whether the asynchronous hand-off started.
+    // which remains until a transport terminal callback resolves it or ownership cleanup removes it. Returns whether the
+    // asynchronous hand-off started.
     private boolean sendGrant(
         DiscoveryNode coordinator,
         String bucketKey,
@@ -1163,10 +1176,11 @@ public class WorkloadGroupSharedThrottleService implements ClusterStateListener 
 
                 @Override
                 public void handleException(TransportException exp) {
-                    // No GRANT retry: delivery is ambiguous after a timeout. Remove this exact coordinator incarnation
-                    // BEFORE making the slot available, so re-driving cannot select it again in a failure loop. A later
-                    // denied acquire may register a responsive coordinator again. If the original grant arrives late,
-                    // that timed-out hand-off can admit at most one extra request.
+                    // No GRANT retry: delivery is ambiguous after a timeout. Resolve waiter membership BEFORE making the
+                    // slot available, so an unchanged registration cannot be selected again in a failure loop. A denial
+                    // that re-registered the coordinator while this grant was pending is preserved as evidence that it
+                    // is responsive again. If the original grant arrives late, that timed-out hand-off can admit at most
+                    // one extra request.
                     logger.debug(
                         "Shared throttle grant to [{}] for bucket [{}] failed; resolving waiter and reclaiming",
                         coordinator.getId(),
@@ -1190,9 +1204,9 @@ public class WorkloadGroupSharedThrottleService implements ClusterStateListener 
         return true;
     }
 
-    // COORDINATOR-SIDE: a grant arrived. Hand the reserved permit to the queue service to admit one queued request; if
-    // there is none (or no consumer wired yet), return the reserved slot — closing the permit releases the permit AND
-    // re-drives owner-push so the owner tries the next waiter (this is how a stale waiter count self-drains).
+    // COORDINATOR-SIDE: a grant arrived. Hand the reserved permit to the queue service to admit one retained request; if
+    // there is none (or no consumer wired yet), return it through the explicit unused-grant release, which also asks the
+    // current owner to deregister this coordinator before re-driving another waiter.
     private void handleGrant(GrantPermitRequest request) {
         consumeGrant(request.bucketKey, request.sharedLimit, request.permitId);
     }
@@ -1222,9 +1236,10 @@ public class WorkloadGroupSharedThrottleService implements ClusterStateListener 
         }
     }
 
-    // Returns an unused reserved slot to its owner, tagging the release so the owner deregisters this coordinator from
-    // the bucket's waiter set (it has no queued request for the bucket) and then re-drives owner-push to the next
-    // waiter. If this node is the owner, does it in-process.
+    // Returns an unused reserved slot to the owner selected by the coordinator's CURRENT ring, tagging the release so
+    // that owner deregisters this coordinator and then re-drives owner-push. If ownership changed since the grant was
+    // issued, the current owner treats an unknown id as a no-op; the former issuer's record remains until release/TTL.
+    // If this node is the current owner, handle the return in-process.
     private void returnUnusedGrant(String bucketKey, String reservedPermitId) {
         final DiscoveryNode owner = ring.get().ownerFor(bucketKey).orElse(null);
         final DiscoveryNode self = clusterService.localNode();
@@ -1246,9 +1261,9 @@ public class WorkloadGroupSharedThrottleService implements ClusterStateListener 
         }
     }
 
-    // A Releasable for a reserved permit, releasing the same way a normal acquired permit does: locally if this node
-    // owns the bucket, else via a RELEASE RPC. Both paths re-drive owner-push (releaseLocal directly; releaseRemote via
-    // the owner's RELEASE handler), so returning an unused grant flows the slot to the next waiter.
+    // A Releasable for a CONSUMED grant. It releases to the owner snapshot selected from this coordinator's ring when the
+    // grant was received: locally if that is this node, otherwise by RELEASE RPC. Unused grants bypass this wrapper and
+    // use returnUnusedGrant so they can carry the waiter-deregistration signal.
     private Releasable reservedPermit(DiscoveryNode owner, String bucketKey, int sharedLimit, String permitId) {
         if (owner == null) {
             return releaseOnce(() -> {}); // ring empty; nothing to release remotely
@@ -1450,9 +1465,9 @@ public class WorkloadGroupSharedThrottleService implements ClusterStateListener 
         final String permitId;
         final long ttlNanos;
         /**
-         * Owner-push: who is asking, and whether they will park the request on denial (so the owner should register a
-         * waiter and later push a grant). Both are ADDED fields — read with {@code optional*} and a safe default, never
-         * {@code require*}, because a peer predating queueing does not send them (see the read policy above).
+         * Owner-push: who is asking, and whether the coordinator already retained the request as PENDING_ACQUIRE and
+         * therefore needs waiter registration on denial. Both are ADDED fields — read with {@code optional*} and a safe
+         * default, never {@code require*}, because a peer predating queueing does not send them (see the read policy above).
          * <p>
          * Only the coordinator's PERSISTENT node id travels, not the {@link DiscoveryNode}: a DiscoveryNode is not in the
          * {@code writeGenericValue} registry so it cannot ride in the map, and the owner does not need the object on the
@@ -1588,8 +1603,9 @@ public class WorkloadGroupSharedThrottleService implements ClusterStateListener 
          * deregisters that coordinator from the bucket's waiter set, since it has no queued request. Empty for a normal
          * release, and empty is also the default when an older peer omits the key.
          * <p>
-         * Persistent node id rather than a {@link DiscoveryNode} for the same reason as {@code requestingNodeId} above,
-         * and rather than an ephemeralId so that registration and deregistration key the waiter set on ONE identity.
+         * The waiter set itself is keyed by exact {@link DiscoveryNode} incarnation. This persistent id is the compact
+         * release hint available on the wire; cleanup scans and removes every matching incarnation, including stale ones
+         * left by a restart.
          */
         final String queueEmptyOnNodeId;
 
@@ -1684,8 +1700,9 @@ public class WorkloadGroupSharedThrottleService implements ClusterStateListener 
     }
 
     /**
-     * {@code owner -> coord}. Grant: a reserved shared permit for a bucket the coordinator is waiting on. Carries the
-     * bucket's shared limit so a returned (unused) grant can re-drive owner-push toward the next waiter.
+     * {@code owner -> coord}. Grant: a reserved shared permit for a bucket the coordinator is waiting on. The historical
+     * wire shape carries {@code sharedLimit}, but return/re-drive accounting resolves the owner's live limit from cluster
+     * state rather than trusting this value.
      */
     public static class GrantPermitRequest extends TransportRequest {
         // Born with the map format, so all three keys are baseline and read strictly.

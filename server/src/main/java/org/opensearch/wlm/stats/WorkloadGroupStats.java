@@ -26,16 +26,22 @@ import java.util.Objects;
 
 /**
  * {
- *     "workloadGroupID": {
- *          "completions": 1233234234,
- *          "rejections": 12,
- *          "failures": 97,
- *          "total_cancellations": 474,
- *          "CPU": { "current_usage": 49.6, "cancellation": 432, "rejections": 8 },
- *          "MEMORY": { "current_usage": 39.6, "cancellation": 42, "rejections": 4 }
- *     },
- *     ...
- *     ...
+ *     "workload_groups": {
+ *         "workloadGroupID": {
+ *             "total_completions": 123,
+ *             "total_rejections": 12,
+ *             "total_cancellations": 4,
+ *             "total_throttled": 7,
+ *             "total_queued": 5,
+ *             "total_queue_rejections": 2,
+ *             "queued_current": 1,
+ *             "queue_peak": 3,
+ *             "total_queue_wait_millis": 80,
+ *             "max_queue_wait_millis": 35,
+ *             "cpu": { "current_usage": 0.49, "cancellations": 3, "rejections": 8 },
+ *             "memory": { "current_usage": 0.39, "cancellations": 1, "rejections": 4 }
+ *         }
+ *     }
  * }
  */
 public class WorkloadGroupStats implements ToXContentObject, Writeable {
@@ -88,8 +94,8 @@ public class WorkloadGroupStats implements ToXContentObject, Writeable {
     }
 
     /**
-     * This is a stats holder object which will hold the data for a workload group at a point in time
-     * the instance will only be created on demand through stats api
+     * This is a best-effort stats snapshot for one workload group. Individual counters are read independently, so a
+     * snapshot racing an update may transiently straddle it. Instances are created on demand through the stats API.
      */
     public static class WorkloadGroupStatsHolder implements ToXContentObject, Writeable {
         public static final String COMPLETIONS = "total_completions";
@@ -113,8 +119,9 @@ public class WorkloadGroupStats implements ToXContentObject, Writeable {
         private long queuedCurrent;
         private long queuePeak;
         // Cumulative parked time and the single-request high-water mark, over the requests that genuinely waited. The
-        // mean is totalQueueWaitMillis / queued: `queued` counts the same population, so it needs no separate
-        // denominator. Populated from WorkloadGroupState in from(...); 0 via the plain constructors.
+        // mean is totalQueueWaitMillis / queued: `queued` represents the same conceptual population, so it needs no
+        // separate denominator. A concurrent snapshot can briefly straddle an update to the independent counters.
+        // Populated from WorkloadGroupState in from(...); 0 via the plain constructors.
         private long totalQueueWaitMillis;
         private long maxQueueWaitMillis;
         private Map<ResourceType, ResourceStats> resourceStats;
@@ -231,11 +238,11 @@ public class WorkloadGroupStats implements ToXContentObject, Writeable {
 
         /**
          * static factory method to convert {@link WorkloadGroupState} into {@link WorkloadGroupStatsHolder}, including
-         * the point-in-time queue depth gauges (which live in the queue service, not the state).
+         * current WAITING depth and the historical WAITING-depth high-water mark (which live in the queue service).
          * @param workloadGroupState which needs to be converted
          * @param queuedCurrent current WAITING depth for this group (excludes provisional owner acquires)
-         * @param queuePeak peak WAITING depth for this group
-         * @return WorkloadGroupStatsHolder object
+         * @param queuePeak peak WAITING depth for this group since its queue was created
+         * @return workload-group stats snapshot
          */
         public static WorkloadGroupStatsHolder from(WorkloadGroupState workloadGroupState, long queuedCurrent, long queuePeak) {
             final WorkloadGroupStatsHolder statsHolder = new WorkloadGroupStatsHolder();
@@ -392,7 +399,7 @@ public class WorkloadGroupStats implements ToXContentObject, Writeable {
         /**
          * static factory method to convert {@link ResourceTypeState} into {@link ResourceStats}
          * @param resourceTypeState which needs to be converted
-         * @return WorkloadGroupStatsHolder object
+         * @return resource stats snapshot
          */
         public static ResourceStats from(ResourceTypeState resourceTypeState) {
             return new ResourceStats(
@@ -403,9 +410,9 @@ public class WorkloadGroupStats implements ToXContentObject, Writeable {
         }
 
         /**
-         * Writes the @param {stats} to @param {out}
+         * Writes {@code stats} to {@code out}.
          * @param out StreamOutput
-         * @param stats WorkloadGroupStatsHolder
+         * @param stats resource stats to write
          * @throws IOException exception
          */
         public static void writeTo(StreamOutput out, ResourceStats stats) throws IOException {

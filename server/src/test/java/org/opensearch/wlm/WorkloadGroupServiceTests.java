@@ -628,7 +628,7 @@ public class WorkloadGroupServiceTests extends OpenSearchTestCase {
         }, e -> { throw new AssertionError("pending queue-drain request failed instead of being admitted", e); })));
     }
 
-    public void testDisablingThrottlingImmediatelyReleasesTheQueuedBacklog() {
+    public void testRemovingFinalThrottleTierSchedulesQueuedBacklogDrain() {
         // Removing the final tier leaves parked requests with no permit source, so the config callback must run them all
         // untracked instead of waiting for the periodic service loop.
         when(mockWorkloadManagementSettings.getWlmMode()).thenReturn(WlmMode.ENABLED);
@@ -648,7 +648,8 @@ public class WorkloadGroupServiceTests extends OpenSearchTestCase {
         assertNull(acquireThrottlePermitSync(workloadGroupService, "wg-1", null));
         assertEquals("two requests should be parked", 2, queueService.currentDepth("wg-1"));
 
-        // Operator disables throttling (and therefore queueing) on the group.
+        // Operator removes the final throttle tier. Queue settings may remain configured, but queueing becomes inert;
+        // any backlog retained under the old admission policy must run without waiting for the periodic service sweep.
         WorkloadGroup unthrottled = new WorkloadGroup(
             "wg-1-name",
             "wg-1",
@@ -657,7 +658,7 @@ public class WorkloadGroupServiceTests extends OpenSearchTestCase {
         );
         deliverWorkloadGroupsChanged(Map.of("wg-1", throttled), Map.of("wg-1", unthrottled));
 
-        assertEquals("the whole backlog must be released as soon as throttling is disabled", 0, queueService.currentDepth("wg-1"));
+        assertEquals("the scheduled policy drain must release the whole backlog", 0, queueService.currentDepth("wg-1"));
     }
 
     public void testDeletingGroupDrainsWaitingAndPendingRequests() {

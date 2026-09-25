@@ -23,12 +23,14 @@ import java.util.concurrent.atomic.AtomicLong;
 /**
  * A bounded, per-coordinator retained-request queue for a single workload group. A node-tier denial enters directly as
  * {@link RequestState#WAITING}. A shared-tier overflow is first registered as
- * {@link RequestState#PENDING_ACQUIRE} before contacting the owner, then either leaves on its own acquire result or
- * transitions to {@code WAITING} if the owner denies it.
+ * {@link RequestState#PENDING_ACQUIRE} before contacting the owner. A direct grant or fail-open result admits that
+ * exact entry; a registered denial attempts to transition it to {@code WAITING}, while an unregistered denial or full
+ * waiting bucket rejects it.
  * <p>
- * The queue is partitioned into a per-bucket FIFO ({@code byBucket}) so a permit freed for one bucket wakes a request
- * retained on that same bucket, and a heavily queued bucket cannot head-of-line-block another. Capacity has two
- * distinct meanings:
+ * The queue is partitioned into per-bucket insertion order ({@code byBucket}) so a permit freed for one bucket wakes a
+ * request retained on that same bucket, and a heavily queued bucket cannot head-of-line-block another. Pushed grants
+ * and node-tier drains take the oldest retained request; the exact result of a request's own shared acquire may remove
+ * that provisional request from the middle. Capacity has two distinct meanings:
  * <ul>
  *   <li>{@code queue.size_per_bucket} bounds only {@code WAITING} entries in one bucket;</li>
  *   <li>{@link WorkloadGroupQueueSettings#MAX_GROUP_QUEUE_DEPTH} bounds
@@ -165,14 +167,14 @@ public class WorkloadGroupQueue {
      *       {@link WorkloadGroupQueueSettings#MAX_GROUP_QUEUE_DEPTH} pending plus waiting requests.</li>
      * </ol>
      * {@code sizePerBucket} is passed per call (not stored) so a live {@code queue.size_per_bucket} change takes effect
-     * immediately: a decrease stops admitting to a bucket once it is at/above the new cap (already-parked requests are
+     * immediately: a decrease stops admitting to a bucket once it is at/above the new cap (existing WAITING requests are
      * not evicted); an increase widens capacity at once.
      * <p>
      * The per-bucket depth is read (not created) before reserving the shared group counter, so a group-ceiling rejection
      * never leaves an empty bucket set behind — preserving the invariant that a present bucket key has a retained
      * request.
      *
-     * @param req           the request to park
+     * @param req           the WAITING request to retain
      * @param sizePerBucket the group's <em>current</em> {@code queue.size_per_bucket}
      * @return {@code true} if the request was enqueued, {@code false} if rejected (disabled / bucket full / group full)
      */
@@ -197,8 +199,8 @@ public class WorkloadGroupQueue {
 
     /**
      * Registers a provisional shared-tier acquire. It consumes only the fixed per-group retained-request budget; the
-     * user-facing per-bucket waiting budget is reserved later by {@link #transitionToWaiting} if the owner denies.
-     * Must be called while holding the per-bucket lock for {@code req.bucketKey}.
+     * user-facing per-bucket waiting budget is reserved later by {@link #transitionToWaiting} if a registered owner
+     * denial is accepted. Must be called while holding the per-bucket lock for {@code req.bucketKey}.
      */
     boolean offerPendingAcquire(QueuedRequest req) {
         if (reserveRetainedSlot() == false) {
@@ -265,8 +267,9 @@ public class WorkloadGroupQueue {
     }
 
     /**
-     * Removes a specific parked request from its bucket (used on cancellation/eviction). Must be called while holding
-     * the per-bucket lock. Returns {@code true} if it was present and removed (in which case depth is decremented).
+     * Removes a specific retained request from its bucket (used for an exact acquire result or cancellation/eviction).
+     * Must be called while holding the per-bucket lock. Returns {@code true} if it was present and removed; retained
+     * depth is always decremented, and WAITING depth is decremented when applicable.
      * O(1) average — this is the hot path under a cancellation storm, so the bucket is a {@link LinkedHashSet} rather
      * than a deque (whose {@code remove(Object)} would be O(n), making a mass cancel on one bucket O(n^2)).
      */
@@ -283,7 +286,7 @@ public class WorkloadGroupQueue {
         return removed;
     }
 
-    /** Snapshot of the bucket keys that currently have at least one retained request. */
+    /** Live concurrent-map view of bucket keys that currently have at least one retained request. */
     Set<String> bucketKeys() {
         return byBucket.keySet();
     }

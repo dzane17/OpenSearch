@@ -1435,8 +1435,9 @@ public class Node implements Closeable {
             );
             workloadGroupService.setSharedThrottleService(workloadGroupSharedThrottleService);
 
-            // Coordinator-local request queues: park a throttle-denied search instead of rejecting it, and admit it
-            // when a permit frees (node-completion drain, owner-push grant, or the WorkloadGroupService backstop sweep).
+            // Coordinator-local retained requests: node-tier denials enter WAITING; shared-tier requests enter
+            // PENDING_ACQUIRE before the owner verdict and transition to WAITING only after a registered denial. They are
+            // admitted by node-permit handoff/recovery, owner-pushed shared grants, or live-configuration drains.
             final WorkloadGroupQueueService workloadGroupQueueService = new WorkloadGroupQueueService(
                 threadPool,
                 workloadGroupsStateAccessor

@@ -16,7 +16,8 @@ import java.util.Map;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
- * This class will keep the point in time view of the workload group stats
+ * Mutable node-local workload-group metrics. Most fields are cumulative counters since process start; resource usage is
+ * the latest sampled value, and queue high-water marks are historical maxima. The stats API snapshots this state.
  */
 public class WorkloadGroupState {
     /**
@@ -40,29 +41,33 @@ public class WorkloadGroupState {
     public final CounterMetric totalCancellations = new CounterMetric();
 
     /**
-     * This will track the cumulative requests throttled (rejected by the node-level in-flight throttle) in the workload group since the OpenSearch start time
+     * Cumulative requests rejected by an enforced node- or shared-tier throttle after they could not be retained for
+     * later admission, including disabled/full queues and failed shared-waiter registration.
      */
     public final CounterMetric totalThrottled = new CounterMetric();
 
     /**
-     * Cumulative requests that <em>waited</em> in the workload group's request queue for capacity to free, since the
-     * OpenSearch start time. Counted when such a request is admitted, by {@link #recordQueueWaitMillis}.
+     * Cumulative requests that completed a {@code WAITING} interval in the workload group's request queue, since the
+     * OpenSearch start time. Counted when an entry is selected and dequeued for admission, by
+     * {@link #recordQueueWaitMillis}.
      * <p>
      * This deliberately does NOT count every request retained by the queue service. A shared-tier request first enters
-     * {@code PENDING_ACQUIRE} before the owner's verdict, solely to close the grant-before-registration race. Only an
-     * owner denial transitions the exact entry to {@code WAITING}; direct grants and fail-open outcomes leave from
-     * {@code PENDING_ACQUIRE} and are excluded here.
+     * {@code PENDING_ACQUIRE} before the owner's verdict, solely to close the grant-before-registration race. Only a
+     * registered owner denial that fits the bucket cap transitions the exact entry to {@code WAITING}; direct grants,
+     * fail-open outcomes, unregistered denials, and full-bucket denials leave without a recorded wait.
      * <p>
-     * Incremented at the same site as {@link #totalQueueWaitMillis}, which is what makes it a sound denominator for mean
-     * queue wait: one increment per recorded wait sample, so the two cannot drift apart.
+     * Incremented by the same method as {@link #totalQueueWaitMillis}, so both counters describe the same conceptual
+     * sample population. They are independent atomics, so a concurrent stats snapshot can transiently observe one update
+     * before the other.
      * <p>
-     * Two things it therefore does not include, both by design: a request that is denied and still parked right now (it
-     * has not finished waiting — see {@code queued_current}), and one cancelled or evicted before ever being admitted.
+     * It excludes a request still in {@code WAITING} (see {@code queued_current}) and one cancelled/evicted before
+     * dequeue. A cancellation that wins the final post-dequeue check is still counted because its queue wait ended.
      */
     public final CounterMetric totalQueued = new CounterMetric();
 
     /**
-     * Cumulative requests rejected because the workload group's request queue was full, since the OpenSearch start time.
+     * Cumulative requests rejected because the workload group's per-bucket waiting cap or fixed per-group retained
+     * request cap was full, since the OpenSearch start time.
      */
     public final CounterMetric totalQueueRejections = new CounterMetric();
 
@@ -70,16 +75,17 @@ public class WorkloadGroupState {
      * Cumulative time (in millis) that WAITING requests spent parked in the queue. Divide by
      * {@link #totalQueued} for the mean wait; use {@link #maxQueueWaitMillis} for the tail.
      * <p>
-     * The wait clock starts on the PENDING_ACQUIRE -> WAITING transition, not when the provisional entry is registered,
-     * so owner round-trip latency is never reported as queue latency.
+     * For a shared-tier request, the wait clock starts on the PENDING_ACQUIRE -> WAITING transition rather than when the
+     * provisional entry is registered, so owner round-trip latency is never reported as queue latency. A node-tier
+     * request enters WAITING directly and starts its clock when enqueued.
      * <p>
-     * {@link #totalQueued} is incremented by the same call, so sum and count always describe exactly the same set of
-     * requests and the mean is well-formed whenever the count is non-zero.
+     * {@link #totalQueued} is incremented by the same call, so sum and count converge on the same set of requests. A
+     * snapshot racing that call may briefly observe only one of the two independent atomic updates.
      */
     public final CounterMetric totalQueueWaitMillis = new CounterMetric();
 
     /**
-     * High-water mark (in millis) of any single admitted request's queue wait, since the OpenSearch start time.
+     * High-water mark (in millis) of any completed {@code WAITING} interval, since the OpenSearch start time.
      */
     private final AtomicLong maxQueueWaitMillis = new AtomicLong(0);
 
@@ -135,7 +141,7 @@ public class WorkloadGroupState {
 
     /**
      *
-     * @return requests that had to wait in the workload group's request queue for a permit to free
+     * @return requests that completed a WAITING interval in the workload group's request queue
      */
     public long getTotalQueued() {
         return totalQueued.count();
@@ -150,13 +156,14 @@ public class WorkloadGroupState {
     }
 
     /**
-     * Records one request finishing a genuine wait in the queue: counts it in {@link #totalQueued}, adds its wait to the
-     * cumulative sum, and advances the high-water mark. Called once per admission that the request did not supply itself.
+     * Records one completed {@code WAITING} interval: counts it in {@link #totalQueued}, adds its wait to the cumulative
+     * sum, and advances the high-water mark. Called once when a WAITING entry is selected and dequeued for admission.
      * <p>
-     * All three move together here ON PURPOSE. This is the single site that can observe "a request waited and has now
-     * been admitted", so making it the only writer of {@link #totalQueued} is what makes sum-over-count a sound mean:
-     * there is no interleaving in which one advances without the other. Splitting the count out to the throttle-denial
-     * signal instead looks equivalent but is not — see the note on {@link #totalQueued}.
+     * All three are updated by this one method ON PURPOSE. This is the single site that can observe "a request's queue
+     * wait ended", so making it the only writer of {@link #totalQueued} keeps their eventual sample population aligned.
+     * The fields are independent atomics rather than a transactional snapshot, so a concurrent stats read can briefly
+     * straddle one update. Splitting the count out to the throttle-denial signal instead looks equivalent but is not —
+     * see the note on {@link #totalQueued}.
      *
      * @param waitMillis how long the request was parked, in millis (negative values are clamped to 0 for clock skew)
      */

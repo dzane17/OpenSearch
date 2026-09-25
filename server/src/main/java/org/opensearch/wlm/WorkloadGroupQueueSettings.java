@@ -25,7 +25,8 @@ import java.util.Map;
  * ({@code node_limit}, {@code shared_limit}) are themselves per-bucket. {@code 0} disables queueing (immediate reject
  * preserved). A shared-tier request is provisionally retained as {@code PENDING_ACQUIRE} before the owner RPC so an
  * early pushed grant cannot race ahead of local registration; that provisional state does not consume this configured
- * waiting budget. Only an owner denial transitions the exact request to {@code WAITING} and reserves a bucket slot.
+ * waiting budget. A registered owner denial attempts to transition the exact request to {@code WAITING} and reserve a
+ * bucket slot; an unregistered denial or full waiting bucket rejects that exact request instead.
  * Keying the cap per bucket gives fairness for {@code attribute=username}/{@code role}: one principal's denied backlog
  * cannot consume another principal's per-bucket allowance. That fairness is bounded rather than absolute — see the
  * group ceiling below. For {@code attribute=group} there is a single bucket, so this is the group's waiting depth.
@@ -38,14 +39,15 @@ import java.util.Map;
  * {@link #MAX_SIZE_PER_BUCKET} is pinned to the same value, so validation never accepts a per-bucket waiting depth the
  * group ceiling could never honour.
  * <p>
- * There is deliberately <b>no user-facing queue timeout</b>, and no timeout of any kind. Legitimate queue wait is
- * unbounded — it grows with backlog depth over drain throughput — so any fixed wall-clock cap would eventually cancel
- * healthy, still-connected requests under a large slow burst. A client bounds its own wait with
+ * There is deliberately <b>no wall-clock timeout for WAITING entries</b>. Legitimate queue wait is unbounded — it grows
+ * with backlog depth over drain throughput — so any fixed cap would eventually cancel healthy, still-connected
+ * requests under a large slow burst. {@code PENDING_ACQUIRE} remains subject to the shared-owner acquire timeout. A
+ * client bounds its own queue wait with
  * {@code cancel_after_time_interval} (per request, or the {@code search.cancel_after_time_interval} cluster setting):
  * its cancellation timer is armed before throttle admission, so it fires while the request is parked and evicts the
  * entry promptly. A parked request is therefore bounded only by task cancellation (client disconnect or
- * {@code cancel_after_time_interval}); the queue itself never expires an entry by time — the backstop sweep only
- * removes entries whose task is already cancelled.
+ * {@code cancel_after_time_interval}); the queue itself never expires an entry by time. Cancellation callbacks remove
+ * cancelled entries, and admission defensively re-checks cancellation after dequeueing.
  */
 @ExperimentalApi
 public class WorkloadGroupQueueSettings {
