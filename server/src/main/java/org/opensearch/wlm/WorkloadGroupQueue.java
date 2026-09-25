@@ -12,11 +12,8 @@ import org.opensearch.common.annotation.ExperimentalApi;
 import org.opensearch.common.lease.Releasable;
 import org.opensearch.core.action.ActionListener;
 
-import java.util.ArrayList;
-import java.util.Collections;
 import java.util.Iterator;
 import java.util.LinkedHashSet;
-import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
@@ -24,35 +21,50 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
- * A bounded, per-coordinator request queue for a single workload group. When a search is denied by a throttle limit,
- * instead of an immediate 429 the coordinator parks it here and admits it once a permit frees (node-tier completion or
- * a cluster-tier owner grant).
+ * A bounded, per-coordinator retained-request queue for a single workload group. A node-tier denial enters directly as
+ * {@link RequestState#WAITING}. A shared-tier overflow is first registered as
+ * {@link RequestState#PENDING_ACQUIRE} before contacting the owner, then either leaves on its own acquire result or
+ * transitions to {@code WAITING} if the owner denies it.
  * <p>
  * The queue is partitioned into a per-bucket FIFO ({@code byBucket}) so a permit freed for one bucket wakes a request
- * waiting on that same bucket, and a heavily-queued bucket cannot head-of-line-block another. Capacity is bounded on
- * two axes (see {@link #offer}): a per-bucket cap ({@code queue.size_per_bucket}, for cross-principal fairness) and a
- * fixed per-group total ({@link WorkloadGroupQueueSettings#MAX_GROUP_QUEUE_DEPTH}, a footprint backstop). A parked
- * request holds no thread — only its {@link ActionListener} and open client connection — so the queue's footprint
- * (heap + sockets) is what those two limits bound; {@code depth} tracks the group total for the fixed ceiling.
+ * retained on that same bucket, and a heavily queued bucket cannot head-of-line-block another. Capacity has two
+ * distinct meanings:
+ * <ul>
+ *   <li>{@code queue.size_per_bucket} bounds only {@code WAITING} entries in one bucket;</li>
+ *   <li>{@link WorkloadGroupQueueSettings#MAX_GROUP_QUEUE_DEPTH} bounds
+ *       {@code PENDING_ACQUIRE + WAITING} across the whole group.</li>
+ * </ul>
+ * A retained request holds no thread — only its {@link ActionListener}, task, and open client connection.
  * <p>
- * Thread-safety: {@code depth} is a shared {@link AtomicInteger}; each bucket's {@link LinkedHashSet} is guarded by the
- * caller holding this group's per-bucket lock (a {@code KeyedLock} in {@link WorkloadGroupQueueService}). Callers must
- * never invoke a parked listener while holding that lock.
+ * Thread-safety: the group counters are atomics; each bucket's request set and waiting count are guarded by the caller
+ * holding this group's per-bucket lock (a {@code KeyedLock} in {@link WorkloadGroupQueueService}). Callers must never
+ * invoke a retained listener while holding that lock.
  * <p>
- * Each bucket's container is a {@link LinkedHashSet}: insertion order gives the per-bucket FIFO (head = oldest), while
- * membership-based removal is O(1) average. This matters because a request can be removed from the middle on
- * cancellation ({@link #remove}); an {@code ArrayDeque} would make that O(n), so a mass-cancellation storm on one
- * bucket (each cancel firing an independent remove) would be O(n^2). {@link QueuedRequest} has no {@code equals}/
- * {@code hashCode} override, so identity semantics hold and distinct requests never collide.
+ * Each bucket's container is a {@link LinkedHashSet}: insertion order gives pushed-grant and node-drain paths a FIFO
+ * head, while membership-based removal is O(1) average. Exact acquire results and cancellation can remove a request
+ * from the middle; an {@code ArrayDeque} would make that O(n), so a mass-cancellation storm on one bucket would be
+ * O(n^2). {@link QueuedRequest} has no {@code equals}/{@code hashCode} override, so identity semantics hold and
+ * distinct requests never collide.
  */
 @ExperimentalApi
 public class WorkloadGroupQueue {
 
+    enum RequestState {
+        PENDING_ACQUIRE,
+        WAITING
+    }
+
+    enum WaitingTransition {
+        WAITING,
+        REQUEST_GONE,
+        BUCKET_FULL
+    }
+
     /**
-     * A parked request: the held listener (already context-preserving, wrapped upstream), its bucket key, the owning
-     * task, and the handle that deregisters its task-cancellation callback once it is admitted or evicted.
+     * A retained request: the held listener (already context-preserving, wrapped upstream), its bucket key, the owning
+     * task, current state, and the handle that deregisters its task-cancellation callback once it leaves the queue.
      * <p>
-     * A parked request has no wall-clock deadline. There is deliberately no queue timeout: legitimate queue wait is
+     * A waiting request has no wall-clock deadline. There is deliberately no queue timeout: legitimate queue wait is
      * unbounded (it grows with backlog depth over throughput), so any fixed cap would eventually cancel healthy,
      * still-connected requests under a large slow burst. A client bounds its own wait with
      * {@code cancel_after_time_interval} (or a disconnect); either cancels the task, which evicts the entry promptly.
@@ -62,17 +74,33 @@ public class WorkloadGroupQueue {
         final ActionListener<Releasable> listener;
         final String bucketKey;
         final WorkloadGroupTask task;
-        // Relative-clock instant (nanos) the request was parked, for observability (queue-wait metric). Stable across
-        // the request's queue lifetime — the request is never re-parked, so this is the true total-wait basis.
-        final long enqueueNanos;
+        volatile RequestState state;
+        // Relative-clock instant (nanos) at which the request entered WAITING. A provisional PENDING_ACQUIRE has no
+        // queue-wait start: owner round-trip time is not denied-backlog latency.
+        volatile long waitStartNanos;
         // Set after construction (the callback needs the enqueued reference); deregisters the cancellation callback.
         volatile Releasable cancellationHandle;
 
-        public QueuedRequest(ActionListener<Releasable> listener, String bucketKey, WorkloadGroupTask task, long enqueueNanos) {
+        public QueuedRequest(ActionListener<Releasable> listener, String bucketKey, WorkloadGroupTask task, long waitStartNanos) {
+            this(listener, bucketKey, task, RequestState.WAITING, waitStartNanos);
+        }
+
+        private QueuedRequest(
+            ActionListener<Releasable> listener,
+            String bucketKey,
+            WorkloadGroupTask task,
+            RequestState state,
+            long waitStartNanos
+        ) {
             this.listener = listener;
             this.bucketKey = bucketKey;
             this.task = task;
-            this.enqueueNanos = enqueueNanos;
+            this.state = state;
+            this.waitStartNanos = waitStartNanos;
+        }
+
+        static QueuedRequest pendingAcquire(ActionListener<Releasable> listener, String bucketKey, WorkloadGroupTask task) {
+            return new QueuedRequest(listener, bucketKey, task, RequestState.PENDING_ACQUIRE, 0L);
         }
 
         public ActionListener<Releasable> listener() {
@@ -87,9 +115,21 @@ public class WorkloadGroupQueue {
             return task;
         }
 
-        /** Time parked so far, in nanos, as of {@code nowNanos} (relative clock). Never negative. */
+        boolean isWaiting() {
+            return state == RequestState.WAITING;
+        }
+
+        void transitionToWaiting(long nowNanos) {
+            state = RequestState.WAITING;
+            waitStartNanos = nowNanos;
+        }
+
+        /** Time spent in WAITING so far, in nanos, as of {@code nowNanos} (relative clock). Never negative. */
         long waitNanos(long nowNanos) {
-            long w = nowNanos - enqueueNanos;
+            if (isWaiting() == false) {
+                return 0L;
+            }
+            long w = nowNanos - waitStartNanos;
             return w < 0 ? 0 : w;
         }
 
@@ -101,32 +141,36 @@ public class WorkloadGroupQueue {
         }
     }
 
-    private final Map<String, LinkedHashSet<QueuedRequest>> byBucket = new ConcurrentHashMap<>();
-    private final AtomicInteger depth = new AtomicInteger(0);
-    private final AtomicLong peak = new AtomicLong(0);
+    private static class BucketQueue {
+        final LinkedHashSet<QueuedRequest> requests = new LinkedHashSet<>();
+        int waitingDepth;
+    }
+
+    private final Map<String, BucketQueue> byBucket = new ConcurrentHashMap<>();
+    private final AtomicInteger retainedDepth = new AtomicInteger(0);
+    private final AtomicInteger waitingDepth = new AtomicInteger(0);
+    private final AtomicLong peakWaitingDepth = new AtomicLong(0);
 
     public WorkloadGroupQueue() {}
 
     /**
-     * Attempts to park a request. Must be called while holding the per-bucket lock for {@code req.bucketKey}. Enforces
-     * TWO limits and returns {@code false} (the caller then rejects with a 429) if either is hit:
+     * Attempts to insert a request that is already known to be waiting (the node-tier path). Must be called while
+     * holding the per-bucket lock for {@code req.bucketKey}. Enforces two limits and returns {@code false} if either is
+     * hit:
      * <ol>
-     *   <li><b>per-bucket</b> — the request's own bucket already holds {@code sizePerBucket} parked requests
+     *   <li><b>per-bucket</b> — the request's own bucket already holds {@code sizePerBucket} waiting requests
      *       ({@code sizePerBucket <= 0} means queueing is disabled). This is the user-facing {@code queue.size_per_bucket}
-     *       knob, giving cross-principal fairness <em>while the group total is below the ceiling</em>: one bucket cannot
-     *       consume another's per-bucket capacity. Note the fairness is bounded, not absolute — once the group total
-     *       reaches the ceiling below, admission is first-come-first-served across buckets, so a high-cardinality flood
-     *       can still crowd out a well-behaved bucket that has not yet filled its own allowance.</li>
-     *   <li><b>per-group total</b> — the group already holds {@link WorkloadGroupQueueSettings#MAX_GROUP_QUEUE_DEPTH}
-     *       parked requests across all buckets on this coordinator. A fixed, non-configurable footprint backstop against
-     *       attacker-controlled bucket cardinality (username/role buckets are derived from the request principal).</li>
+     *       knob, giving cross-principal fairness.</li>
+     *   <li><b>per-group retained total</b> — the group already holds
+     *       {@link WorkloadGroupQueueSettings#MAX_GROUP_QUEUE_DEPTH} pending plus waiting requests.</li>
      * </ol>
      * {@code sizePerBucket} is passed per call (not stored) so a live {@code queue.size_per_bucket} change takes effect
      * immediately: a decrease stops admitting to a bucket once it is at/above the new cap (already-parked requests are
      * not evicted); an increase widens capacity at once.
      * <p>
      * The per-bucket depth is read (not created) before reserving the shared group counter, so a group-ceiling rejection
-     * never leaves an empty bucket set behind — preserving the invariant that a present bucket key has a live waiter.
+     * never leaves an empty bucket set behind — preserving the invariant that a present bucket key has a retained
+     * request.
      *
      * @param req           the request to park
      * @param sizePerBucket the group's <em>current</em> {@code queue.size_per_bucket}
@@ -137,84 +181,87 @@ public class WorkloadGroupQueue {
             return false; // queueing disabled
         }
         // Per-bucket cap. Read under this bucket's lock (held by the caller), so the bucket set is stable for this key.
-        LinkedHashSet<QueuedRequest> existing = byBucket.get(req.bucketKey);
-        if (existing != null && existing.size() >= sizePerBucket) {
+        BucketQueue existing = byBucket.get(req.bucketKey);
+        if (existing != null && existing.waitingDepth >= sizePerBucket) {
             return false; // this bucket's queue is full
         }
-        // Fixed per-group backstop on the TOTAL across all buckets. Reserve first; only touch the bucket set once the
-        // slot is secured, so the set and the depth counter never disagree (and no empty set is left on rejection).
-        int updated = depth.incrementAndGet();
-        if (updated > WorkloadGroupQueueSettings.MAX_GROUP_QUEUE_DEPTH) {
-            depth.decrementAndGet();
-            return false; // group-wide ceiling hit
+        if (reserveRetainedSlot() == false) {
+            return false;
         }
-        peak.accumulateAndGet(updated, Math::max);
-        byBucket.computeIfAbsent(req.bucketKey, k -> new LinkedHashSet<>()).add(req);
+        BucketQueue bucket = byBucket.computeIfAbsent(req.bucketKey, k -> new BucketQueue());
+        bucket.requests.add(req);
+        bucket.waitingDepth++;
+        recordWaitingAdded();
         return true;
     }
 
     /**
-     * Returns the oldest parked request for {@code bucketKey} without removing it, or {@code null} if none. Must be
+     * Registers a provisional shared-tier acquire. It consumes only the fixed per-group retained-request budget; the
+     * user-facing per-bucket waiting budget is reserved later by {@link #transitionToWaiting} if the owner denies.
+     * Must be called while holding the per-bucket lock for {@code req.bucketKey}.
+     */
+    boolean offerPendingAcquire(QueuedRequest req) {
+        if (reserveRetainedSlot() == false) {
+            return false;
+        }
+        byBucket.computeIfAbsent(req.bucketKey, k -> new BucketQueue()).requests.add(req);
+        return true;
+    }
+
+    /**
+     * Converts the exact provisional request to WAITING after an owner denial. If the bucket's configured waiting
+     * capacity is already full, removes this exact request while retaining all existing waiters.
+     */
+    WaitingTransition transitionToWaiting(QueuedRequest req, int sizePerBucket, long nowNanos) {
+        BucketQueue bucket = byBucket.get(req.bucketKey);
+        if (bucket == null || bucket.requests.contains(req) == false) {
+            return WaitingTransition.REQUEST_GONE;
+        }
+        if (req.isWaiting()) {
+            return WaitingTransition.WAITING;
+        }
+        if (sizePerBucket <= 0 || bucket.waitingDepth >= sizePerBucket) {
+            removePresent(bucket, req);
+            pruneIfEmpty(req.bucketKey, bucket);
+            return WaitingTransition.BUCKET_FULL;
+        }
+        req.transitionToWaiting(nowNanos);
+        bucket.waitingDepth++;
+        recordWaitingAdded();
+        return WaitingTransition.WAITING;
+    }
+
+    /**
+     * Returns the oldest retained request for {@code bucketKey} without removing it, or {@code null} if none. Must be
      * called while holding the per-bucket lock.
      */
     QueuedRequest peekOldest(String bucketKey) {
-        LinkedHashSet<QueuedRequest> bucket = byBucket.get(bucketKey);
+        BucketQueue bucket = byBucket.get(bucketKey);
         if (bucket == null) {
             return null;
         }
-        Iterator<QueuedRequest> it = bucket.iterator();
+        Iterator<QueuedRequest> it = bucket.requests.iterator();
         return it.hasNext() ? it.next() : null; // head = oldest (insertion order)
     }
 
     /**
-     * Removes and returns the oldest parked request for {@code bucketKey}, or {@code null} if none. Must be called
-     * while holding the per-bucket lock. Decrements the shared depth and prunes the bucket entry when it empties.
+     * Removes and returns the oldest retained request for {@code bucketKey}, or {@code null} if none. Must be called
+     * while holding the per-bucket lock. Updates both retained and waiting counts and prunes an empty bucket.
      */
     QueuedRequest pollOldest(String bucketKey) {
-        LinkedHashSet<QueuedRequest> bucket = byBucket.get(bucketKey);
+        BucketQueue bucket = byBucket.get(bucketKey);
         if (bucket == null) {
             return null;
         }
-        Iterator<QueuedRequest> it = bucket.iterator();
+        Iterator<QueuedRequest> it = bucket.requests.iterator();
         QueuedRequest req = null;
         if (it.hasNext()) {
             req = it.next(); // head = oldest (insertion order)
             it.remove();
-            depth.decrementAndGet();
+            recordRemoved(bucket, req);
         }
-        if (bucket.isEmpty()) {
-            byBucket.remove(bucketKey);
-        }
+        pruneIfEmpty(bucketKey, bucket);
         return req;
-    }
-
-    /**
-     * Removes and returns every parked request in {@code bucketKey} whose task is cancelled, leaving all survivors in
-     * place. Must be called while holding the per-bucket lock. Depth is decremented for each removed request.
-     * <p>
-     * This is the backstop sweep's cleanup: a defense-in-depth complement to the per-request cancellation callback
-     * (which normally evicts a cancelled entry immediately), catching any cancelled task the callback missed. There is
-     * no time-based eviction — a still-live parked request is never removed here regardless of how long it has waited;
-     * a corrupt/dead but uncancelled entry self-heals when it drains to the head and fails on execution.
-     */
-    List<QueuedRequest> evictCancelled(String bucketKey) {
-        LinkedHashSet<QueuedRequest> bucket = byBucket.get(bucketKey);
-        if (bucket == null) {
-            return Collections.emptyList();
-        }
-        List<QueuedRequest> evicted = new ArrayList<>();
-        for (Iterator<QueuedRequest> it = bucket.iterator(); it.hasNext();) {
-            QueuedRequest req = it.next();
-            if (req.task().isCancelled()) {
-                it.remove();
-                depth.decrementAndGet();
-                evicted.add(req);
-            }
-        }
-        if (bucket.isEmpty()) {
-            byBucket.remove(bucketKey);
-        }
-        return evicted;
     }
 
     /**
@@ -224,30 +271,66 @@ public class WorkloadGroupQueue {
      * than a deque (whose {@code remove(Object)} would be O(n), making a mass cancel on one bucket O(n^2)).
      */
     boolean remove(QueuedRequest req) {
-        LinkedHashSet<QueuedRequest> bucket = byBucket.get(req.bucketKey);
+        BucketQueue bucket = byBucket.get(req.bucketKey);
         if (bucket == null) {
             return false;
         }
-        boolean removed = bucket.remove(req);
+        boolean removed = bucket.requests.remove(req);
         if (removed) {
-            depth.decrementAndGet();
+            recordRemoved(bucket, req);
         }
-        if (bucket.isEmpty()) {
-            byBucket.remove(req.bucketKey);
-        }
+        pruneIfEmpty(req.bucketKey, bucket);
         return removed;
     }
 
-    /** Snapshot of the bucket keys that currently have at least one parked request. */
+    /** Snapshot of the bucket keys that currently have at least one retained request. */
     Set<String> bucketKeys() {
         return byBucket.keySet();
     }
 
     int currentDepth() {
-        return depth.get();
+        return retainedDepth.get();
+    }
+
+    int currentWaitingDepth() {
+        return waitingDepth.get();
     }
 
     long peakDepth() {
-        return peak.get();
+        return peakWaitingDepth.get();
+    }
+
+    private boolean reserveRetainedSlot() {
+        int updated = retainedDepth.incrementAndGet();
+        if (updated > WorkloadGroupQueueSettings.MAX_GROUP_QUEUE_DEPTH) {
+            retainedDepth.decrementAndGet();
+            return false;
+        }
+        return true;
+    }
+
+    private void recordWaitingAdded() {
+        int updated = waitingDepth.incrementAndGet();
+        peakWaitingDepth.accumulateAndGet(updated, Math::max);
+    }
+
+    private void removePresent(BucketQueue bucket, QueuedRequest req) {
+        if (bucket.requests.remove(req)) {
+            recordRemoved(bucket, req);
+        }
+    }
+
+    private void recordRemoved(BucketQueue bucket, QueuedRequest req) {
+        retainedDepth.decrementAndGet();
+        if (req.isWaiting()) {
+            bucket.waitingDepth--;
+            waitingDepth.decrementAndGet();
+        }
+    }
+
+    private void pruneIfEmpty(String bucketKey, BucketQueue bucket) {
+        if (bucket.requests.isEmpty()) {
+            byBucket.remove(bucketKey, bucket);
+        }
     }
 }

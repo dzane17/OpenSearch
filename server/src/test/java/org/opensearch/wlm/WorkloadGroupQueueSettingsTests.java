@@ -75,6 +75,7 @@ public class WorkloadGroupQueueSettingsTests extends OpenSearchTestCase {
     public void testMaxSizePerBucketIsPinnedToGroupCeiling() {
         // Invariant: the configurable per-bucket cap can never exceed the fixed per-group ceiling, otherwise validation
         // would accept a depth the group total could never honour.
+        assertEquals(1_000, WorkloadGroupQueueSettings.MAX_GROUP_QUEUE_DEPTH);
         assertEquals(WorkloadGroupQueueSettings.MAX_GROUP_QUEUE_DEPTH, WorkloadGroupQueueSettings.MAX_SIZE_PER_BUCKET);
     }
 

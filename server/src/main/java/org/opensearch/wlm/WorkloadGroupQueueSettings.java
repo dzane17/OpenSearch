@@ -20,24 +20,23 @@ import java.util.Map;
  * absent key keeps the existing value with no extra bookkeeping.
  * <p>
  * When a request is denied by a throttle limit, instead of an immediate 429 the coordinator may park it in a bounded
- * queue and admit it once a permit frees. The single user-facing knob is {@code size_per_bucket}: the maximum parked
- * requests <em>per throttle bucket</em> (per coordinator), mirroring how the throttle limits ({@code node_limit},
- * {@code shared_limit}) are themselves per-bucket. {@code 0} disables queueing (immediate reject preserved). Keying the
- * cap per bucket gives fairness for {@code attribute=username}/{@code role}: one principal's flood cannot consume
- * another principal's per-bucket allowance. That fairness is bounded rather than absolute — see the group ceiling below,
- * at which admission reverts to first-come-first-served across buckets. For {@code attribute=group} there is a single
- * bucket, so it is simply the group's queue depth.
+ * queue and admit it once a permit frees. The single user-facing knob is {@code size_per_bucket}: the maximum
+ * <em>denied and waiting</em> requests per throttle bucket (per coordinator), mirroring how the throttle limits
+ * ({@code node_limit}, {@code shared_limit}) are themselves per-bucket. {@code 0} disables queueing (immediate reject
+ * preserved). A shared-tier request is provisionally retained as {@code PENDING_ACQUIRE} before the owner RPC so an
+ * early pushed grant cannot race ahead of local registration; that provisional state does not consume this configured
+ * waiting budget. Only an owner denial transitions the exact request to {@code WAITING} and reserves a bucket slot.
+ * Keying the cap per bucket gives fairness for {@code attribute=username}/{@code role}: one principal's denied backlog
+ * cannot consume another principal's per-bucket allowance. That fairness is bounded rather than absolute — see the
+ * group ceiling below. For {@code attribute=group} there is a single bucket, so this is the group's waiting depth.
  * <p>
- * Above the per-bucket cap sits a fixed, non-configurable per-group ceiling ({@link #MAX_GROUP_QUEUE_DEPTH}) on the
- * <em>total</em> parked requests across all of a group's buckets on one coordinator. It is a safety backstop, not a
- * fairness knob: because bucket keys for {@code username}/{@code role} are attacker-controlled (derived from the request
- * principal), a purely per-bucket cap would let unbounded distinct principals each allocate {@code size_per_bucket}
- * slots, so the group ceiling bounds the coordinator's parked footprint (heap + open connections) regardless of bucket
- * cardinality. {@link #MAX_SIZE_PER_BUCKET} is pinned to the same value, so validation never accepts a per-bucket depth
- * the ceiling could not honour: a single-bucket group ({@code attribute=group}) may queue the whole group budget in its
- * one bucket, while a many-bucket group reaches the ceiling first — the intended shed point, where a 429 is the correct
- * response. See {@code WorkloadGroupQueue} for enforcement (a request is admitted only if both its bucket is under
- * {@code size_per_bucket} AND the group total is under this ceiling).
+ * Above the per-bucket cap sits a fixed, non-configurable per-group ceiling ({@link #MAX_GROUP_QUEUE_DEPTH}) on every
+ * retained request across all of a group's buckets on one coordinator:
+ * {@code PENDING_ACQUIRE[group] + WAITING[group] <= MAX_GROUP_QUEUE_DEPTH}. It is a safety backstop, not a fairness
+ * knob. It bounds both an extreme burst of in-flight shared-owner acquires and the denied backlog created by
+ * attacker-controlled bucket cardinality. There is deliberately no node-wide retained-request cap.
+ * {@link #MAX_SIZE_PER_BUCKET} is pinned to the same value, so validation never accepts a per-bucket waiting depth the
+ * group ceiling could never honour.
  * <p>
  * There is deliberately <b>no user-facing queue timeout</b>, and no timeout of any kind. Legitimate queue wait is
  * unbounded — it grows with backlog depth over drain throughput — so any fixed wall-clock cap would eventually cancel
@@ -55,13 +54,11 @@ public class WorkloadGroupQueueSettings {
     public static final int DEFAULT_SIZE_PER_BUCKET = 0;
 
     /**
-     * Fixed, non-configurable ceiling on the TOTAL parked requests for one group across all its buckets on a single
-     * coordinator. A pure OOM/footprint backstop against attacker-controlled bucket cardinality (username/role buckets
-     * come from the request principal), NOT a latency or fairness knob. Grounded in the retained heap of a parked
-     * request (its held {@code SearchRequest} + open channel + task ~ tens of KB): 10,000 parked ~= a few hundred MB of
-     * pinned request memory, a high-but-acceptable backstop on a small heap and negligible on a large one.
+     * Fixed, non-configurable ceiling on the TOTAL retained requests for one group across all its buckets on a single
+     * coordinator. Counts both provisional shared-owner acquires and denied waiters. This is a footprint backstop
+     * against both request bursts and attacker-controlled bucket cardinality, not a latency or fairness knob.
      */
-    public static final int MAX_GROUP_QUEUE_DEPTH = 10_000;
+    public static final int MAX_GROUP_QUEUE_DEPTH = 1_000;
 
     /**
      * Maximum configurable per-bucket queue depth. Pinned to {@link #MAX_GROUP_QUEUE_DEPTH}: the group ceiling caps the

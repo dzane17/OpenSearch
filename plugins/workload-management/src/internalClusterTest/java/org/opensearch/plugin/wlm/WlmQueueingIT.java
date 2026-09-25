@@ -65,7 +65,6 @@ import java.util.function.ToLongFunction;
 
 import static org.opensearch.index.query.QueryBuilders.scriptQuery;
 import static org.opensearch.test.hamcrest.OpenSearchAssertions.assertAcked;
-import static org.hamcrest.Matchers.greaterThan;
 import static org.hamcrest.Matchers.greaterThanOrEqualTo;
 
 /**
@@ -238,6 +237,90 @@ public class WlmQueueingIT extends OpenSearchIntegTestCase {
         assertNotNull(secondQueued.actionGet(TIMEOUT));
     }
 
+    public void testGlobalDisableImmediatelyDrainsQueuedSearch() throws Exception {
+        String workloadGroupId = "wlm_global_drain_group";
+        String ruleId = "wlm_global_drain_rule";
+        String indexName = "global_drain_index";
+
+        setWlmMode("enabled");
+        WorkloadGroup workloadGroup = createQueueingWorkloadGroup("global_drain_group", workloadGroupId, 1, 5);
+        updateWorkloadGroupInClusterState(PUT, workloadGroup);
+        FeatureType featureType = AutoTaggingRegistry.getFeatureType(WorkloadGroupFeatureType.NAME);
+        createRule(ruleId, "global drain rule", indexName, featureType, workloadGroupId);
+        indexDocument(indexName);
+
+        assertBusy(() -> {
+            long before = getCompletions(workloadGroupId);
+            client().prepareSearch(indexName).setQuery(org.opensearch.index.query.QueryBuilders.matchAllQuery()).get();
+            assertTrue("Expected search to be tagged to the workload group", getCompletions(workloadGroupId) > before);
+        }, 30, TimeUnit.SECONDS);
+
+        List<ScriptedBlockPlugin> plugins = initBlockFactory();
+        ActionFuture<SearchResponse> firstBlocked = blockingSearch(indexName).execute();
+        awaitBlockedCount(plugins, 1);
+
+        long totalQueuedBefore = getTotalQueued(workloadGroupId);
+        ActionFuture<SearchResponse> secondQueued = blockingSearch(indexName).execute();
+        assertBusy(() -> assertEquals("second search should be parked", 1, getQueuedCurrent(workloadGroupId)), 30, TimeUnit.SECONDS);
+
+        // The setting update must submit an immediate queue drain. The first search remains blocked and still owns the
+        // only node permit, so the second can reach the script before that permit is released only if it was run
+        // untracked by the global ENABLED -> DISABLED callback.
+        setWlmMode("disabled");
+        awaitBlockedCount(plugins, 2);
+        assertBusy(() -> assertEquals("global disable must empty the queue", 0, getQueuedCurrent(workloadGroupId)));
+        assertBusy(() -> assertEquals(totalQueuedBefore + 1, getTotalQueued(workloadGroupId)));
+
+        disableBlocks(plugins);
+        assertNotNull(firstBlocked.actionGet(TIMEOUT));
+        assertNotNull(secondQueued.actionGet(TIMEOUT));
+    }
+
+    public void testThrottleTierSwitchImmediatelyDrainsQueuedSearch() throws Exception {
+        String workloadGroupId = "wlm_tier_switch_drain_group";
+        String ruleId = "wlm_tier_switch_drain_rule";
+        String indexName = "tier_switch_drain_index";
+
+        setWlmMode("enabled");
+        WorkloadGroup nodeOnly = createQueueingWorkloadGroup("tier_switch_drain_group", workloadGroupId, 1, 5);
+        updateWorkloadGroupInClusterState(PUT, nodeOnly);
+        FeatureType featureType = AutoTaggingRegistry.getFeatureType(WorkloadGroupFeatureType.NAME);
+        createRule(ruleId, "tier switch drain rule", indexName, featureType, workloadGroupId);
+        indexDocument(indexName);
+
+        assertBusy(() -> {
+            long before = getCompletions(workloadGroupId);
+            client().prepareSearch(indexName).setQuery(org.opensearch.index.query.QueryBuilders.matchAllQuery()).get();
+            assertTrue("Expected search to be tagged to the workload group", getCompletions(workloadGroupId) > before);
+        }, 30, TimeUnit.SECONDS);
+
+        List<ScriptedBlockPlugin> plugins = initBlockFactory();
+        ActionFuture<SearchResponse> firstBlocked = blockingSearch(indexName).execute();
+        awaitBlockedCount(plugins, 1);
+
+        long totalQueuedBefore = getTotalQueued(workloadGroupId);
+        ActionFuture<SearchResponse> secondQueued = blockingSearch(indexName).execute();
+        assertBusy(() -> assertEquals("second search should be parked", 1, getQueuedCurrent(workloadGroupId)), 30, TimeUnit.SECONDS);
+
+        Settings sharedOnlyThrottling = Settings.builder()
+            .put(WorkloadGroupThrottleSettings.ATTRIBUTE.getKey(), "group")
+            .put(WorkloadGroupThrottleSettings.SHARED_LIMIT.getKey(), 1)
+            .build();
+        WorkloadGroup sharedOnly = createQueueingWorkloadGroup("tier_switch_drain_group", workloadGroupId, sharedOnlyThrottling, 5);
+        updateWorkloadGroupInClusterState(PUT, sharedOnly);
+
+        // The old request was queued against the node tier and was never registered with the shared owner. The first
+        // search still holds the old node permit, so reaching two blocked scripts proves the cluster-change callback
+        // drained that old backlog untracked instead of waiting on either tier.
+        awaitBlockedCount(plugins, 2);
+        assertBusy(() -> assertEquals("tier switch must empty the old queue", 0, getQueuedCurrent(workloadGroupId)));
+        assertBusy(() -> assertEquals(totalQueuedBefore + 1, getTotalQueued(workloadGroupId)));
+
+        disableBlocks(plugins);
+        assertNotNull(firstBlocked.actionGet(TIMEOUT));
+        assertNotNull(secondQueued.actionGet(TIMEOUT));
+    }
+
     // Helpers
 
     private static boolean hasRejectedExecutionCause(Throwable t) {
@@ -312,12 +395,16 @@ public class WlmQueueingIT extends OpenSearchIntegTestCase {
     }
 
     private void awaitForBlock(List<ScriptedBlockPlugin> plugins) throws Exception {
+        awaitBlockedCount(plugins, 1);
+    }
+
+    private void awaitBlockedCount(List<ScriptedBlockPlugin> plugins, int expected) throws Exception {
         assertBusy(() -> {
             int blocked = 0;
             for (ScriptedBlockPlugin plugin : plugins) {
                 blocked += plugin.hits.get();
             }
-            assertThat(blocked, greaterThan(0));
+            assertThat("expected searches to reach the blocking script", blocked, greaterThanOrEqualTo(expected));
         });
     }
 
@@ -351,6 +438,10 @@ public class WlmQueueingIT extends OpenSearchIntegTestCase {
             .put(WorkloadGroupThrottleSettings.ATTRIBUTE.getKey(), "group")
             .put(WorkloadGroupThrottleSettings.NODE_LIMIT.getKey(), nodeLimit)
             .build();
+        return createQueueingWorkloadGroup(name, id, throttling, queueSizePerBucket);
+    }
+
+    private WorkloadGroup createQueueingWorkloadGroup(String name, String id, Settings throttling, int queueSizePerBucket) {
         Settings queue = Settings.builder().put(WorkloadGroupQueueSettings.SIZE_PER_BUCKET.getKey(), queueSizePerBucket).build();
         return new WorkloadGroup(
             name,

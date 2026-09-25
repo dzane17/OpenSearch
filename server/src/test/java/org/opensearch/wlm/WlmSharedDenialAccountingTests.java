@@ -25,7 +25,9 @@ import org.opensearch.threadpool.ThreadPool;
 import org.opensearch.wlm.cancellation.WorkloadGroupTaskCancellationService;
 import org.opensearch.wlm.stats.WorkloadGroupState;
 
+import java.util.ArrayList;
 import java.util.HashSet;
+import java.util.List;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
@@ -84,7 +86,7 @@ public class WlmSharedDenialAccountingTests extends OpenSearchTestCase {
 
         // shared_limit only (no node tier) so every request goes straight to the shared/queueing path.
         Settings throttling = Settings.builder().put("attribute", "group").put("shared_limit", 1).build();
-        Settings queue = Settings.builder().put("size_per_bucket", 5).build();
+        Settings queue = Settings.builder().put("size_per_bucket", 1).build();
         WorkloadGroup wg = new WorkloadGroup(
             GROUP + "-name",
             GROUP,
@@ -217,11 +219,10 @@ public class WlmSharedDenialAccountingTests extends OpenSearchTestCase {
     }
 
     /**
-     * THE RACE: a concurrent drain admits the parked request BEFORE the denied-and-unregistered reply lands, so
-     * rejectOldest finds an empty bucket and returns false. The request was served, so no rejection happened — but
-     * incrementThrottled is called unconditionally ahead of rejectOldest, so total_throttled is incremented anyway.
+     * A concurrent pushed grant admits the provisional request before a denied-and-unregistered reply lands. The
+     * delayed reply must target the now-gone exact token, count no throttle, and affect no other request.
      */
-    public void testUnregisteredDenialAfterRacingDrainCountsASpuriousThrottle() {
+    public void testUnregisteredDenialAfterRacingDrainDoesNotCountSpuriousThrottle() {
         stubAcquire((listener, noWaiter) -> {
             // A racing owner-push grant / node-tier drain serves the parked request first...
             assertTrue("precondition: the racing drain must find the parked request", queueService.admitWithPermit(BUCKET, () -> {}));
@@ -233,7 +234,83 @@ public class WlmSharedDenialAccountingTests extends OpenSearchTestCase {
         assertEquals("the request WAS served by the racing drain", 1, o.admitted.get());
         assertEquals("and it was not failed", 0, o.failed.get());
         assertEquals(0, queueService.currentDepth(GROUP));
-        assertEquals("BUG: total_throttled counts a rejection that never happened — the request succeeded", 0, state().getTotalThrottled());
+        assertEquals("the stale denial must not count a rejection after the request succeeded", 0, state().getTotalThrottled());
+    }
+
+    /**
+     * The motivating Option-A regression: pending owner RPCs do not consume queue.size_per_bucket. With a configured
+     * waiting depth of one, several requests can all be retained while their owner acquires are in flight and then run
+     * on free permits without receiving false queue-full 429s.
+     */
+    public void testPendingBurstWithFreePermitsDoesNotFillWaitingQueue() {
+        List<ActionListener<Releasable>> ownerReplies = new ArrayList<>();
+        doAnswer(inv -> {
+            @SuppressWarnings("unchecked")
+            ActionListener<Releasable> listener = (ActionListener<Releasable>) inv.getArgument(2);
+            ownerReplies.add(listener);
+            return null;
+        }).when(mockShared).acquireAsync(anyString(), anyInt(), any(), any());
+
+        List<Outcome> outcomes = new ArrayList<>();
+        for (int i = 0; i < 10; i++) {
+            outcomes.add(request());
+        }
+        assertEquals(10, ownerReplies.size());
+        assertEquals("PENDING_ACQUIRE is not queued_current", 0, queueService.currentDepth(GROUP));
+        assertEquals(10, queueService.retainedDepth(GROUP));
+        assertEquals(0, state().getTotalQueueRejections());
+        assertEquals(0, state().getTotalThrottled());
+
+        ownerReplies.forEach(reply -> reply.onResponse(() -> {}));
+
+        for (Outcome outcome : outcomes) {
+            assertEquals(1, outcome.admitted.get());
+            assertEquals(0, outcome.failed.get());
+        }
+        assertEquals(0, queueService.retainedDepth(GROUP));
+        assertEquals(0, state().getTotalQueueRejections());
+        assertEquals(0, state().getTotalThrottled());
+    }
+
+    /** An early pushed grant followed by the original registered denial response completes the request exactly once. */
+    public void testPushedGrantBeforeRegisteredDenialResponseMakesDenialNoOp() {
+        stubAcquire((listener, noWaiter) -> {
+            assertTrue(queueService.admitWithPermit(BUCKET, () -> {}));
+            listener.onFailure(new OpenSearchRejectedExecutionException());
+        });
+
+        Outcome outcome = request();
+        assertEquals(1, outcome.admitted.get());
+        assertEquals(0, outcome.failed.get());
+        assertEquals(0, queueService.retainedDepth(GROUP));
+        assertEquals(0, state().getTotalQueued());
+        assertEquals(0, state().getTotalThrottled());
+    }
+
+    /** Only a real denial transition consumes the configured one-slot waiting queue. */
+    public void testSecondRegisteredDenialIsRejectedWhenWaitingQueueIsFull() {
+        List<ActionListener<Releasable>> ownerReplies = new ArrayList<>();
+        doAnswer(inv -> {
+            @SuppressWarnings("unchecked")
+            ActionListener<Releasable> listener = (ActionListener<Releasable>) inv.getArgument(2);
+            ownerReplies.add(listener);
+            return null;
+        }).when(mockShared).acquireAsync(anyString(), anyInt(), any(), any());
+
+        Outcome first = request();
+        Outcome second = request();
+        assertEquals(0, queueService.currentDepth(GROUP));
+        assertEquals(2, queueService.retainedDepth(GROUP));
+
+        ownerReplies.get(0).onFailure(new OpenSearchRejectedExecutionException());
+        ownerReplies.get(1).onFailure(new OpenSearchRejectedExecutionException());
+
+        assertEquals(0, first.admitted.get() + first.failed.get());
+        assertEquals(1, second.failed.get());
+        assertEquals(1, queueService.currentDepth(GROUP));
+        assertEquals(1, queueService.retainedDepth(GROUP));
+        assertEquals(1, state().getTotalQueueRejections());
+        assertEquals(1, state().getTotalThrottled());
     }
 
     /**

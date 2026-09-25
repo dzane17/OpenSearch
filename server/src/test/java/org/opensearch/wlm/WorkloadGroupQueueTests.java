@@ -13,7 +13,11 @@ import org.opensearch.common.lease.Releasable;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.test.OpenSearchTestCase;
 
+import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
 public class WorkloadGroupQueueTests extends OpenSearchTestCase {
@@ -26,8 +30,8 @@ public class WorkloadGroupQueueTests extends OpenSearchTestCase {
         return new WorkloadGroupQueue.QueuedRequest(ActionListener.wrap(r -> {}, e -> {}), bucketKey, task(), 0L);
     }
 
-    private static WorkloadGroupQueue.QueuedRequest req(String bucketKey, WorkloadGroupTask task) {
-        return new WorkloadGroupQueue.QueuedRequest(ActionListener.wrap(r -> {}, e -> {}), bucketKey, task, 0L);
+    private static WorkloadGroupQueue.QueuedRequest pending(String bucketKey) {
+        return WorkloadGroupQueue.QueuedRequest.pendingAcquire(ActionListener.wrap(r -> {}, e -> {}), bucketKey, task());
     }
 
     public void testOfferRejectedWhenDisabled() {
@@ -72,6 +76,85 @@ public class WorkloadGroupQueueTests extends OpenSearchTestCase {
         assertTrue(queue.offer(req("g:username:bob"), 2));
         assertTrue(queue.offer(req("g:username:carol"), 2));
         assertEquals(5, queue.currentDepth());
+    }
+
+    public void testPendingAcquireDoesNotConsumeBucketWaitingCapacity() {
+        WorkloadGroupQueue queue = new WorkloadGroupQueue();
+        WorkloadGroupQueue.QueuedRequest waiting = req("g:group");
+        WorkloadGroupQueue.QueuedRequest pending1 = pending("g:group");
+        WorkloadGroupQueue.QueuedRequest pending2 = pending("g:group");
+
+        assertTrue(queue.offer(waiting, 1));
+        assertTrue(queue.offerPendingAcquire(pending1));
+        assertTrue(queue.offerPendingAcquire(pending2));
+        assertEquals(3, queue.currentDepth());
+        assertEquals(1, queue.currentWaitingDepth());
+
+        // Only the denial transition consumes queue.size_per_bucket. The exact pending request is removed if full.
+        assertEquals(WorkloadGroupQueue.WaitingTransition.BUCKET_FULL, queue.transitionToWaiting(pending1, 1, 10L));
+        assertEquals(2, queue.currentDepth());
+        assertEquals(1, queue.currentWaitingDepth());
+        assertSame(waiting, queue.pollOldest("g:group"));
+
+        assertEquals(WorkloadGroupQueue.WaitingTransition.WAITING, queue.transitionToWaiting(pending2, 1, 20L));
+        assertEquals(1, queue.currentDepth());
+        assertEquals(1, queue.currentWaitingDepth());
+        assertSame(pending2, queue.pollOldest("g:group"));
+    }
+
+    public void testCombinedGroupCeilingCountsPendingAndWaiting() {
+        WorkloadGroupQueue queue = new WorkloadGroupQueue();
+        int waiting = WorkloadGroupQueueSettings.MAX_GROUP_QUEUE_DEPTH / 2;
+        for (int i = 0; i < waiting; i++) {
+            assertTrue(queue.offer(req("g:username:waiting-" + i), 1));
+        }
+        for (int i = waiting; i < WorkloadGroupQueueSettings.MAX_GROUP_QUEUE_DEPTH; i++) {
+            assertTrue(queue.offerPendingAcquire(pending("g:username:pending-" + i)));
+        }
+        assertEquals(WorkloadGroupQueueSettings.MAX_GROUP_QUEUE_DEPTH, queue.currentDepth());
+        assertEquals(waiting, queue.currentWaitingDepth());
+        assertFalse(queue.offerPendingAcquire(pending("g:username:pending-overflow")));
+        assertFalse(queue.offer(req("g:username:waiting-overflow"), 1));
+        assertEquals(WorkloadGroupQueueSettings.MAX_GROUP_QUEUE_DEPTH, queue.currentDepth());
+    }
+
+    public void testConcurrentPendingOffersNeverExceedCombinedGroupCeiling() throws Exception {
+        WorkloadGroupQueue queue = new WorkloadGroupQueue();
+        int attempts = WorkloadGroupQueueSettings.MAX_GROUP_QUEUE_DEPTH * 2;
+        List<WorkloadGroupQueue.QueuedRequest> requests = new ArrayList<>(attempts);
+        for (int i = 0; i < attempts; i++) {
+            requests.add(pending("g:username:u" + i));
+        }
+
+        int workers = 8;
+        CountDownLatch start = new CountDownLatch(1);
+        CountDownLatch done = new CountDownLatch(workers);
+        AtomicInteger accepted = new AtomicInteger();
+        AtomicReference<Throwable> workerFailure = new AtomicReference<>();
+        for (int worker = 0; worker < workers; worker++) {
+            final int first = worker;
+            new Thread(() -> {
+                try {
+                    start.await();
+                    for (int i = first; i < attempts; i += workers) {
+                        if (queue.offerPendingAcquire(requests.get(i))) {
+                            accepted.incrementAndGet();
+                        }
+                    }
+                } catch (Throwable t) {
+                    workerFailure.compareAndSet(null, t);
+                } finally {
+                    done.countDown();
+                }
+            }).start();
+        }
+
+        start.countDown();
+        assertTrue(done.await(10, TimeUnit.SECONDS));
+        assertNull(workerFailure.get());
+        assertEquals(WorkloadGroupQueueSettings.MAX_GROUP_QUEUE_DEPTH, accepted.get());
+        assertEquals(WorkloadGroupQueueSettings.MAX_GROUP_QUEUE_DEPTH, queue.currentDepth());
+        assertEquals(0, queue.currentWaitingDepth());
     }
 
     public void testGroupCeilingRejectsOnceTotalDepthIsReached() {
@@ -161,50 +244,6 @@ public class WorkloadGroupQueueTests extends OpenSearchTestCase {
         assertEquals(2L, queue.peakDepth()); // peak does not decrease
     }
 
-    public void testEvictCancelledRemovesOnlyCancelledPreservingSurvivors() {
-        WorkloadGroupQueue queue = new WorkloadGroupQueue();
-        WorkloadGroupQueue.QueuedRequest survivorA = req("g:group"); // live
-        WorkloadGroupTask cancelledTask = task();
-        WorkloadGroupQueue.QueuedRequest cancelled = req("g:group", cancelledTask);
-        WorkloadGroupQueue.QueuedRequest survivorB = req("g:group"); // live
-        assertTrue(queue.offer(survivorA, 10));
-        assertTrue(queue.offer(cancelled, 10));
-        assertTrue(queue.offer(survivorB, 10));
-
-        cancelledTask.cancel("client disconnect");
-        List<WorkloadGroupQueue.QueuedRequest> evicted = queue.evictCancelled("g:group");
-        assertEquals(1, evicted.size());
-        assertSame(cancelled, evicted.get(0));
-        assertEquals(2, queue.currentDepth()); // both live survivors remain
-        // Survivors keep their place and identity; no time-based eviction ever removes a live request.
-        assertSame(survivorA, queue.pollOldest("g:group"));
-        assertSame(survivorB, queue.pollOldest("g:group"));
-    }
-
-    public void testEvictCancelledLeavesLiveRequestsRegardlessOfAge() {
-        // There is no wall-clock deadline: a live parked request is never evicted by the sweep no matter how long it
-        // has waited. Only a cancelled task is removed.
-        WorkloadGroupQueue queue = new WorkloadGroupQueue();
-        WorkloadGroupQueue.QueuedRequest live = req("g:group");
-        assertTrue(queue.offer(live, 10));
-        assertTrue(queue.evictCancelled("g:group").isEmpty());
-        assertEquals(1, queue.currentDepth());
-        assertSame(live, queue.pollOldest("g:group"));
-    }
-
-    public void testEvictCancelledRemovesCancelledTaskAndPrunes() {
-        WorkloadGroupQueue queue = new WorkloadGroupQueue();
-        WorkloadGroupTask t = task();
-        WorkloadGroupQueue.QueuedRequest r = req("g:group", t);
-        assertTrue(queue.offer(r, 10));
-        t.cancel("client disconnect");
-        List<WorkloadGroupQueue.QueuedRequest> evicted = queue.evictCancelled("g:group");
-        assertEquals(1, evicted.size());
-        assertSame(r, evicted.get(0));
-        assertEquals(0, queue.currentDepth());
-        assertFalse(queue.bucketKeys().contains("g:group")); // pruned
-    }
-
     public void testWaitNanos() {
         long enqueue = 5_000_000L;
         WorkloadGroupQueue.QueuedRequest r = new WorkloadGroupQueue.QueuedRequest(
@@ -216,6 +255,20 @@ public class WorkloadGroupQueueTests extends OpenSearchTestCase {
         assertEquals(2000L, r.waitNanos(enqueue + 2000));
         assertEquals(0L, r.waitNanos(enqueue)); // admitted instantly
         assertEquals(0L, r.waitNanos(enqueue - 100)); // clock skew guard: never negative
+    }
+
+    public void testPendingWaitStartsOnlyOnDenialTransition() {
+        WorkloadGroupQueue queue = new WorkloadGroupQueue();
+        WorkloadGroupQueue.QueuedRequest pending = pending("g:group");
+        assertTrue(queue.offerPendingAcquire(pending));
+        assertEquals(0L, pending.waitNanos(10_000L));
+        assertEquals(0, queue.currentWaitingDepth());
+        assertEquals(0L, queue.peakDepth());
+
+        assertEquals(WorkloadGroupQueue.WaitingTransition.WAITING, queue.transitionToWaiting(pending, 1, 5_000L));
+        assertEquals(2_000L, pending.waitNanos(7_000L));
+        assertEquals(1, queue.currentWaitingDepth());
+        assertEquals(1L, queue.peakDepth());
     }
 
     public void testCapturesListenerAndBucket() {

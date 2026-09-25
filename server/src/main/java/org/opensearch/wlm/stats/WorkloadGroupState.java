@@ -48,21 +48,13 @@ public class WorkloadGroupState {
      * Cumulative requests that <em>waited</em> in the workload group's request queue for capacity to free, since the
      * OpenSearch start time. Counted when such a request is admitted, by {@link #recordQueueWaitMillis}.
      * <p>
-     * This deliberately does NOT count every request that entered the queue. Parking is enqueue-first — an internal
-     * optimisation that parks a request before the owner's verdict is known, to close a registration race — so under an
-     * active queue every shared-tier request passes through the queue, and most leave again immediately on the permit
-     * their own acquire returned. Counting those would make this stat read as "all shared-tier traffic" rather than
-     * "traffic the throttle actually delayed", so an admission the request supplied itself is excluded.
+     * This deliberately does NOT count every request retained by the queue service. A shared-tier request first enters
+     * {@code PENDING_ACQUIRE} before the owner's verdict, solely to close the grant-before-registration race. Only an
+     * owner denial transitions the exact entry to {@code WAITING}; direct grants and fail-open outcomes leave from
+     * {@code PENDING_ACQUIRE} and are excluded here.
      * <p>
      * Incremented at the same site as {@link #totalQueueWaitMillis}, which is what makes it a sound denominator for mean
-     * queue wait: one increment per recorded wait sample, so the two cannot drift apart. Counting instead from the
-     * <em>denial</em> signal would be close but not exact — a granted acquire supplies zero drains when a concurrent
-     * drain emptied the bucket first, which produces a wait sample with no matching denial (and, with a fresh counter, a
-     * zero denominator).
-     * <p>
-     * Note FIFO means the request counted here is not necessarily the one whose own acquire was denied: a granted permit
-     * drains the OLDEST parked request. The identity is permuted; what this counts is unambiguous either way — a request
-     * that was admitted having genuinely waited for someone else's capacity.
+     * queue wait: one increment per recorded wait sample, so the two cannot drift apart.
      * <p>
      * Two things it therefore does not include, both by design: a request that is denied and still parked right now (it
      * has not finished waiting — see {@code queued_current}), and one cancelled or evicted before ever being admitted.
@@ -75,12 +67,11 @@ public class WorkloadGroupState {
     public final CounterMetric totalQueueRejections = new CounterMetric();
 
     /**
-     * Cumulative time (in millis) that genuinely-waiting requests spent parked in the queue. Divide by
+     * Cumulative time (in millis) that WAITING requests spent parked in the queue. Divide by
      * {@link #totalQueued} for the mean wait; use {@link #maxQueueWaitMillis} for the tail.
      * <p>
-     * Recorded only for admissions the request did not supply itself — an owner-push grant, a node-tier completion
-     * drain, or the backstop sweep. An enqueue-first pass-through, admitted on the permit its own acquire returned, is
-     * skipped: its "wait" is just the owner round-trip, and including it would drag the mean toward zero.
+     * The wait clock starts on the PENDING_ACQUIRE -> WAITING transition, not when the provisional entry is registered,
+     * so owner round-trip latency is never reported as queue latency.
      * <p>
      * {@link #totalQueued} is incremented by the same call, so sum and count always describe exactly the same set of
      * requests and the mean is well-formed whenever the count is non-zero.

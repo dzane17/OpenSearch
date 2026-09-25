@@ -19,6 +19,7 @@ import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.io.stream.BytesStreamOutput;
 import org.opensearch.common.lease.Releasable;
 import org.opensearch.common.settings.Settings;
+import org.opensearch.common.util.concurrent.OpenSearchExecutors;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.common.io.stream.StreamInput;
 import org.opensearch.core.common.io.stream.StreamOutput;
@@ -35,6 +36,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
@@ -80,12 +82,16 @@ public class WorkloadGroupSharedThrottleServiceTests extends OpenSearchTestCase 
 
     // The owner resolves a bucket's shared_limit from its OWN cluster state (it no longer arrives on the RELEASE RPC), so
     // any test that expects owner-push to be driven has to model the group. Without this the limit reads as UNSET and
-    // onSharedSlotFreed correctly declines to grant.
+    // offerSharedSlots correctly declines to grant.
     private void stubGroupFor(String bucketKey, int sharedLimit) {
         final int idx = bucketKey.indexOf(':');
         final String groupId = idx < 0 ? bucketKey : bucketKey.substring(0, idx);
+        when(metadata.workloadGroups()).thenReturn(Map.of(groupId, workloadGroup(groupId, sharedLimit)));
+    }
+
+    private WorkloadGroup workloadGroup(String groupId, int sharedLimit) {
         Settings throttling = Settings.builder().put("attribute", "group").put("shared_limit", sharedLimit).build();
-        WorkloadGroup group = new WorkloadGroup(
+        return new WorkloadGroup(
             groupId + "-name",
             groupId,
             new MutableWorkloadGroupFragment(
@@ -96,7 +102,6 @@ public class WorkloadGroupSharedThrottleServiceTests extends OpenSearchTestCase 
             ),
             1L
         );
-        when(metadata.workloadGroups()).thenReturn(Map.of(groupId, group));
     }
 
     private WorkloadGroupSharedThrottleService newService() {
@@ -191,6 +196,164 @@ public class WorkloadGroupSharedThrottleServiceTests extends OpenSearchTestCase 
         assertEquals("the sweep must drive owner-push for the slot it freed", 1, admits.get());
     }
 
+    public void testTtlSweepOffersEveryPermitReclaimedInOneBucket() {
+        final int sharedLimit = 3;
+        final String groupId = "multi-expiry";
+        final String bucket = groupId + ":group";
+        final AtomicLong nanos = new AtomicLong(0L);
+        WorkloadGroupSharedThrottleService service = new WorkloadGroupSharedThrottleService(
+            clusterService,
+            threadPool,
+            transportService,
+            new SharedThrottleTracker(nanos::get)
+        );
+        deliverNodesChanged(service, clusterService.state().nodes());
+        stubGroupFor(bucket, sharedLimit);
+
+        final AtomicInteger parked = new AtomicInteger(3);
+        final AtomicInteger admits = new AtomicInteger();
+        final List<Releasable> grantedPermits = new ArrayList<>();
+        service.setGrantConsumer((bucketKey, permit) -> {
+            if (parked.getAndDecrement() <= 0) {
+                return false;
+            }
+            admits.incrementAndGet();
+            grantedPermits.add(permit);
+            return true;
+        });
+
+        final List<Releasable> expiredHolders = new ArrayList<>();
+        for (int i = 0; i < sharedLimit; i++) {
+            expiredHolders.add(awaitGrant(service, bucket, sharedLimit));
+        }
+        for (int i = 0; i < sharedLimit; i++) {
+            AtomicReference<Exception> denial = new AtomicReference<>();
+            service.acquireAsync(
+                bucket,
+                sharedLimit,
+                ActionListener.wrap(p -> fail("the bucket is full"), denial::set),
+                () -> fail("the local owner must register itself")
+            );
+            assertTrue(denial.get() instanceof OpenSearchRejectedExecutionException);
+        }
+
+        nanos.set(WorkloadGroupSharedThrottleService.PERMIT_TTL_NANOS + 1L);
+        service.sweepExpiredAndDrive();
+
+        assertEquals("one sweep must offer all three slots reclaimed in the same bucket", sharedLimit, admits.get());
+        assertEquals("the replacement grants refill, but never exceed, the live limit", sharedLimit, service.tracker().inFlight(bucket));
+
+        expiredHolders.forEach(Releasable::close); // already expired: idempotent no-ops
+        while (grantedPermits.isEmpty() == false) {
+            grantedPermits.remove(0).close();
+        }
+        assertEquals(0, service.tracker().inFlight(bucket));
+    }
+
+    public void testSharedLimitIncreaseOffersOnlyTheAddedCapacityFromClusterChange() {
+        final String groupId = "limit-increase";
+        final String bucket = groupId + ":group";
+        final int previousLimit = 1;
+        final int currentLimit = 4;
+        WorkloadGroupSharedThrottleService service = newService();
+        stubGroupFor(bucket, previousLimit);
+        when(threadPool.executor(ThreadPool.Names.GENERIC)).thenReturn(OpenSearchExecutors.newDirectExecutorService());
+
+        final AtomicInteger parked = new AtomicInteger(5);
+        final AtomicInteger admits = new AtomicInteger();
+        final List<Releasable> grantedPermits = new ArrayList<>();
+        service.setGrantConsumer((bucketKey, permit) -> {
+            if (parked.getAndDecrement() <= 0) {
+                return false;
+            }
+            admits.incrementAndGet();
+            grantedPermits.add(permit);
+            return true;
+        });
+
+        final Releasable originalHolder = awaitGrant(service, bucket, previousLimit);
+        for (int i = 0; i < 5; i++) {
+            AtomicReference<Exception> denial = new AtomicReference<>();
+            service.acquireAsync(
+                bucket,
+                previousLimit,
+                ActionListener.wrap(p -> fail("the old shared limit is full"), denial::set),
+                () -> fail("the local owner must register itself")
+            );
+            assertTrue(denial.get() instanceof OpenSearchRejectedExecutionException);
+        }
+
+        final DiscoveryNodes nodes = clusterService.state().nodes();
+        final Metadata previousMetadata = Mockito.mock(Metadata.class);
+        when(previousMetadata.workloadGroups()).thenReturn(Map.of(groupId, workloadGroup(groupId, previousLimit)));
+        final Metadata currentMetadata = Mockito.mock(Metadata.class);
+        when(currentMetadata.workloadGroups()).thenReturn(Map.of(groupId, workloadGroup(groupId, currentLimit)));
+        final ClusterState previousState = Mockito.mock(ClusterState.class);
+        when(previousState.nodes()).thenReturn(nodes);
+        when(previousState.metadata()).thenReturn(previousMetadata);
+        final ClusterState currentState = Mockito.mock(ClusterState.class);
+        when(currentState.nodes()).thenReturn(nodes);
+        when(currentState.metadata()).thenReturn(currentMetadata);
+        when(clusterService.state()).thenReturn(currentState);
+
+        service.clusterChanged(new ClusterChangedEvent("shared limit increased", currentState, previousState));
+
+        assertEquals("the hook must grant exactly newLimit - oldLimit requests", currentLimit - previousLimit, admits.get());
+        assertEquals("the owner must stop at the new live limit", currentLimit, service.tracker().inFlight(bucket));
+        assertEquals("requests beyond the one-time added-capacity budget remain queued", 2, parked.get());
+
+        originalHolder.close();
+        while (grantedPermits.isEmpty() == false) {
+            grantedPermits.remove(0).close();
+        }
+        assertEquals(0, service.tracker().inFlight(bucket));
+    }
+
+    public void testOrdinaryReleaseOffersOneSlotEvenWhenLiveLimitIsHigher() {
+        final String groupId = "one-slot-release";
+        final String bucket = groupId + ":group";
+        WorkloadGroupSharedThrottleService service = newService();
+        stubGroupFor(bucket, 1);
+
+        final AtomicInteger parked = new AtomicInteger(4);
+        final AtomicInteger admits = new AtomicInteger();
+        final List<Releasable> grantedPermits = new ArrayList<>();
+        service.setGrantConsumer((bucketKey, permit) -> {
+            if (parked.getAndDecrement() <= 0) {
+                return false;
+            }
+            admits.incrementAndGet();
+            grantedPermits.add(permit);
+            return true;
+        });
+
+        final Releasable holder = awaitGrant(service, bucket, 1);
+        for (int i = 0; i < 4; i++) {
+            AtomicReference<Exception> denial = new AtomicReference<>();
+            service.acquireAsync(
+                bucket,
+                1,
+                ActionListener.wrap(p -> fail("the old shared limit is full"), denial::set),
+                () -> fail("the local owner must register itself")
+            );
+            assertTrue(denial.get() instanceof OpenSearchRejectedExecutionException);
+        }
+
+        // Model the new state being visible without invoking its cluster-change hook. The release path now sees limit 4,
+        // but the single completed request still represents only one newly-freed slot and must not perform a bulk fill.
+        stubGroupFor(bucket, 4);
+        holder.close();
+
+        assertEquals("a normal return must hand off only its one freed slot", 1, admits.get());
+        assertEquals(1, service.tracker().inFlight(bucket));
+        assertEquals(3, parked.get());
+
+        while (grantedPermits.isEmpty() == false) {
+            grantedPermits.remove(0).close();
+        }
+        assertEquals(0, service.tracker().inFlight(bucket));
+    }
+
     public void testRingPopulatesWhenNodeSetUnchangedVsPreviousState() {
         // Regression for the single-node no-op: the coordinator seeds the initial applied state already containing the
         // local node, so the first real clusterChanged has previous.nodes() == current.nodes() and nodesChanged() is
@@ -242,6 +405,206 @@ public class WorkloadGroupSharedThrottleServiceTests extends OpenSearchTestCase 
         deliverNodesChanged(service, DiscoveryNodes.builder().add(restarted).localNodeId("n1").build());
 
         assertSame("ring must have rebuilt with the restarted node instance", restarted, service.ring().ownerFor("b").orElseThrow());
+    }
+
+    public void testFormerOwnerPrunesWaitersAndCannotIssueOrPushPermits() {
+        final int sharedLimit = 1;
+        final DiscoveryNode remote = new DiscoveryNode(
+            "remote",
+            "remote",
+            buildNewFakeTransportAddress(),
+            Collections.emptyMap(),
+            Set.of(DiscoveryNodeRole.DATA_ROLE),
+            org.opensearch.Version.CURRENT
+        );
+        final DiscoveryNodes bothNodes = DiscoveryNodes.builder().add(localNode).add(remote).localNodeId(localNode.getId()).build();
+        final ThrottleOwnerSelector twoNodeRing = ThrottleOwnerSelector.fromDiscoveryNodes(bothNodes);
+        String movedBucket = null;
+        for (int i = 0; i < 10_000 && movedBucket == null; i++) {
+            String candidate = "moved-" + i;
+            if (twoNodeRing.ownerFor(candidate).filter(remote::equals).isPresent()) {
+                movedBucket = candidate;
+            }
+        }
+        assertNotNull("could not find a bucket that moves from the single local owner to the remote node", movedBucket);
+        final String bucket = movedBucket;
+
+        WorkloadGroupSharedThrottleService service = newService();
+        stubGroupFor(bucket, sharedLimit);
+        AtomicInteger admits = new AtomicInteger();
+        service.setGrantConsumer((bucketKey, permit) -> {
+            admits.incrementAndGet();
+            return true;
+        });
+
+        Releasable oldPermit = awaitGrant(service, bucket, sharedLimit);
+        AtomicReference<Exception> denial = new AtomicReference<>();
+        service.acquireAsync(
+            bucket,
+            sharedLimit,
+            ActionListener.wrap(p -> fail("must be denied while the old permit is live"), denial::set),
+            () -> fail("the local owner must register itself")
+        );
+        assertTrue(denial.get() instanceof OpenSearchRejectedExecutionException);
+        assertEquals(1, service.waiterCountForTest(bucket));
+
+        deliverNodesChanged(service, bothNodes);
+        assertEquals(remote, service.ring().ownerFor(bucket).orElseThrow());
+        assertEquals("the former owner must drop stale waiter routing state", 0, service.waiterCountForTest(bucket));
+
+        WorkloadGroupSharedThrottleService.AcquirePermitResponse staleAcquire = service.handleAcquire(
+            new WorkloadGroupSharedThrottleService.AcquirePermitRequest(
+                bucket,
+                sharedLimit,
+                "stale-acquire",
+                WorkloadGroupSharedThrottleService.PERMIT_TTL_NANOS,
+                localNode.getId(),
+                true
+            )
+        );
+        assertFalse("a former owner must not mint another permit", staleAcquire.granted);
+        assertFalse("a former owner must not register another waiter", staleAcquire.registered);
+        assertEquals("only the pre-remap permit may remain", 1, service.tracker().inFlight(bucket));
+
+        oldPermit.close();
+        assertEquals("the old permit may drain locally but must not create a pushed grant", 0, service.tracker().inFlight(bucket));
+        assertEquals(0, admits.get());
+    }
+
+    public void testOwnerChangeDuringPushReservationReclaimsPermitBeforeGrant() {
+        final int sharedLimit = 1;
+        final DiscoveryNode remote = new DiscoveryNode(
+            "remote-race",
+            "remote-race",
+            buildNewFakeTransportAddress(),
+            Collections.emptyMap(),
+            Set.of(DiscoveryNodeRole.DATA_ROLE),
+            org.opensearch.Version.CURRENT
+        );
+        final DiscoveryNodes bothNodes = DiscoveryNodes.builder().add(localNode).add(remote).localNodeId(localNode.getId()).build();
+        final ThrottleOwnerSelector twoNodeRing = ThrottleOwnerSelector.fromDiscoveryNodes(bothNodes);
+        String movedBucket = null;
+        for (int i = 0; i < 10_000 && movedBucket == null; i++) {
+            String candidate = "reservation-race-" + i;
+            if (twoNodeRing.ownerFor(candidate).filter(remote::equals).isPresent()) {
+                movedBucket = candidate;
+            }
+        }
+        assertNotNull("could not find a bucket that moves to the remote node", movedBucket);
+        final String bucket = movedBucket;
+
+        AtomicReference<Runnable> afterSuccessfulAcquire = new AtomicReference<>();
+        SharedThrottleTracker raceTracker = new SharedThrottleTracker() {
+            @Override
+            public boolean tryAcquire(String bucketKey, int limit, String permitId, long ttlNanos) {
+                boolean granted = super.tryAcquire(bucketKey, limit, permitId, ttlNanos);
+                Runnable callback = afterSuccessfulAcquire.getAndSet(null);
+                if (granted && callback != null) {
+                    callback.run();
+                }
+                return granted;
+            }
+        };
+        WorkloadGroupSharedThrottleService service = new WorkloadGroupSharedThrottleService(
+            clusterService,
+            threadPool,
+            transportService,
+            raceTracker
+        );
+        deliverNodesChanged(service, clusterService.state().nodes());
+        stubGroupFor(bucket, sharedLimit);
+        AtomicInteger admits = new AtomicInteger();
+        service.setGrantConsumer((bucketKey, permit) -> {
+            admits.incrementAndGet();
+            return true;
+        });
+
+        Releasable holder = awaitGrant(service, bucket, sharedLimit);
+        AtomicReference<Exception> denial = new AtomicReference<>();
+        service.acquireAsync(
+            bucket,
+            sharedLimit,
+            ActionListener.wrap(p -> fail("must be denied while the holder is live"), denial::set),
+            () -> fail("the local owner must register itself")
+        );
+        assertTrue(denial.get() instanceof OpenSearchRejectedExecutionException);
+        assertEquals(1, service.waiterCountForTest(bucket));
+
+        afterSuccessfulAcquire.set(() -> deliverNodesChanged(service, bothNodes));
+        holder.close();
+
+        assertEquals(
+            "the callback remapped this bucket during the pushed-grant reservation",
+            remote,
+            service.ring().ownerFor(bucket).orElseThrow()
+        );
+        assertEquals("the post-reservation owner fence must reclaim the stale permit", 0, service.tracker().inFlight(bucket));
+        assertEquals("the former owner must not expose the stale permit to its local waiter", 0, admits.get());
+        assertEquals(0, service.waiterCountForTest(bucket));
+    }
+
+    public void testUnknownUnusedGrantReleaseDoesNotDeregisterCurrentOwnerWaiter() {
+        final String bucket = "unknown-release:group";
+        final int sharedLimit = 1;
+        WorkloadGroupSharedThrottleService service = newService();
+        stubGroupFor(bucket, sharedLimit);
+        assertTrue(
+            service.tracker().tryAcquire(bucket, sharedLimit, "current-owner-permit", WorkloadGroupSharedThrottleService.PERMIT_TTL_NANOS)
+        );
+
+        AtomicReference<Exception> denial = new AtomicReference<>();
+        service.acquireAsync(
+            bucket,
+            sharedLimit,
+            ActionListener.wrap(p -> fail("must be denied while the current permit is live"), denial::set),
+            () -> fail("the local owner must register itself")
+        );
+        assertTrue(denial.get() instanceof OpenSearchRejectedExecutionException);
+        assertEquals(1, service.waiterCountForTest(bucket));
+
+        service.handleRelease(
+            new WorkloadGroupSharedThrottleService.ReleasePermitRequest(bucket, "permit-from-former-owner", localNode.getId())
+        );
+
+        assertEquals("an unknown old-owner permit id must not remove a valid new-owner waiter", 1, service.waiterCountForTest(bucket));
+        assertEquals("the current owner's real permit remains live", 1, service.tracker().inFlight(bucket));
+        assertTrue(service.tracker().release(bucket, "current-owner-permit"));
+    }
+
+    public void testReRegisterWaiterAfterOwnerChangeImmediatelyDrivesFreeCapacity() {
+        final String bucket = "re-register:group";
+        final int sharedLimit = 1;
+        WorkloadGroupSharedThrottleService service = newService();
+        stubGroupFor(bucket, sharedLimit);
+        AtomicReference<Releasable> admittedPermit = new AtomicReference<>();
+        AtomicBoolean firstGrant = new AtomicBoolean(true);
+        AtomicInteger admits = new AtomicInteger();
+        service.setGrantConsumer((bucketKey, permit) -> {
+            if (firstGrant.compareAndSet(true, false)) {
+                admittedPermit.set(permit);
+                admits.incrementAndGet();
+                return true;
+            }
+            return false;
+        });
+
+        WorkloadGroupSharedThrottleService.ReRegisterWaiterAfterOwnerChangeResponse response = service
+            .handleReRegisterWaiterAfterOwnerChange(
+                new WorkloadGroupSharedThrottleService.ReRegisterWaiterAfterOwnerChangeRequest(bucket, localNode.getId())
+            );
+
+        assertTrue(response.registered);
+        assertEquals("registration must drive already-free capacity without waiting for a future release", 1, admits.get());
+        assertEquals(1, service.waiterCountForTest(bucket));
+        assertEquals(1, service.tracker().inFlight(bucket));
+
+        admittedPermit.get().close();
+        assertEquals(
+            "the next unused grant reconciles the now-empty coordinator out of the waiter set",
+            0,
+            service.waiterCountForTest(bucket)
+        );
+        assertEquals(0, service.tracker().inFlight(bucket));
     }
 
     public void testLocalOwnerGrantsThenDeniesAtLimit() {
@@ -459,8 +822,33 @@ public class WorkloadGroupSharedThrottleServiceTests extends OpenSearchTestCase 
         assertEquals(original.permitId, copy.permitId);
     }
 
+    public void testReRegisterWaiterAfterOwnerChangeRequestSerializationRoundTrip() throws Exception {
+        WorkloadGroupSharedThrottleService.ReRegisterWaiterAfterOwnerChangeRequest original =
+            new WorkloadGroupSharedThrottleService.ReRegisterWaiterAfterOwnerChangeRequest("grp1:group", "node-1");
+        WorkloadGroupSharedThrottleService.ReRegisterWaiterAfterOwnerChangeRequest copy = copyWriteable(
+            original,
+            writableRegistry(),
+            WorkloadGroupSharedThrottleService.ReRegisterWaiterAfterOwnerChangeRequest::new
+        );
+        assertEquals(original.bucketKey, copy.bucketKey);
+        assertEquals(original.requestingNodeId, copy.requestingNodeId);
+    }
+
+    public void testReRegisterWaiterAfterOwnerChangeResponseSerializationRoundTrip() throws Exception {
+        for (boolean registered : new boolean[] { true, false }) {
+            WorkloadGroupSharedThrottleService.ReRegisterWaiterAfterOwnerChangeResponse original =
+                new WorkloadGroupSharedThrottleService.ReRegisterWaiterAfterOwnerChangeResponse(registered);
+            WorkloadGroupSharedThrottleService.ReRegisterWaiterAfterOwnerChangeResponse copy = copyWriteable(
+                original,
+                writableRegistry(),
+                WorkloadGroupSharedThrottleService.ReRegisterWaiterAfterOwnerChangeResponse::new
+            );
+            assertEquals(registered, copy.registered);
+        }
+    }
+
     // --- serde resilience -------------------------------------------------------------------------------------------
-    // All three RPC bodies are ONE name-keyed map, so a peer from a different commit interoperates. These write the bytes
+    // All RPC bodies are ONE name-keyed map, so a peer from a different commit interoperates. These write the bytes
     // by hand to stand in for another build's writer, since our own writeTo can only emit the keys it knows.
 
     private static StreamInput bodyBytes(Map<String, Object> body, boolean withTaskPreamble) throws IOException {

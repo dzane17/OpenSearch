@@ -27,10 +27,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
-/**
- * Adversarial probes of the owner-push {@code registered} bit and the {@code rejectOldest} path added by queueing.
- * Throwaway/diagnostic suite: each test states the interleaving it forces and the invariant it is trying to break.
- */
+/** Adversarial probes of the PENDING_ACQUIRE -> WAITING state machine and exact-entry acquire outcomes. */
 public class WlmQueueingAdversarialTests extends OpenSearchTestCase {
 
     private ThreadPool threadPool;
@@ -63,28 +60,22 @@ public class WlmQueueingAdversarialTests extends OpenSearchTestCase {
         return new OpenSearchRejectedExecutionException("Request throttled: test.");
     }
 
-    // ---------------------------------------------------------------------------------------------------------------
-    // PROBE 1 — exactly-once completion
-    // ---------------------------------------------------------------------------------------------------------------
-
-    /**
-     * A single parked request raced by an admit and a reject must be completed EXACTLY ONCE, never both admitted and
-     * failed. Both paths poll under the same per-bucket lock, so one must lose.
-     */
-    public void testAdmitAndRejectRaceCompletesExactlyOnce() throws Exception {
+    /** A granted result raced by an unregistered-denial result for the same token must complete exactly once. */
+    public void testExactAdmitAndRejectRaceCompletesExactlyOnce() throws Exception {
         for (int iter = 0; iter < 200; iter++) {
             WorkloadGroupQueueService svc = new WorkloadGroupQueueService(threadPool, stateAccessor);
             AtomicInteger admits = new AtomicInteger();
             AtomicInteger failures = new AtomicInteger();
             CountDownLatch done = new CountDownLatch(1);
 
-            assertTrue(svc.tryEnqueue(GROUP, BUCKET, task(), 5, ActionListener.wrap(p -> {
+            WorkloadGroupQueue.QueuedRequest pending = svc.tryRegisterPendingAcquire(GROUP, BUCKET, task(), ActionListener.wrap(p -> {
                 admits.incrementAndGet();
                 done.countDown();
             }, e -> {
                 failures.incrementAndGet();
                 done.countDown();
-            })));
+            }));
+            assertNotNull(pending);
 
             CyclicBarrier barrier = new CyclicBarrier(2);
             AtomicReference<Boolean> admitResult = new AtomicReference<>();
@@ -94,13 +85,13 @@ public class WlmQueueingAdversarialTests extends OpenSearchTestCase {
                 try {
                     barrier.await();
                 } catch (Exception ignored) {}
-                admitResult.set(svc.admitWithOwnPermit(BUCKET, () -> {}));
+                admitResult.set(svc.admitPendingAcquire(pending, () -> {}));
             });
             Thread rejecter = new Thread(() -> {
                 try {
                     barrier.await();
                 } catch (Exception ignored) {}
-                rejectResult.set(svc.rejectOldest(BUCKET, throttle429()));
+                rejectResult.set(svc.rejectPendingAcquire(pending, throttle429()));
             });
             admitter.start();
             rejecter.start();
@@ -112,148 +103,140 @@ public class WlmQueueingAdversarialTests extends OpenSearchTestCase {
             Thread.yield();
             assertEquals("iter " + iter + ": exactly one completion", 1, admits.get() + failures.get());
             assertTrue("iter " + iter + ": exactly one of admit/reject must claim the request", admitResult.get() ^ rejectResult.get());
-            assertEquals("iter " + iter + ": queue must be empty", 0, svc.currentDepth(GROUP));
+            assertEquals("iter " + iter + ": retained queue must be empty", 0, svc.retainedDepth(GROUP));
         }
     }
 
-    // ---------------------------------------------------------------------------------------------------------------
-    // PROBE 2 — reject-oldest victim selection and the dropped rejection
-    // ---------------------------------------------------------------------------------------------------------------
-
-    /** An empty bucket yields false: the rejection is dropped on the floor. Caller must cope. */
-    public void testRejectOldestOnEmptyBucketReturnsFalse() {
-        assertFalse("no queue object at all", service.rejectOldest(BUCKET, throttle429()));
-
-        // Now create the queue object, park and drain, leaving an empty bucket behind a live queue.
-        assertTrue(service.tryEnqueue(GROUP, BUCKET, task(), 5, ActionListener.wrap(p -> {}, e -> {})));
-        assertTrue(service.admitWithOwnPermit(BUCKET, () -> {}));
-        assertEquals(0, service.currentDepth(GROUP));
-        assertFalse("queue exists but bucket is empty", service.rejectOldest(BUCKET, throttle429()));
-    }
-
     /**
-     * VICTIM SWAP: the request whose acquire was refused registration is NOT necessarily the one that gets the 429.
-     * R1 parks, R2 parks; R2's acquire is granted and (FIFO) admits R1; R1's refused-registration callback then fires
-     * and rejects the head, which is now R2. Net accounting is still one-in one-out, but the 429 lands on the request
-     * whose own acquire succeeded.
+     * Owner-push can race the original denial response. Either the grant claims PENDING_ACQUIRE first and the denial is
+     * a no-op, or the denial transitions to WAITING first and the grant completes that wait. Both orders are safe.
      */
-    public void testRejectOldestFailsTheHeadNotTheRefusedRequest() throws Exception {
-        AtomicReference<String> r1Outcome = new AtomicReference<>();
-        AtomicReference<String> r2Outcome = new AtomicReference<>();
-        CountDownLatch both = new CountDownLatch(2);
-
-        assertTrue(service.tryEnqueue(GROUP, BUCKET, task(), 5, ActionListener.wrap(p -> {
-            r1Outcome.set("admitted");
-            both.countDown();
-        }, e -> {
-            r1Outcome.set("failed");
-            both.countDown();
-        })));
-        assertTrue(service.tryEnqueue(GROUP, BUCKET, task(), 5, ActionListener.wrap(p -> {
-            r2Outcome.set("admitted");
-            both.countDown();
-        }, e -> {
-            r2Outcome.set("failed");
-            both.countDown();
-        })));
-
-        // R2's own acquire came back granted -> admits the OLDEST, which is R1.
-        assertTrue(service.admitWithOwnPermit(BUCKET, () -> {}));
-        // R1's acquire came back denied-and-unregistered -> rejects the head, which is now R2.
-        assertTrue(service.rejectOldest(BUCKET, throttle429()));
-
-        assertTrue(both.await(10, TimeUnit.SECONDS));
-        assertEquals("R1 (the refused one) actually RAN", "admitted", r1Outcome.get());
-        assertEquals("R2 (whose acquire was granted) took the 429", "failed", r2Outcome.get());
-        assertEquals(0, service.currentDepth(GROUP));
-    }
-
-    /**
-     * N unregisterable denials can never reject more than N requests, and never more than the queue holds — so
-     * rejectOldest cannot over-reject a bucket.
-     */
-    public void testRejectOldestCannotOverRejectBeyondQueueDepth() throws Exception {
-        AtomicInteger failures = new AtomicInteger();
-        CountDownLatch latch = new CountDownLatch(2);
-        for (int i = 0; i < 2; i++) {
-            assertTrue(service.tryEnqueue(GROUP, BUCKET, task(), 5, ActionListener.wrap(p -> {}, e -> {
+    public void testPushedGrantAndDenialTransitionRaceCompletesExactlyOnce() throws Exception {
+        for (int iter = 0; iter < 200; iter++) {
+            WorkloadGroupQueueService svc = new WorkloadGroupQueueService(threadPool, stateAccessor);
+            AtomicInteger admits = new AtomicInteger();
+            AtomicInteger failures = new AtomicInteger();
+            CountDownLatch completed = new CountDownLatch(1);
+            WorkloadGroupQueue.QueuedRequest pending = svc.tryRegisterPendingAcquire(GROUP, BUCKET, task(), ActionListener.wrap(p -> {
+                admits.incrementAndGet();
+                completed.countDown();
+            }, e -> {
                 failures.incrementAndGet();
-                latch.countDown();
-            })));
+                completed.countDown();
+            }));
+            assertNotNull(pending);
+
+            CyclicBarrier barrier = new CyclicBarrier(2);
+            AtomicReference<Boolean> grantClaimed = new AtomicReference<>();
+            AtomicReference<WorkloadGroupQueueService.PendingAcquireTransition> denialResult = new AtomicReference<>();
+            Thread grant = new Thread(() -> {
+                try {
+                    barrier.await();
+                } catch (Exception ignored) {}
+                grantClaimed.set(svc.admitWithPermit(BUCKET, () -> {}));
+            });
+            Thread denial = new Thread(() -> {
+                try {
+                    barrier.await();
+                } catch (Exception ignored) {}
+                denialResult.set(svc.transitionPendingAcquireToWaiting(pending, 1, throttle429()));
+            });
+            grant.start();
+            denial.start();
+            grant.join();
+            denial.join();
+
+            assertTrue(completed.await(10, TimeUnit.SECONDS));
+            assertTrue(grantClaimed.get());
+            assertTrue(
+                denialResult.get() == WorkloadGroupQueueService.PendingAcquireTransition.WAITING
+                    || denialResult.get() == WorkloadGroupQueueService.PendingAcquireTransition.REQUEST_GONE
+            );
+            assertEquals(1, admits.get());
+            assertEquals(0, failures.get());
+            assertEquals(0, svc.retainedDepth(GROUP));
         }
-        assertTrue(service.rejectOldest(BUCKET, throttle429()));
-        assertTrue(service.rejectOldest(BUCKET, throttle429()));
-        assertFalse("third rejection has no victim", service.rejectOldest(BUCKET, throttle429()));
-
-        assertTrue(latch.await(10, TimeUnit.SECONDS));
-        assertEquals(2, failures.get());
-        assertEquals(0, service.currentDepth(GROUP));
     }
 
-    // ---------------------------------------------------------------------------------------------------------------
-    // PROBE 3 — cancellation handle interaction
-    // ---------------------------------------------------------------------------------------------------------------
+    /** A full WAITING bucket rejects the originating pending token, never the existing waiter. */
+    public void testQueueFullTransitionRejectsExactPendingRequest() throws Exception {
+        AtomicInteger existingAdmitted = new AtomicInteger();
+        AtomicInteger existingFailed = new AtomicInteger();
+        AtomicInteger pendingAdmitted = new AtomicInteger();
+        AtomicInteger pendingFailed = new AtomicInteger();
 
-    /**
-     * A task cancelled (and hence evicted by its cancellation callback) before rejectOldest runs must be completed
-     * exactly once — by the cancellation path — and rejectOldest must find nothing to reject.
-     */
-    public void testRejectOldestAfterCancellationEvictionDoesNotDoubleComplete() throws Exception {
+        assertTrue(
+            service.tryEnqueue(
+                GROUP,
+                BUCKET,
+                task(),
+                1,
+                ActionListener.wrap(p -> existingAdmitted.incrementAndGet(), e -> existingFailed.incrementAndGet())
+            )
+        );
+        WorkloadGroupQueue.QueuedRequest pending = service.tryRegisterPendingAcquire(
+            GROUP,
+            BUCKET,
+            task(),
+            ActionListener.wrap(p -> pendingAdmitted.incrementAndGet(), e -> pendingFailed.incrementAndGet())
+        );
+        assertNotNull(pending);
+
+        assertEquals(
+            WorkloadGroupQueueService.PendingAcquireTransition.QUEUE_FULL,
+            service.transitionPendingAcquireToWaiting(pending, 1, throttle429())
+        );
+        assertBusy(() -> assertEquals(1, pendingFailed.get()));
+        assertEquals(0, pendingAdmitted.get());
+        assertEquals(0, existingFailed.get());
+        assertEquals(1, service.currentDepth(GROUP));
+        assertEquals(1, service.retainedDepth(GROUP));
+
+        assertTrue(service.admitWithPermit(BUCKET, () -> {}));
+        assertBusy(() -> assertEquals(1, existingAdmitted.get()));
+    }
+
+    /** Cancellation removes a pending token, and every delayed acquire outcome becomes a harmless no-op. */
+    public void testCancellationBeforeAcquireResultCompletesExactlyOnce() throws Exception {
         SearchTask t = task();
         AtomicInteger completions = new AtomicInteger();
-        AtomicReference<Exception> failure = new AtomicReference<>();
-        CountDownLatch latch = new CountDownLatch(1);
-
-        assertTrue(service.tryEnqueue(GROUP, BUCKET, t, 5, ActionListener.wrap(p -> {
+        CountDownLatch completed = new CountDownLatch(1);
+        WorkloadGroupQueue.QueuedRequest pending = service.tryRegisterPendingAcquire(GROUP, BUCKET, t, ActionListener.wrap(p -> {
             completions.incrementAndGet();
-            latch.countDown();
+            completed.countDown();
         }, e -> {
             completions.incrementAndGet();
-            failure.set(e);
-            latch.countDown();
-        })));
+            completed.countDown();
+        }));
+        assertNotNull(pending);
 
-        t.cancel("client gone"); // fires the cancellation callback -> evictCancelled removes + fails it
-        assertTrue(latch.await(10, TimeUnit.SECONDS));
-        assertEquals("cancellation must be the single completion", 1, completions.get());
-        assertEquals(0, service.currentDepth(GROUP));
+        t.cancel("client gone");
+        assertTrue(completed.await(10, TimeUnit.SECONDS));
+        assertEquals(1, completions.get());
+        assertEquals(0, service.retainedDepth(GROUP));
 
-        assertFalse("the cancelled request is gone, so there is nothing to reject", service.rejectOldest(BUCKET, throttle429()));
+        assertFalse(service.admitPendingAcquire(pending, () -> {}));
+        assertFalse(service.rejectPendingAcquire(pending, throttle429()));
+        assertEquals(
+            WorkloadGroupQueueService.PendingAcquireTransition.REQUEST_GONE,
+            service.transitionPendingAcquireToWaiting(pending, 1, throttle429())
+        );
         Thread.yield();
-        assertEquals("rejectOldest must not add a second completion", 1, completions.get());
+        assertEquals(1, completions.get());
     }
 
-    /**
-     * Reverse order: rejectOldest claims the request first, then the task is cancelled. The cancellation callback must
-     * find it already removed and not complete it again.
-     */
-    public void testCancellationAfterRejectOldestDoesNotDoubleComplete() throws Exception {
-        SearchTask t = task();
-        AtomicInteger completions = new AtomicInteger();
-        CountDownLatch latch = new CountDownLatch(1);
-
-        assertTrue(service.tryEnqueue(GROUP, BUCKET, t, 5, ActionListener.wrap(p -> {
-            completions.incrementAndGet();
-            latch.countDown();
-        }, e -> {
-            completions.incrementAndGet();
-            latch.countDown();
-        })));
-
-        assertTrue(service.rejectOldest(BUCKET, throttle429()));
-        assertTrue(latch.await(10, TimeUnit.SECONDS));
-        t.cancel("too late"); // handle already released; entry already removed
-        Thread.yield();
-        assertEquals("exactly one completion across reject + cancel", 1, completions.get());
-        assertEquals(0, service.currentDepth(GROUP));
-    }
-
-    /** rejectOldest must not complete the listener inline on the caller's (transport) thread. */
-    public void testRejectOldestCompletesOffCallerThread() throws Exception {
+    /** Exact-entry rejection must not complete the listener inline on the caller's transport thread. */
+    public void testRejectPendingCompletesOffCallerThread() throws Exception {
         Thread caller = Thread.currentThread();
         AtomicReference<Thread> failedOn = new AtomicReference<>();
-        assertTrue(service.tryEnqueue(GROUP, BUCKET, task(), 5, ActionListener.wrap(p -> {}, e -> failedOn.set(Thread.currentThread()))));
-        assertTrue(service.rejectOldest(BUCKET, throttle429()));
+        WorkloadGroupQueue.QueuedRequest pending = service.tryRegisterPendingAcquire(
+            GROUP,
+            BUCKET,
+            task(),
+            ActionListener.wrap(p -> {}, e -> failedOn.set(Thread.currentThread()))
+        );
+        assertNotNull(pending);
+        assertTrue(service.rejectPendingAcquire(pending, throttle429()));
         assertBusy(() -> assertNotNull(failedOn.get()));
         assertNotSame("must be dispatched, not inline (caller is a transport thread)", caller, failedOn.get());
     }
@@ -333,41 +316,69 @@ public class WlmQueueingAdversarialTests extends OpenSearchTestCase {
     // total_queued / queue-wait accounting
     // ---------------------------------------------------------------------------------------------------------------
 
-    /** Parking starts a wait; only finishing one counts. */
-    public void testTryEnqueueDoesNotCountQueued() {
-        assertTrue(service.tryEnqueue(GROUP, BUCKET, task(), 5, ActionListener.wrap(p -> {}, e -> {})));
-        assertEquals("parking alone must not count as queued", 0, stateAccessor.getWorkloadGroupState(GROUP).getTotalQueued());
-        assertEquals("but it is visible as live depth", 1, service.currentDepth(GROUP));
+    /** A provisional owner round trip is retained for safety but is not visible as denied queue backlog. */
+    public void testPendingAcquireDoesNotCountOrAppearAsWaiting() {
+        WorkloadGroupQueue.QueuedRequest pending = service.tryRegisterPendingAcquire(
+            GROUP,
+            BUCKET,
+            task(),
+            ActionListener.wrap(p -> {}, e -> {})
+        );
+        assertNotNull(pending);
+        assertEquals(1, service.retainedDepth(GROUP));
+        assertEquals(0, service.currentDepth(GROUP));
+        assertEquals(0, service.peakDepth(GROUP));
+        assertEquals(0, stateAccessor.getWorkloadGroupState(GROUP).getTotalQueued());
     }
 
-    /**
-     * A self-supplied admission (enqueue-first pass-through) counts nothing; a pushed one counts exactly one queued
-     * request AND one wait sample. This is the invariant that makes total_queued a valid mean-wait denominator.
-     */
-    public void testOnlyPushedAdmissionsCountQueuedAndRecordWait() throws Exception {
-        assertTrue(service.tryEnqueue(GROUP, BUCKET, task(), 5, ActionListener.wrap(p -> {}, e -> {})));
-        assertTrue(service.admitWithOwnPermit(BUCKET, () -> {}));
-        assertEquals(
-            "an enqueue-first pass-through must not count as queued",
-            0,
-            stateAccessor.getWorkloadGroupState(GROUP).getTotalQueued()
+    /** A direct grant to PENDING_ACQUIRE counts neither a queue wait nor a throttle. */
+    public void testPendingDirectAdmissionDoesNotCountQueued() throws Exception {
+        WorkloadGroupQueue.QueuedRequest pending = service.tryRegisterPendingAcquire(
+            GROUP,
+            BUCKET,
+            task(),
+            ActionListener.wrap(p -> {}, e -> {})
         );
+        assertNotNull(pending);
+        assertTrue(service.admitPendingAcquire(pending, () -> {}));
+        assertEquals("a provisional pass-through must not count as queued", 0, stateAccessor.getWorkloadGroupState(GROUP).getTotalQueued());
         assertEquals("and must not record a wait", 0, stateAccessor.getWorkloadGroupState(GROUP).getTotalQueueWaitMillis());
+        assertEquals(0, service.retainedDepth(GROUP));
+    }
 
-        assertTrue(service.tryEnqueue(GROUP, BUCKET, task(), 5, ActionListener.wrap(p -> {}, e -> {})));
+    /** Once denial transitions the entry to WAITING, a pushed grant records exactly one completed queue wait. */
+    public void testPushedAdmissionAfterDenialCountsQueuedAndRecordsWait() {
+        WorkloadGroupQueue.QueuedRequest pending = service.tryRegisterPendingAcquire(
+            GROUP,
+            BUCKET,
+            task(),
+            ActionListener.wrap(p -> {}, e -> {})
+        );
+        assertNotNull(pending);
+        assertEquals(
+            WorkloadGroupQueueService.PendingAcquireTransition.WAITING,
+            service.transitionPendingAcquireToWaiting(pending, 1, throttle429())
+        );
+        assertEquals(1, service.currentDepth(GROUP));
         assertTrue(service.admitWithPermit(BUCKET, () -> {}));
-        // The wait itself may legitimately be 0ms, so the COUNT is what proves a sample was taken.
         assertEquals(
             "a pushed admission counts exactly one queued request",
             1,
             stateAccessor.getWorkloadGroupState(GROUP).getTotalQueued()
         );
+        assertEquals(0, service.currentDepth(GROUP));
     }
 
-    /** rejectOldest must NOT count the request as queued (it never waited for capacity). */
-    public void testRejectOldestDoesNotCountQueued() throws Exception {
-        assertTrue(service.tryEnqueue(GROUP, BUCKET, task(), 5, ActionListener.wrap(p -> {}, e -> {})));
-        assertTrue(service.rejectOldest(BUCKET, throttle429()));
+    /** An unregistered denial of a provisional request does not count as a completed queue wait. */
+    public void testRejectPendingDoesNotCountQueued() {
+        WorkloadGroupQueue.QueuedRequest pending = service.tryRegisterPendingAcquire(
+            GROUP,
+            BUCKET,
+            task(),
+            ActionListener.wrap(p -> {}, e -> {})
+        );
+        assertNotNull(pending);
+        assertTrue(service.rejectPendingAcquire(pending, throttle429()));
         assertEquals(
             "a request refused outright never waited, so it must not count as queued",
             0,
@@ -376,22 +387,22 @@ public class WlmQueueingAdversarialTests extends OpenSearchTestCase {
         assertEquals("and it must not record a queue wait either", 0, stateAccessor.getWorkloadGroupState(GROUP).getTotalQueueWaitMillis());
     }
 
-    /** rejectOldest on an unknown group must be a safe no-op, not an NPE. */
-    public void testRejectOldestUnknownGroupIsSafe() {
-        assertFalse(service.rejectOldest("nosuchgroup:group", throttle429()));
-        assertFalse(service.rejectOldest("weirdkeynocolon", throttle429()));
-    }
-
-    /** The failure instance handed to rejectOldest must be the one the client sees. */
-    public void testRejectOldestPropagatesTheGivenFailure() throws Exception {
+    /** The failure instance associated with the exact pending token must be the one its client sees. */
+    public void testRejectPendingPropagatesTheGivenFailure() throws Exception {
         OpenSearchRejectedExecutionException expected = throttle429();
         AtomicReference<Exception> seen = new AtomicReference<>();
         CountDownLatch latch = new CountDownLatch(1);
-        assertTrue(service.tryEnqueue(GROUP, BUCKET, task(), 5, ActionListener.wrap(p -> {}, e -> {
-            seen.set(e);
-            latch.countDown();
-        })));
-        assertTrue(service.rejectOldest(BUCKET, expected));
+        WorkloadGroupQueue.QueuedRequest pending = service.tryRegisterPendingAcquire(
+            GROUP,
+            BUCKET,
+            task(),
+            ActionListener.wrap(p -> {}, e -> {
+                seen.set(e);
+                latch.countDown();
+            })
+        );
+        assertNotNull(pending);
+        assertTrue(service.rejectPendingAcquire(pending, expected));
         assertTrue(latch.await(10, TimeUnit.SECONDS));
         assertSame("the client must receive exactly the supplied 429", expected, seen.get());
     }

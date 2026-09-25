@@ -11,6 +11,7 @@ package org.opensearch.wlm;
 import org.opensearch.test.OpenSearchTestCase;
 
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -238,5 +239,22 @@ public class SharedThrottleTrackerTests extends OpenSearchTestCase {
 
         // Idempotent: a second pass has nothing left to reclaim for that bucket.
         assertTrue("a repeat sweep must not re-report an already-reclaimed bucket", tracker.sweepExpired().isEmpty());
+    }
+
+    public void testSweepExpiredReportsExactReclaimedCountPerBucket() {
+        AtomicLong now = new AtomicLong(0L);
+        SharedThrottleTracker tracker = new SharedThrottleTracker(now::get);
+        assertTrue(tracker.tryAcquire("many", 5, "lease-a", 100L));
+        assertTrue(tracker.tryAcquire("many", 5, "lease-b", 100L));
+        assertTrue(tracker.tryAcquire("many", 5, "lease-c", 1_000L));
+
+        now.set(101L);
+
+        assertEquals(
+            "the owner needs one wake-up budget entry for every permit reclaimed in the same bucket",
+            Map.of("many", 2),
+            tracker.sweepExpiredCounts()
+        );
+        assertEquals(1, tracker.inFlight("many"));
     }
 }

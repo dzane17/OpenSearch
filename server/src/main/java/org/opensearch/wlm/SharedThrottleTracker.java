@@ -11,6 +11,7 @@ package org.opensearch.wlm;
 import org.opensearch.common.annotation.ExperimentalApi;
 
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
@@ -149,28 +150,35 @@ public class SharedThrottleTracker {
      * Reclaims all expired permits across every bucket. Intended to be called periodically by the owning service.
      * Safe to run concurrently with {@link #tryAcquire}/{@link #release} thanks to per-key {@code compute}.
      *
-     * @return the bucket keys for which at least one permit was reclaimed, i.e. those that just gained free capacity.
-     *         The caller must drive owner-push for these: an expiring permit is the only free-slot signal available when
-     *         the holder crashed or its release RPC was lost, so ignoring it strands a waiting coordinator's parked
-     *         request (there is no queue timeout to rescue it). Empty when nothing expired, which is the common case.
+     * @return the bucket keys for which at least one permit was reclaimed.
      */
     public List<String> sweepExpired() {
+        return new ArrayList<>(sweepExpiredCounts().keySet());
+    }
+
+    /**
+     * Reclaims all expired permits like {@link #sweepExpired()}, but preserves the exact number reclaimed per bucket so
+     * the owning service can offer every slot created by one sweep instead of collapsing several expiries to one wake-up.
+     *
+     * @return each bucket that gained free capacity mapped to its number of reclaimed permits
+     */
+    Map<String, Integer> sweepExpiredCounts() {
         final long now = nanoTimeSupplier.getAsLong();
-        final List<String> freedBuckets = new ArrayList<>();
+        final Map<String, Integer> freedByBucket = new HashMap<>();
         for (String bucketKey : permitsByBucket.keySet()) {
             permitsByBucket.computeIfPresent(bucketKey, (k, bucket) -> {
                 final int before = bucket.permits.size();
                 pruneExpired(bucket, now);
-                if (bucket.permits.size() < before) {
-                    // At least one slot just freed for this bucket. Reclaiming a permit here is the ONLY signal for a
-                    // holder that crashed or whose release RPC was lost — there is no release RPC to drive owner-push —
-                    // so the caller must be told, or a coordinator's parked request can strand with free capacity.
-                    freedBuckets.add(bucketKey);
+                final int reclaimed = before - bucket.permits.size();
+                if (reclaimed > 0) {
+                    // Preserve the count, not just the bucket identity. One sweep can reclaim many crashed holders, and
+                    // there is no release RPC per expired permit to generate the missing wake-ups.
+                    freedByBucket.put(bucketKey, reclaimed);
                 }
                 return bucket.permits.isEmpty() ? null : bucket;
             });
         }
-        return freedBuckets;
+        return freedByBucket;
     }
 
     // Current live (non-expired-at-read-time) count for a bucket. Package-private for tests.

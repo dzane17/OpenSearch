@@ -233,8 +233,8 @@ public class WorkloadGroupStats implements ToXContentObject, Writeable {
          * static factory method to convert {@link WorkloadGroupState} into {@link WorkloadGroupStatsHolder}, including
          * the point-in-time queue depth gauges (which live in the queue service, not the state).
          * @param workloadGroupState which needs to be converted
-         * @param queuedCurrent current queued depth for this group
-         * @param queuePeak peak queued depth for this group
+         * @param queuedCurrent current WAITING depth for this group (excludes provisional owner acquires)
+         * @param queuePeak peak WAITING depth for this group
          * @return WorkloadGroupStatsHolder object
          */
         public static WorkloadGroupStatsHolder from(WorkloadGroupState workloadGroupState, long queuedCurrent, long queuePeak) {

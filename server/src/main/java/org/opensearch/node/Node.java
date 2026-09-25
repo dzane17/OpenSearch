@@ -1444,6 +1444,8 @@ public class Node implements Closeable {
             workloadGroupService.setQueueService(workloadGroupQueueService);
             // Owner-push grant -> admit one queued request against the reserved shared permit.
             workloadGroupSharedThrottleService.setGrantConsumer(workloadGroupQueueService::admitWithPermit);
+            // Owner-ring change -> inspect only this coordinator's retained buckets and re-register those that moved.
+            workloadGroupSharedThrottleService.setRetainedBucketKeysSupplier(workloadGroupQueueService::retainedBucketKeys);
 
             TopNSearchTasksLogger taskConsumer = new TopNSearchTasksLogger(settings, settingsModule.getClusterSettings());
             transportService.getTaskManager().registerTaskResourceConsumer(taskConsumer);
