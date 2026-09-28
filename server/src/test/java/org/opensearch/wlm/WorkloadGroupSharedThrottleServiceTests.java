@@ -36,6 +36,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.ExecutorService;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
@@ -91,6 +92,10 @@ public class WorkloadGroupSharedThrottleServiceTests extends OpenSearchTestCase 
 
     private WorkloadGroup workloadGroup(String groupId, int sharedLimit) {
         Settings throttling = Settings.builder().put("attribute", "group").put("shared_limit", sharedLimit).build();
+        return workloadGroup(groupId, throttling);
+    }
+
+    private WorkloadGroup workloadGroup(String groupId, Settings throttling) {
         return new WorkloadGroup(
             groupId + "-name",
             groupId,
@@ -102,6 +107,15 @@ public class WorkloadGroupSharedThrottleServiceTests extends OpenSearchTestCase 
             ),
             1L
         );
+    }
+
+    private ClusterState stateWithGroups(DiscoveryNodes nodes, Map<String, WorkloadGroup> groups) {
+        Metadata stateMetadata = Mockito.mock(Metadata.class);
+        when(stateMetadata.workloadGroups()).thenReturn(groups);
+        ClusterState state = Mockito.mock(ClusterState.class);
+        when(state.nodes()).thenReturn(nodes);
+        when(state.metadata()).thenReturn(stateMetadata);
+        return state;
     }
 
     private WorkloadGroupSharedThrottleService newService() {
@@ -306,6 +320,78 @@ public class WorkloadGroupSharedThrottleServiceTests extends OpenSearchTestCase 
         while (grantedPermits.isEmpty() == false) {
             grantedPermits.remove(0).close();
         }
+        assertEquals(0, service.tracker().inFlight(bucket));
+    }
+
+    public void testClusterChangePrunesWaitersForDeletedGroup() {
+        final String groupId = "deleted-group";
+        final String bucket = groupId + ":group";
+        final int sharedLimit = 1;
+        WorkloadGroupSharedThrottleService service = newService();
+        stubGroupFor(bucket, sharedLimit);
+        AtomicReference<Runnable> cleanupTask = new AtomicReference<>();
+        ExecutorService genericExecutor = Mockito.mock(ExecutorService.class);
+        Mockito.doAnswer(invocation -> {
+            cleanupTask.set((Runnable) invocation.getArgument(0));
+            return null;
+        }).when(genericExecutor).execute(Mockito.any(Runnable.class));
+        when(threadPool.executor(ThreadPool.Names.GENERIC)).thenReturn(genericExecutor);
+
+        Releasable holder = awaitGrant(service, bucket, sharedLimit);
+        AtomicReference<Exception> denial = new AtomicReference<>();
+        service.acquireAsync(
+            bucket,
+            sharedLimit,
+            ActionListener.wrap(p -> fail("the shared limit is full"), denial::set),
+            () -> fail("the local owner must register itself")
+        );
+        assertTrue(denial.get() instanceof OpenSearchRejectedExecutionException);
+        assertEquals(1, service.waiterCountForTest(bucket));
+
+        DiscoveryNodes nodes = clusterService.state().nodes();
+        ClusterState previousState = stateWithGroups(nodes, Map.of(groupId, workloadGroup(groupId, sharedLimit)));
+        ClusterState currentState = stateWithGroups(nodes, Map.of());
+        when(clusterService.state()).thenReturn(currentState);
+
+        service.clusterChanged(new ClusterChangedEvent("workload group deleted", currentState, previousState));
+
+        assertNotNull("cleanup must be scheduled off the cluster-applier thread", cleanupTask.get());
+        assertEquals("the asynchronous cleanup must not run inline", 1, service.waiterCountForTest(bucket));
+        cleanupTask.get().run();
+        assertEquals("deleting the group must prune its owner-side waiter membership", 0, service.waiterCountForTest(bucket));
+        holder.close();
+        assertEquals(0, service.tracker().inFlight(bucket));
+    }
+
+    public void testClusterChangePrunesWaitersWhenSharedTierIsRemoved() {
+        final String groupId = "shared-tier-removed";
+        final String bucket = groupId + ":group";
+        final int sharedLimit = 1;
+        WorkloadGroupSharedThrottleService service = newService();
+        stubGroupFor(bucket, sharedLimit);
+        when(threadPool.executor(ThreadPool.Names.GENERIC)).thenReturn(OpenSearchExecutors.newDirectExecutorService());
+
+        Releasable holder = awaitGrant(service, bucket, sharedLimit);
+        AtomicReference<Exception> denial = new AtomicReference<>();
+        service.acquireAsync(
+            bucket,
+            sharedLimit,
+            ActionListener.wrap(p -> fail("the shared limit is full"), denial::set),
+            () -> fail("the local owner must register itself")
+        );
+        assertTrue(denial.get() instanceof OpenSearchRejectedExecutionException);
+        assertEquals(1, service.waiterCountForTest(bucket));
+
+        DiscoveryNodes nodes = clusterService.state().nodes();
+        ClusterState previousState = stateWithGroups(nodes, Map.of(groupId, workloadGroup(groupId, sharedLimit)));
+        Settings nodeOnlyThrottling = Settings.builder().put("attribute", "group").put("node_limit", 1).build();
+        ClusterState currentState = stateWithGroups(nodes, Map.of(groupId, workloadGroup(groupId, nodeOnlyThrottling)));
+        when(clusterService.state()).thenReturn(currentState);
+
+        service.clusterChanged(new ClusterChangedEvent("shared tier removed", currentState, previousState));
+
+        assertEquals("removing shared_limit must prune the owner-side waiter membership", 0, service.waiterCountForTest(bucket));
+        holder.close();
         assertEquals(0, service.tracker().inFlight(bucket));
     }
 

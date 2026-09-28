@@ -38,6 +38,7 @@ import org.opensearch.transport.TransportService;
 
 import java.io.IOException;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.LinkedHashSet;
 import java.util.Map;
 import java.util.Objects;
@@ -126,7 +127,8 @@ public class WorkloadGroupSharedThrottleService implements ClusterStateListener 
     // hand-off (the coordinator may still have more queued requests), and successive freed slots round-robin fairly
     // across coordinators instead of repeatedly serving whichever one hashes first. A coordinator is removed when a
     // grant comes back unused, when an offer selects it while disconnected, when a failed GRANT has no fresh
-    // re-registration, or when this node loses ownership. Until one of those events, stale incarnations may remain.
+    // re-registration, when its group loses the shared tier, or when this node loses ownership. Until one of those events,
+    // stale incarnations may remain.
     // No request identity is held (the requests live on their coordinators).
     // LinkedHashSet is NOT thread-safe, so every access — read, size, add, remove, rotate — MUST go through
     // compute/computeIfPresent on this map, whose per-key exclusive remapping is the sole lock guarding the inner set.
@@ -256,6 +258,11 @@ public class WorkloadGroupSharedThrottleService implements ClusterStateListener 
             scheduleWaiterReRegistrationAfterOwnerChange(previousRing, currentRing);
         }
 
+        // Deleting a group or removing its shared tier drains coordinator-local queues, but there is no per-bucket
+        // deregistration RPC for that configuration cutover. Prune the corresponding owner-side waiter memberships here;
+        // otherwise currentSharedLimit() remains UNSET and future release/expiry events can never reconcile them.
+        scheduleWaiterRemovalForLostSharedTiers(event);
+
         // A numeric shared_limit increase creates several slots without any corresponding release RPC. Offer exactly
         // the added capacity from this configuration-change hook; ordinary request completion remains a one-slot event
         // and therefore never runs a fill-to-limit loop on the hot release path.
@@ -273,6 +280,59 @@ public class WorkloadGroupSharedThrottleService implements ClusterStateListener 
         // The old permit remains recorded
         // until release/TTL; if this process regains the bucket first, it may temporarily count against the live limit.
         grantsAwaitingResponse.keySet().removeIf(key -> isLocalOwner(currentRing, key.bucketKey) == false);
+    }
+
+    private void scheduleWaiterRemovalForLostSharedTiers(ClusterChangedEvent event) {
+        if (event.state().metadata() == null || event.previousState().metadata() == null) {
+            return;
+        }
+        final Map<String, WorkloadGroup> currentGroups = event.state().metadata().workloadGroups();
+        final Map<String, WorkloadGroup> previousGroups = event.previousState().metadata().workloadGroups();
+        if (currentGroups == null || previousGroups == null) {
+            return;
+        }
+
+        final Set<String> groupsWithoutSharedTier = new HashSet<>();
+        for (Map.Entry<String, WorkloadGroup> entry : previousGroups.entrySet()) {
+            if (sharedLimit(entry.getValue()) == WorkloadGroupThrottleSettings.UNSET_LIMIT) {
+                continue;
+            }
+            final WorkloadGroup currentGroup = currentGroups.get(entry.getKey());
+            if (currentGroup == null || sharedLimit(currentGroup) == WorkloadGroupThrottleSettings.UNSET_LIMIT) {
+                groupsWithoutSharedTier.add(entry.getKey());
+            }
+        }
+        if (groupsWithoutSharedTier.isEmpty()) {
+            return;
+        }
+
+        try {
+            threadPool.executor(ThreadPool.Names.GENERIC).execute(() -> {
+                // Snapshot on the worker, not the cluster-applier thread. This also captures waiter registrations that
+                // raced the cluster-state update but completed before the cleanup task began.
+                for (String bucketKey : Set.copyOf(waitersByBucket.keySet())) {
+                    if (groupsWithoutSharedTier.contains(groupIdOf(bucketKey))) {
+                        try {
+                            // A newer cluster state may have restored the shared tier before this asynchronous task ran.
+                            // Re-check under the same per-bucket map lock used by waiter registration so stale cleanup
+                            // cannot erase a waiter registered against the restored configuration.
+                            waitersByBucket.computeIfPresent(
+                                bucketKey,
+                                (key, nodes) -> currentSharedLimit(key) == WorkloadGroupThrottleSettings.UNSET_LIMIT ? null : nodes
+                            );
+                        } catch (Exception e) {
+                            logger.debug("Failed to remove stale shared-throttle waiters for bucket [" + bucketKey + "]", e);
+                        }
+                    }
+                }
+                // Leave grantsAwaitingResponse intact: their transport callbacks still own reserved permits and will
+                // settle those exact records. Removing waiter membership prevents further grants while preserving
+                // callback race handling.
+            });
+        } catch (Exception e) {
+            // Shutdown may reject cleanup. The process is already discarding this in-memory owner state in that case.
+            logger.debug("Could not schedule shared-throttle waiter cleanup after a group lost its shared tier", e);
+        }
     }
 
     private void scheduleWaiterReRegistrationAfterOwnerChange(ThrottleOwnerSelector previousRing, ThrottleOwnerSelector currentRing) {

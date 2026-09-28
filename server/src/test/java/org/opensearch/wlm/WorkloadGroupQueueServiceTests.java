@@ -328,6 +328,41 @@ public class WorkloadGroupQueueServiceTests extends OpenSearchTestCase {
         assertNotSame("admit must complete the listener off the caller thread (recursion-safety)", callerThread, respondedOn.get());
     }
 
+    public void testPendingDirectGrantCompletesInline() {
+        Thread callerThread = Thread.currentThread();
+        AtomicReference<Thread> respondedOn = new AtomicReference<>();
+        WorkloadGroupQueue.QueuedRequest pending = service.tryRegisterPendingAcquire(
+            "g1",
+            "g1:group",
+            task(),
+            ActionListener.wrap(p -> respondedOn.set(Thread.currentThread()), e -> fail(e.getMessage()))
+        );
+        assertNotNull(pending);
+        assertTrue(service.admitPendingAcquire(pending, () -> {}));
+        assertSame(callerThread, respondedOn.get());
+        assertEquals(0, service.retainedDepth("g1"));
+    }
+
+    public void testPendingAcquireThatReachedWaitingCompletesOffCallerThread() throws Exception {
+        Thread callerThread = Thread.currentThread();
+        AtomicReference<Thread> respondedOn = new AtomicReference<>();
+        WorkloadGroupQueue.QueuedRequest pending = service.tryRegisterPendingAcquire(
+            "g1",
+            "g1:group",
+            task(),
+            ActionListener.wrap(p -> respondedOn.set(Thread.currentThread()), e -> fail(e.getMessage()))
+        );
+        assertNotNull(pending);
+        assertEquals(
+            WorkloadGroupQueueService.PendingAcquireTransition.WAITING,
+            service.transitionPendingAcquireToWaiting(pending, 5, new RuntimeException("queue full"))
+        );
+        assertTrue(service.admitPendingAcquire(pending, () -> {}));
+        assertBusy(() -> assertNotNull(respondedOn.get()));
+        assertNotSame(callerThread, respondedOn.get());
+        assertEquals(0, service.retainedDepth("g1"));
+    }
+
     // Regression for the exactly-once contract on cancellation-during-enqueue: an already-cancelled task must not be
     // left parked, and its listener is failed exactly once.
     public void testEnqueueOfAlreadyCancelledTaskFailsExactlyOnce() throws Exception {

@@ -41,8 +41,9 @@ import java.util.function.Function;
  *       not driven by this sweep.</li>
  * </ul>
  * Concurrency: each bucket's request set is guarded by a per-bucket lock ({@link KeyedLock}); group totals are atomics
- * inside {@link WorkloadGroupQueue}. A retained listener is never completed while a bucket lock is held — every
- * admission or rejection dispatches listener completion onto an executor.
+ * inside {@link WorkloadGroupQueue}. A retained listener is never completed while a bucket lock is held. Actual WAITING
+ * admissions and retained-request failures dispatch listener completion onto an executor; a direct PENDING_ACQUIRE
+ * grant completes inline after releasing the lock, matching the queue-disabled shared path.
  */
 @ExperimentalApi
 public class WorkloadGroupQueueService {
@@ -54,6 +55,9 @@ public class WorkloadGroupQueueService {
     private final Map<String, WorkloadGroupQueue> queuesByGroup = new ConcurrentHashMap<>();
     private final KeyedLock<String> bucketLocks = new KeyedLock<>();
 
+    /**
+     * Result of transitioning a retained shared-throttle acquire from pending to waiting.
+     */
     @ExperimentalApi
     public enum PendingAcquireTransition {
         WAITING,
@@ -189,13 +193,25 @@ public class WorkloadGroupQueueService {
             return false;
         }
         final boolean removed;
+        final boolean wasWaiting;
         try (Releasable ignored = bucketLocks.acquire(lockKey(groupId, req.bucketKey()))) {
+            wasWaiting = req.isWaiting();
             removed = queue.remove(req);
         }
         if (removed == false) {
             return false;
         }
-        admit(req, permit, req.isWaiting());
+        if (wasWaiting) {
+            admit(req, permit, true);
+            return true;
+        }
+        req.releaseCancellationHandle();
+        if (req.task().isCancelled()) {
+            permit.close();
+            req.listener().onFailure(new TaskCancelledException("task cancelled while queued"));
+        } else {
+            req.listener().onResponse(permit);
+        }
         return true;
     }
 
