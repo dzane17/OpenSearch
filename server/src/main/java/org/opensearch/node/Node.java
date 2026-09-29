@@ -308,6 +308,7 @@ import org.opensearch.transport.client.Client;
 import org.opensearch.transport.client.node.NodeClient;
 import org.opensearch.usage.UsageService;
 import org.opensearch.watcher.ResourceWatcherService;
+import org.opensearch.wlm.WorkloadGroupQueueService;
 import org.opensearch.wlm.WorkloadGroupService;
 import org.opensearch.wlm.WorkloadGroupSharedThrottleService;
 import org.opensearch.wlm.WorkloadGroupsStateAccessor;
@@ -1433,6 +1434,19 @@ public class Node implements Closeable {
                 transportService
             );
             workloadGroupService.setSharedThrottleService(workloadGroupSharedThrottleService);
+
+            // Coordinator-local retained requests: node-tier denials enter WAITING; shared-tier requests enter
+            // PENDING_ACQUIRE before the owner verdict and transition to WAITING only after a registered denial. They are
+            // admitted by node-permit handoff/recovery, owner-pushed shared grants, or live-configuration drains.
+            final WorkloadGroupQueueService workloadGroupQueueService = new WorkloadGroupQueueService(
+                threadPool,
+                workloadGroupsStateAccessor
+            );
+            workloadGroupService.setQueueService(workloadGroupQueueService);
+            // Owner-push grant -> admit one queued request against the reserved shared permit.
+            workloadGroupSharedThrottleService.setGrantConsumer(workloadGroupQueueService::admitWithPermit);
+            // Owner-ring change -> inspect only this coordinator's retained buckets and re-register those that moved.
+            workloadGroupSharedThrottleService.setRetainedBucketKeysSupplier(workloadGroupQueueService::retainedBucketKeys);
 
             TopNSearchTasksLogger taskConsumer = new TopNSearchTasksLogger(settings, settingsModule.getClusterSettings());
             transportService.getTaskManager().registerTaskResourceConsumer(taskConsumer);

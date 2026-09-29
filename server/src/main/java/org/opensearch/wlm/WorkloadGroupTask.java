@@ -11,11 +11,14 @@ package org.opensearch.wlm;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.opensearch.common.annotation.PublicApi;
+import org.opensearch.common.lease.Releasable;
 import org.opensearch.common.unit.TimeValue;
 import org.opensearch.common.util.concurrent.ThreadContext;
 import org.opensearch.core.tasks.TaskId;
 import org.opensearch.tasks.CancellableTask;
 
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Map;
 import java.util.function.LongSupplier;
 import java.util.function.Supplier;
@@ -42,6 +45,14 @@ public class WorkloadGroupTask extends CancellableTask {
     private final LongSupplier nanoTimeSupplier;
     private String workloadGroupId;
     private boolean isWorkloadGroupSet = false;
+
+    // Cancellation callbacks for a request parked in the WLM request queue. A queued request holds no thread; when the
+    // task is cancelled (client disconnect or cancel_after timer, both of which cancel the task rather than completing
+    // the parked listener), the queue must evict the entry and fail the listener. Guarded by its own lock and fired at
+    // most once: once cancelled, a later register runs immediately so there is no lost-cancellation race.
+    private final Object cancelCallbackLock = new Object();
+    private List<Runnable> onCancelledCallbacks = new ArrayList<>();
+    private boolean cancellationNotified = false;
 
     public WorkloadGroupTask(long id, String type, String action, String description, TaskId parentTaskId, Map<String, String> headers) {
         this(id, type, action, description, parentTaskId, headers, NO_TIMEOUT, System::nanoTime);
@@ -109,5 +120,54 @@ public class WorkloadGroupTask extends CancellableTask {
     @Override
     public boolean shouldCancelChildrenOnCancellation() {
         return false;
+    }
+
+    /**
+     * Registers a callback invoked once if this task is cancelled, and returns a {@link Releasable} that deregisters it.
+     * If the task is already cancelled the callback runs immediately (so there is no window where a cancellation between
+     * the cancel check and registration is lost). Used by the WLM request queue to evict and fail a parked request whose
+     * client disconnected or whose {@code cancel_after} timer fired — both cancel the task rather than completing the
+     * parked listener, so the queue observes cancellation here.
+     *
+     * @param callback run at most once on cancellation
+     * @return a {@link Releasable} that removes the callback if the request is admitted/drained before any cancellation
+     */
+    public final Releasable addOnCancelledCallback(Runnable callback) {
+        synchronized (cancelCallbackLock) {
+            if (cancellationNotified || isCancelled()) {
+                // Already cancelled: run now rather than register, so a cancellation that landed before registration
+                // is never dropped. Nothing to deregister.
+                callback.run();
+                return () -> {};
+            }
+            onCancelledCallbacks.add(callback);
+        }
+        return () -> {
+            synchronized (cancelCallbackLock) {
+                if (onCancelledCallbacks != null) {
+                    onCancelledCallbacks.remove(callback);
+                }
+            }
+        };
+    }
+
+    @Override
+    protected void onCancelled() {
+        final List<Runnable> callbacks;
+        synchronized (cancelCallbackLock) {
+            if (cancellationNotified) {
+                return;
+            }
+            cancellationNotified = true;
+            callbacks = onCancelledCallbacks;
+            onCancelledCallbacks = null;
+        }
+        for (Runnable callback : callbacks) {
+            try {
+                callback.run();
+            } catch (Exception e) {
+                logger.warn("WorkloadGroupTask onCancelled callback failed", e);
+            }
+        }
     }
 }

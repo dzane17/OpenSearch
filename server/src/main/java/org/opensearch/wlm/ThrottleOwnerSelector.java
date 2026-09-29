@@ -45,10 +45,11 @@ import java.util.TreeMap;
  * Instances are immutable snapshots; {@link WorkloadGroupSharedThrottleService} rebuilds one whenever the
  * discovery-node set changes.
  * <p>
- * <b>Transient ceiling breach on rebalance.</b> When a bucket remaps to a new owner (node join/leave), the previous
- * owner still holds permits for that bucket's in-flight requests while the new owner starts counting from zero, so the
- * bucket's cluster-wide in-flight count can briefly exceed {@code shared_limit} (up to ~2x) until the old permits drain
- * or TTL out. This is inherent to stateless consistent hashing and is accepted for this experimental feature.
+ * <b>Transient rebalance effects.</b> When a bucket remaps to a different owner (node join/leave), the previous owner
+ * still holds permits for that bucket's in-flight requests while the new process starts counting from zero, so the
+ * cluster-wide in-flight count can briefly exceed {@code shared_limit} (up to ~2x for one remap) until old requests
+ * finish or their permits expire. If the same live process later regains the bucket, its retained old records can
+ * instead delay admission until release or TTL. Both are accepted for this experimental feature.
  */
 @ExperimentalApi
 public class ThrottleOwnerSelector {

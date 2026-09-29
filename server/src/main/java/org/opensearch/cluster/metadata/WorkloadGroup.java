@@ -78,18 +78,35 @@ public class WorkloadGroup extends AbstractDiffable<WorkloadGroup> implements To
         // Drop null-valued "clear" keys before storage (meaningful only during an update merge, not on create).
         Settings normalizedSettings = stripClearMarkers(mutableWorkloadGroupFragment.getSettings());
         Settings normalizedThrottling = stripClearMarkers(mutableWorkloadGroupFragment.getThrottling());
+        Settings normalizedQueue = stripClearMarkers(mutableWorkloadGroupFragment.getQueue());
         if (normalizedSettings.equals(mutableWorkloadGroupFragment.getSettings()) == false
-            || normalizedThrottling.equals(mutableWorkloadGroupFragment.getThrottling()) == false) {
+            || normalizedThrottling.equals(mutableWorkloadGroupFragment.getThrottling()) == false
+            || normalizedQueue.equals(mutableWorkloadGroupFragment.getQueue()) == false) {
             mutableWorkloadGroupFragment = new MutableWorkloadGroupFragment(
                 mutableWorkloadGroupFragment.getResiliencyMode(),
                 mutableWorkloadGroupFragment.getResourceLimits(),
                 normalizedSettings,
-                normalizedThrottling
+                normalizedThrottling,
+                normalizedQueue
             );
         }
 
         // Cross-field checks on the merged throttling config (attribute required with a limit; ceiling must be >= 1).
         WorkloadGroupThrottleSettings.validateMergedConfig(mutableWorkloadGroupFragment.getThrottling());
+        // A queue is deliberately NOT required to come with a throttle limit. Queueing engages only on a throttle denial,
+        // so a queue configured without one is simply inert — admission fails open before it can ever reach the queue, and
+        // the queue object is allocated lazily on first enqueue, so it costs nothing at all. Rejecting the combination
+        // would buy nothing and cost two things:
+        // - It would make disabling a throttle destructive. Validation runs against the fully MERGED config, so
+        // clearing throttling.* would force clearing queue.* in the same request — losing the queue sizing an
+        // operator has to retype when re-enabling.
+        // - Every check here also runs on the cluster-state READ path (see the StreamInput constructor below), so a
+        // throw is not a rejected API call, it is a node that cannot apply metadata. Today nothing can create such a
+        // group, but the moment any other build persists one (a later relaxation, a queue-only default) every node
+        // enforcing the rule would fail to deserialize the group. An inert setting is a much better failure mode
+        // than unreadable metadata.
+        // The runtime already treats "queue present, throttling absent" as a first-class state: WorkloadGroupService's
+        // clusterChanged releases any existing backlog untracked once neither limit is set.
 
         this.name = name;
         this._id = _id;
@@ -127,10 +144,14 @@ public class WorkloadGroup extends AbstractDiffable<WorkloadGroup> implements To
             existingGroup.getMutableWorkloadGroupFragment().getThrottling(),
             mutableWorkloadGroupFragment.getThrottling()
         );
+        final Settings updatedQueue = mergeSettings(
+            existingGroup.getMutableWorkloadGroupFragment().getQueue(),
+            mutableWorkloadGroupFragment.getQueue()
+        );
         return new WorkloadGroup(
             existingGroup.getName(),
             existingGroup.get_id(),
-            new MutableWorkloadGroupFragment(mode, updatedResourceLimits, updatedSettings, updatedThrottling),
+            new MutableWorkloadGroupFragment(mode, updatedResourceLimits, updatedSettings, updatedThrottling, updatedQueue),
             Instant.now().getMillis()
         );
     }
@@ -336,7 +357,8 @@ public class WorkloadGroup extends AbstractDiffable<WorkloadGroup> implements To
                     mutableWorkloadGroupFragment1.parseField(parser, fieldName);
                 } else if (token == XContentParser.Token.VALUE_NULL) {
                     if (fieldName.equals(MutableWorkloadGroupFragment.SETTINGS_STRING)
-                        || fieldName.equals(MutableWorkloadGroupFragment.THROTTLING_STRING)) {
+                        || fieldName.equals(MutableWorkloadGroupFragment.THROTTLING_STRING)
+                        || fieldName.equals(MutableWorkloadGroupFragment.QUEUE_STRING)) {
                         mutableWorkloadGroupFragment1.parseField(parser, fieldName);
                     }
                 }
