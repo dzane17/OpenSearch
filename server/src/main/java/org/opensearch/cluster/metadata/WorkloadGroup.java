@@ -24,6 +24,7 @@ import org.opensearch.core.xcontent.XContentParser;
 import org.opensearch.wlm.MutableWorkloadGroupFragment;
 import org.opensearch.wlm.MutableWorkloadGroupFragment.ResiliencyMode;
 import org.opensearch.wlm.ResourceType;
+import org.opensearch.wlm.WorkloadGroupQueueSettings;
 import org.opensearch.wlm.WorkloadGroupThrottleSettings;
 import org.joda.time.Instant;
 
@@ -92,14 +93,17 @@ public class WorkloadGroup extends AbstractDiffable<WorkloadGroup> implements To
         // Drop null clear-markers; they only mean something during an update merge.
         Settings normalizedSettings = stripClearMarkers(mutableWorkloadGroupFragment.getSettings());
         Settings normalizedThrottling = stripClearMarkers(mutableWorkloadGroupFragment.getThrottling());
+        Settings normalizedQueue = stripClearMarkers(mutableWorkloadGroupFragment.getQueue());
         if (normalizedSettings.equals(mutableWorkloadGroupFragment.getSettings()) == false
-            || normalizedThrottling.equals(mutableWorkloadGroupFragment.getThrottling()) == false) {
-            // Skip re-validation here; validateMergedConfig below decides strict vs. lenient.
+            || normalizedThrottling.equals(mutableWorkloadGroupFragment.getThrottling()) == false
+            || normalizedQueue.equals(mutableWorkloadGroupFragment.getQueue()) == false) {
+            // Skip re-validation here; the merged-config checks below decide strict vs. lenient.
             mutableWorkloadGroupFragment = new MutableWorkloadGroupFragment(
                 mutableWorkloadGroupFragment.getResiliencyMode(),
                 mutableWorkloadGroupFragment.getResourceLimits(),
                 normalizedSettings,
                 normalizedThrottling,
+                normalizedQueue,
                 false
             );
         }
@@ -116,9 +120,27 @@ public class WorkloadGroup extends AbstractDiffable<WorkloadGroup> implements To
                     e.getMessage()
                 );
             }
+            try {
+                WorkloadGroupQueueSettings.validate(mutableWorkloadGroupFragment.getQueue());
+            } catch (IllegalArgumentException e) {
+                logger.warn(
+                    "Accepting workload group [{}] with a queue config this node considers invalid ({}); "
+                        + "throttled requests will not be queued for it here",
+                    name,
+                    e.getMessage()
+                );
+            }
         } else {
             WorkloadGroupThrottleSettings.validateMergedConfig(mutableWorkloadGroupFragment.getThrottling());
+            WorkloadGroupQueueSettings.validate(mutableWorkloadGroupFragment.getQueue());
         }
+        // A queue is deliberately NOT required to come with a throttle limit. Queueing engages only on a throttle denial,
+        // so a queue configured without one is simply inert: admission never reaches the queue, and the queue object is
+        // allocated lazily on first retained request. Rejecting the combination would make disabling a throttle
+        // destructive (validation runs against the MERGED config, so clearing throttling.* would force clearing queue.*
+        // in the same request), and since these checks also run on the cluster-state read path, it would turn a group
+        // persisted by a more permissive build into unreadable metadata. WorkloadGroupService releases any existing
+        // backlog untracked once the last throttle tier is removed.
 
         this.name = name;
         this._id = _id;
@@ -156,10 +178,14 @@ public class WorkloadGroup extends AbstractDiffable<WorkloadGroup> implements To
             existingGroup.getMutableWorkloadGroupFragment().getThrottling(),
             mutableWorkloadGroupFragment.getThrottling()
         );
+        final Settings updatedQueue = mergeSettings(
+            existingGroup.getMutableWorkloadGroupFragment().getQueue(),
+            mutableWorkloadGroupFragment.getQueue()
+        );
         return new WorkloadGroup(
             existingGroup.getName(),
             existingGroup.get_id(),
-            new MutableWorkloadGroupFragment(mode, updatedResourceLimits, updatedSettings, updatedThrottling),
+            new MutableWorkloadGroupFragment(mode, updatedResourceLimits, updatedSettings, updatedThrottling, updatedQueue),
             Instant.now().getMillis()
         );
     }
@@ -370,7 +396,8 @@ public class WorkloadGroup extends AbstractDiffable<WorkloadGroup> implements To
                     mutableWorkloadGroupFragment1.parseField(parser, fieldName);
                 } else if (token == XContentParser.Token.VALUE_NULL) {
                     if (fieldName.equals(MutableWorkloadGroupFragment.SETTINGS_STRING)
-                        || fieldName.equals(MutableWorkloadGroupFragment.THROTTLING_STRING)) {
+                        || fieldName.equals(MutableWorkloadGroupFragment.THROTTLING_STRING)
+                        || fieldName.equals(MutableWorkloadGroupFragment.QUEUE_STRING)) {
                         mutableWorkloadGroupFragment1.parseField(parser, fieldName);
                     }
                 }

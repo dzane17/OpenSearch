@@ -92,7 +92,8 @@ public class TransportSearchScrollAction extends HandledTransportAction<SearchSc
                     proceedListener.onFailure(e);
                 }
             }, listener::onFailure);
-            workloadGroupService.acquireThrottlePermit(workloadGroupTask, () -> false, admissionListener);
+            // A scroll page is throttled but never queued: parked behind a backlog it could outlive its keep_alive.
+            workloadGroupService.acquireThrottlePermitWithoutQueueing(workloadGroupTask, admissionListener);
             return;
         }
         executeScroll(task, request, listener);

@@ -98,12 +98,26 @@ public class WorkloadGroupStats implements ToXContentObject, Writeable {
         public static final String FAILURES = "failures";
         public static final String TOTAL_THROTTLED = "total_throttled";
         public static final String TOTAL_WOULD_THROTTLE = "total_would_throttle";
+        public static final String QUEUED = "total_queued";
+        public static final String QUEUE_REJECTIONS = "total_queue_rejections";
+        public static final String QUEUED_CURRENT = "queued_current";
+        public static final String QUEUE_PEAK = "queue_peak";
+        public static final String TOTAL_QUEUE_WAIT_MILLIS = "total_queue_wait_millis";
+        public static final String MAX_QUEUE_WAIT_MILLIS = "max_queue_wait_millis";
         private long completions;
         private long rejections;
         private long failures;
         private long cancellations;
         private long throttled;
         private long wouldThrottle;
+        private long queued;
+        private long queueRejections;
+        private long queuedCurrent;
+        private long queuePeak;
+        // Cumulative parked time and the single-request high-water mark, over the requests that genuinely waited. The
+        // mean is totalQueueWaitMillis / queued: both are written by the same call, so they describe the same requests.
+        private long totalQueueWaitMillis;
+        private long maxQueueWaitMillis;
         private Map<ResourceType, ResourceStats> resourceStats;
 
         // this is needed to support the factory method
@@ -118,12 +132,36 @@ public class WorkloadGroupStats implements ToXContentObject, Writeable {
             long wouldThrottle,
             Map<ResourceType, ResourceStats> resourceStats
         ) {
+            this(completions, rejections, failures, cancellations, throttled, wouldThrottle, 0, 0, 0, 0, 0, 0, resourceStats);
+        }
+
+        public WorkloadGroupStatsHolder(
+            long completions,
+            long rejections,
+            long failures,
+            long cancellations,
+            long throttled,
+            long wouldThrottle,
+            long queued,
+            long queueRejections,
+            long queuedCurrent,
+            long queuePeak,
+            long totalQueueWaitMillis,
+            long maxQueueWaitMillis,
+            Map<ResourceType, ResourceStats> resourceStats
+        ) {
             this.completions = completions;
             this.rejections = rejections;
             this.failures = failures;
             this.cancellations = cancellations;
             this.throttled = throttled;
             this.wouldThrottle = wouldThrottle;
+            this.queued = queued;
+            this.queueRejections = queueRejections;
+            this.queuedCurrent = queuedCurrent;
+            this.queuePeak = queuePeak;
+            this.totalQueueWaitMillis = totalQueueWaitMillis;
+            this.maxQueueWaitMillis = maxQueueWaitMillis;
             this.resourceStats = resourceStats;
         }
 
@@ -137,6 +175,19 @@ public class WorkloadGroupStats implements ToXContentObject, Writeable {
                 this.throttled = in.readVLong();
                 this.wouldThrottle = in.readVLong();
             }
+            // The queue stats trail wouldThrottle under their own gate.
+            // TODO(merge): this gate equals throttling's on the assumption that throttling and queueing ship in the same
+            // release. A build with throttling but not queueing that also reports 3.10.0 would mis-decode this positional
+            // stream in both directions, so if queueing ships later, or both builds can share a cluster, bump it (both
+            // paths).
+            if (in.getVersion().onOrAfter(Version.V_3_10_0)) {
+                this.queued = in.readVLong();
+                this.queueRejections = in.readVLong();
+                this.queuedCurrent = in.readVLong();
+                this.queuePeak = in.readVLong();
+                this.totalQueueWaitMillis = in.readVLong();
+                this.maxQueueWaitMillis = in.readVLong();
+            }
             this.resourceStats = in.readMap((i) -> ResourceType.fromName(i.readString()), ResourceStats::new);
         }
 
@@ -146,6 +197,10 @@ public class WorkloadGroupStats implements ToXContentObject, Writeable {
 
         public long getRejections() {
             return rejections;
+        }
+
+        public long getFailures() {
+            return failures;
         }
 
         public long getCancellations() {
@@ -160,16 +215,53 @@ public class WorkloadGroupStats implements ToXContentObject, Writeable {
             return wouldThrottle;
         }
 
+        public long getQueued() {
+            return queued;
+        }
+
+        public long getQueueRejections() {
+            return queueRejections;
+        }
+
+        public long getQueuedCurrent() {
+            return queuedCurrent;
+        }
+
+        public long getQueuePeak() {
+            return queuePeak;
+        }
+
+        public long getTotalQueueWaitMillis() {
+            return totalQueueWaitMillis;
+        }
+
+        public long getMaxQueueWaitMillis() {
+            return maxQueueWaitMillis;
+        }
+
         public Map<ResourceType, ResourceStats> getResourceStats() {
             return resourceStats;
         }
 
         /**
-         * static factory method to convert {@link WorkloadGroupState} into {@link WorkloadGroupStatsHolder}
+         * static factory method to convert {@link WorkloadGroupState} into {@link WorkloadGroupStatsHolder}, with no
+         * live queue depth (used where a queue service is not available, e.g. tests).
          * @param workloadGroupState which needs to be converted
          * @return WorkloadGroupStatsHolder object
          */
         public static WorkloadGroupStatsHolder from(WorkloadGroupState workloadGroupState) {
+            return from(workloadGroupState, 0L, 0L);
+        }
+
+        /**
+         * static factory method to convert {@link WorkloadGroupState} into {@link WorkloadGroupStatsHolder}, including
+         * current WAITING depth and the historical WAITING-depth high-water mark (which live in the queue service).
+         * @param workloadGroupState which needs to be converted
+         * @param queuedCurrent current WAITING depth for this group (excludes provisional owner acquires)
+         * @param queuePeak peak WAITING depth for this group since its queue was created
+         * @return WorkloadGroupStatsHolder object
+         */
+        public static WorkloadGroupStatsHolder from(WorkloadGroupState workloadGroupState, long queuedCurrent, long queuePeak) {
             final WorkloadGroupStatsHolder statsHolder = new WorkloadGroupStatsHolder();
 
             Map<ResourceType, ResourceStats> resourceStatsMap = new HashMap<>();
@@ -184,6 +276,12 @@ public class WorkloadGroupStats implements ToXContentObject, Writeable {
             statsHolder.cancellations = workloadGroupState.getTotalCancellations();
             statsHolder.throttled = workloadGroupState.getTotalThrottled();
             statsHolder.wouldThrottle = workloadGroupState.getTotalWouldThrottle();
+            statsHolder.queued = workloadGroupState.getTotalQueued();
+            statsHolder.queueRejections = workloadGroupState.getTotalQueueRejections();
+            statsHolder.queuedCurrent = queuedCurrent;
+            statsHolder.queuePeak = queuePeak;
+            statsHolder.totalQueueWaitMillis = workloadGroupState.getTotalQueueWaitMillis();
+            statsHolder.maxQueueWaitMillis = workloadGroupState.getMaxQueueWaitMillis();
             statsHolder.resourceStats = resourceStatsMap;
             return statsHolder;
         }
@@ -204,6 +302,15 @@ public class WorkloadGroupStats implements ToXContentObject, Writeable {
                 out.writeVLong(statsHolder.throttled);
                 out.writeVLong(statsHolder.wouldThrottle);
             }
+            // Mirrors the read path's queue-stats gate (see the TODO(merge) there).
+            if (out.getVersion().onOrAfter(Version.V_3_10_0)) {
+                out.writeVLong(statsHolder.queued);
+                out.writeVLong(statsHolder.queueRejections);
+                out.writeVLong(statsHolder.queuedCurrent);
+                out.writeVLong(statsHolder.queuePeak);
+                out.writeVLong(statsHolder.totalQueueWaitMillis);
+                out.writeVLong(statsHolder.maxQueueWaitMillis);
+            }
             out.writeMap(statsHolder.resourceStats, (o, val) -> o.writeString(val.getName()), ResourceStats::writeTo);
         }
 
@@ -221,6 +328,12 @@ public class WorkloadGroupStats implements ToXContentObject, Writeable {
             builder.field(TOTAL_CANCELLATIONS, cancellations);
             builder.field(TOTAL_THROTTLED, throttled);
             builder.field(TOTAL_WOULD_THROTTLE, wouldThrottle);
+            builder.field(QUEUED, queued);
+            builder.field(QUEUE_REJECTIONS, queueRejections);
+            builder.field(QUEUED_CURRENT, queuedCurrent);
+            builder.field(QUEUE_PEAK, queuePeak);
+            builder.field(TOTAL_QUEUE_WAIT_MILLIS, totalQueueWaitMillis);
+            builder.field(MAX_QUEUE_WAIT_MILLIS, maxQueueWaitMillis);
 
             for (ResourceType resourceType : ResourceType.getSortedValues()) {
                 ResourceStats resourceStats1 = resourceStats.get(resourceType);
@@ -243,12 +356,32 @@ public class WorkloadGroupStats implements ToXContentObject, Writeable {
                 && failures == that.failures
                 && cancellations == that.cancellations
                 && throttled == that.throttled
-                && wouldThrottle == that.wouldThrottle;
+                && wouldThrottle == that.wouldThrottle
+                && queued == that.queued
+                && queueRejections == that.queueRejections
+                && queuedCurrent == that.queuedCurrent
+                && queuePeak == that.queuePeak
+                && totalQueueWaitMillis == that.totalQueueWaitMillis
+                && maxQueueWaitMillis == that.maxQueueWaitMillis;
         }
 
         @Override
         public int hashCode() {
-            return Objects.hash(completions, rejections, cancellations, failures, throttled, wouldThrottle, resourceStats);
+            return Objects.hash(
+                completions,
+                rejections,
+                cancellations,
+                failures,
+                throttled,
+                wouldThrottle,
+                queued,
+                queueRejections,
+                queuedCurrent,
+                queuePeak,
+                totalQueueWaitMillis,
+                maxQueueWaitMillis,
+                resourceStats
+            );
         }
     }
 

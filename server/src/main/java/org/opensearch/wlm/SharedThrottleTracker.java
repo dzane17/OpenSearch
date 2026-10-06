@@ -10,7 +10,10 @@ package org.opensearch.wlm;
 
 import org.opensearch.common.lease.Releasable;
 
+import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.Iterator;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
@@ -100,13 +103,20 @@ final class SharedThrottleTracker {
         return granted[0];
     }
 
-    /** Releases a permit by id; a no-op for an unknown or already-released id. */
-    void release(String bucketKey, String permitId) {
+    /**
+     * Releases a permit by id; a no-op for an unknown or already-released id.
+     *
+     * @return {@code true} if a recorded permit was removed, i.e. a slot just freed. Only the owner can know this, so
+     *         owner-push is driven on {@code true} only and a no-op release never produces a phantom grant.
+     */
+    boolean release(String bucketKey, String permitId) {
+        final boolean[] removed = new boolean[1];
         permitsByBucket.computeIfPresent(bucketKey, (k, bucket) -> {
-            bucket.permits.remove(permitId);
+            removed[0] = bucket.permits.remove(permitId) != null;
             // minExpiry intentionally left as is (see Bucket).
             return bucket.permits.isEmpty() ? null : bucket;
         });
+        return removed[0];
     }
 
     /**
@@ -114,39 +124,64 @@ final class SharedThrottleTracker {
      * cluster), across all buckets. Permits recorded with {@link #UNKNOWN_COORDINATOR} are never matched. An O(total
      * permits) scan, so only call it on node removal.
      *
-     * @return the number of permits released
+     * @return each bucket that lost permits mapped to the number released (empty if none)
      */
-    int releaseAllFrom(Set<String> coordinatorIds) {
+    Map<String, Integer> releaseAllFrom(Set<String> coordinatorIds) {
+        final Map<String, Integer> releasedByBucket = new HashMap<>();
         if (coordinatorIds.isEmpty()) {
-            return 0;
+            return releasedByBucket;
         }
-        final int[] released = new int[1];
         for (String bucketKey : permitsByBucket.keySet()) {
             permitsByBucket.computeIfPresent(bucketKey, (k, bucket) -> {
+                int released = 0;
                 for (Iterator<Permit> it = bucket.permits.values().iterator(); it.hasNext();) {
                     final String coordinatorId = it.next().coordinatorId();
                     if (UNKNOWN_COORDINATOR.equals(coordinatorId) == false && coordinatorIds.contains(coordinatorId)) {
                         it.remove();
-                        released[0]++;
+                        released++;
+                    }
+                }
+                if (released > 0) {
+                    releasedByBucket.put(bucketKey, released);
+                }
+                return bucket.permits.isEmpty() ? null : bucket;
+            });
+        }
+        return releasedByBucket;
+    }
+
+    /**
+     * Reclaims expired permits across all buckets; safe to run concurrently with acquire and release.
+     *
+     * @return the bucket keys for which at least one permit was reclaimed
+     */
+    List<String> sweepExpired() {
+        return new ArrayList<>(sweepExpiredCounts().keySet());
+    }
+
+    /**
+     * Like {@link #sweepExpired()}, but keeps the number reclaimed per bucket so the owner can offer every freed slot
+     * (expired permits get no release RPC to wake a waiter).
+     *
+     * @return each bucket that gained free capacity mapped to its number of reclaimed permits
+     */
+    Map<String, Integer> sweepExpiredCounts() {
+        final long now = nanoTimeSupplier.getAsLong();
+        final Map<String, Integer> freedByBucket = new HashMap<>();
+        for (String bucketKey : permitsByBucket.keySet()) {
+            permitsByBucket.computeIfPresent(bucketKey, (k, bucket) -> {
+                if (bucket.minExpiry <= now) {
+                    final int before = bucket.permits.size();
+                    pruneExpired(bucket, now);
+                    final int reclaimed = before - bucket.permits.size();
+                    if (reclaimed > 0) {
+                        freedByBucket.put(bucketKey, reclaimed);
                     }
                 }
                 return bucket.permits.isEmpty() ? null : bucket;
             });
         }
-        return released[0];
-    }
-
-    /** Reclaims expired permits across all buckets; safe to run concurrently with acquire and release. */
-    void sweepExpired() {
-        final long now = nanoTimeSupplier.getAsLong();
-        for (String bucketKey : permitsByBucket.keySet()) {
-            permitsByBucket.computeIfPresent(bucketKey, (k, bucket) -> {
-                if (bucket.minExpiry <= now) {
-                    pruneExpired(bucket, now);
-                }
-                return bucket.permits.isEmpty() ? null : bucket;
-            });
-        }
+        return freedByBucket;
     }
 
     // Raw number of permit records for a bucket, not filtered by expiry.

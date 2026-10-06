@@ -70,4 +70,45 @@ public class WorkloadGroupStateTests extends OpenSearchTestCase {
         assertEquals(5, workloadGroupState.getResourceState().get(ResourceType.MEMORY).cancellations.count());
     }
 
+    public void testRecordQueueWaitAggregates() {
+        WorkloadGroupState state = new WorkloadGroupState();
+        assertEquals(0, state.getTotalQueueWaitMillis());
+        assertEquals(0, state.getMaxQueueWaitMillis());
+
+        assertEquals(0, state.getTotalQueued());
+
+        state.recordQueueWaitMillis(100);
+        state.recordQueueWaitMillis(300);
+        state.recordQueueWaitMillis(50);
+
+        assertEquals("one queued request counted per recorded wait", 3, state.getTotalQueued());
+        assertEquals(450, state.getTotalQueueWaitMillis()); // sum -> mean = 450/3 = 150
+        assertEquals(300, state.getMaxQueueWaitMillis()); // high-water mark, does not decrease
+    }
+
+    public void testRecordQueueWaitClampsNegative() {
+        WorkloadGroupState state = new WorkloadGroupState();
+        state.recordQueueWaitMillis(-5); // clock skew guard
+        assertEquals("a clamped sample is still one queued request", 1, state.getTotalQueued());
+        assertEquals(0, state.getTotalQueueWaitMillis());
+        assertEquals(0, state.getMaxQueueWaitMillis());
+    }
+
+    public void testTotalQueuedAndWaitSumCannotDiverge() {
+        // The invariant the single-site design exists to guarantee: total_queued is written ONLY by
+        // recordQueueWaitMillis, so the mean-wait denominator always matches the number of samples in the sum. No
+        // interleaving of throttle denials, grants or drains can move one without the other.
+        WorkloadGroupState state = new WorkloadGroupState();
+        long samples = randomIntBetween(1, 50);
+        long expectedSum = 0;
+        for (int i = 0; i < samples; i++) {
+            long wait = randomIntBetween(0, 1000);
+            expectedSum += wait;
+            state.recordQueueWaitMillis(wait);
+        }
+        assertEquals("denominator must equal the sample count", samples, state.getTotalQueued());
+        assertEquals(expectedSum, state.getTotalQueueWaitMillis());
+        assertTrue("a non-zero count means the mean is well-formed", state.getTotalQueued() > 0);
+    }
+
 }
