@@ -257,4 +257,19 @@ public class SharedThrottleTrackerTests extends OpenSearchTestCase {
         );
         assertEquals(1, tracker.inFlight("many"));
     }
+
+    public void testRenewExtendsOnlyARecordedPermit() {
+        AtomicLong clock = new AtomicLong(0);
+        SharedThrottleTracker tracker = new SharedThrottleTracker(clock::get);
+        assertTrue(tracker.tryAcquire("b", 1, "p1", 100));
+        clock.set(90);
+        assertTrue(tracker.renew("b", "p1", 100)); // now expires at 190
+        clock.set(150);
+        assertFalse("the renewed permit is still live, so the bucket is full", tracker.tryAcquire("b", 1, "p2", 100));
+        assertFalse("unknown permit", tracker.renew("b", "nope", 100));
+        assertFalse("unknown bucket", tracker.renew("other", "p1", 100));
+        clock.set(191);
+        assertTrue("past the renewed expiry the permit is reclaimable", tracker.tryAcquire("b", 1, "p3", 100));
+        assertFalse("a reclaimed permit cannot be renewed back", tracker.renew("b", "p1", 100));
+    }
 }

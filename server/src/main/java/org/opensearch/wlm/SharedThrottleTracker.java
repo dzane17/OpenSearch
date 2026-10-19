@@ -156,6 +156,24 @@ public class SharedThrottleTracker {
     }
 
     /**
+     * Extends a still-recorded permit's expiry to {@code now + ttlNanos}. Used for a permit whose request is still
+     * waiting to acquire the rest of its buckets, so the TTL (meant to reclaim crashed holders) does not reclaim a live
+     * holder that is merely queued. An unknown id (released, swept, or recorded on another owner) is a no-op.
+     *
+     * @return {@code true} if the permit was recorded and its expiry extended
+     */
+    public boolean renew(String bucketKey, String permitId, long ttlNanos) {
+        final long expiresAt = nanoTimeSupplier.getAsLong() + ttlNanos;
+        final boolean[] renewed = new boolean[1];
+        permitsByBucket.computeIfPresent(bucketKey, (k, bucket) -> {
+            // Only ever moves an expiry later, so the cached minExpiry stays a valid lower bound.
+            renewed[0] = bucket.permits.computeIfPresent(permitId, (id, current) -> Math.max(current, expiresAt)) != null;
+            return bucket;
+        });
+        return renewed[0];
+    }
+
+    /**
      * Reclaims all expired permits across every bucket. Intended to be called periodically by the owning service.
      * Safe to run concurrently with {@link #tryAcquire}/{@link #release} thanks to per-key {@code compute}.
      *
