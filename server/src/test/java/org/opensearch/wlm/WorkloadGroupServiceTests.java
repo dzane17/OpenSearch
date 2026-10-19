@@ -1523,4 +1523,29 @@ public class WorkloadGroupServiceTests extends OpenSearchTestCase {
 
         }
     }
+
+    public void testFullGroupQueueRejectionSaysTheQueueIsFull() {
+        when(mockWorkloadManagementSettings.getWlmMode()).thenReturn(WlmMode.ENABLED);
+        mockWorkloadGroupsStateAccessor.addNewWorkloadGroup("wg-1");
+        Settings throttling = Settings.builder().put("attribute", "group").put("shared_limit", 1).build();
+        Settings queue = Settings.builder().put("size_per_bucket", 5).build();
+        stubClusterStateWithGroup(queueingGroup("wg-1", throttling, queue, MutableWorkloadGroupFragment.ResiliencyMode.ENFORCED));
+        WorkloadGroupQueueService queueService = newDirectQueueService();
+        workloadGroupService.setSharedThrottleService(Mockito.mock(WorkloadGroupSharedThrottleService.class));
+        for (int i = 0; i < WorkloadGroupQueueSettings.MAX_GROUP_QUEUE_DEPTH; i++) {
+            assertNotNull(
+                queueService.tryRegisterPendingAcquire("wg-1", "wg-1:group", taskForGroup("wg-1"), ActionListener.wrap(p -> {}, e -> {}))
+            );
+        }
+        OpenSearchRejectedExecutionException e = expectThrows(
+            OpenSearchRejectedExecutionException.class,
+            () -> acquireThrottlePermitSync(workloadGroupService, "wg-1", null)
+        );
+        assertEquals(
+            "Request throttled: workload group [wg-1-name] already has the maximum of "
+                + WorkloadGroupQueueSettings.MAX_GROUP_QUEUE_DEPTH
+                + " queued requests.",
+            e.getMessage()
+        );
+    }
 }

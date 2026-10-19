@@ -530,7 +530,15 @@ public class WorkloadGroupService extends AbstractLifecycleComponent
                 if (pending == null) {
                     // Combined per-group retained-request ceiling reached. The queue service counted the queue rejection.
                     incrementThrottled(plan.workloadGroupId);
-                    listener.onFailure(new OpenSearchRejectedExecutionException("Request throttled: " + plan.describeBreach(false) + "."));
+                    listener.onFailure(
+                        new OpenSearchRejectedExecutionException(
+                            "Request throttled: "
+                                + plan.describeTarget()
+                                + " already has the maximum of "
+                                + WorkloadGroupQueueSettings.MAX_GROUP_QUEUE_DEPTH
+                                + " queued requests."
+                        )
+                    );
                     return;
                 }
 
