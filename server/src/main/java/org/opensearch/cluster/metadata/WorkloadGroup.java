@@ -355,6 +355,9 @@ public class WorkloadGroup extends AbstractDiffable<WorkloadGroup> implements To
                         throw new IllegalArgumentException(fieldName + " is not a valid object in WorkloadGroup");
                     }
                     mutableWorkloadGroupFragment1.parseField(parser, fieldName);
+                } else if (token == XContentParser.Token.START_ARRAY) {
+                    // No WorkloadGroup field is an array; skipping one would silently ignore (or misread) the input.
+                    throw new IllegalArgumentException(fieldName + " is not a valid array in WorkloadGroup");
                 } else if (token == XContentParser.Token.VALUE_NULL) {
                     if (fieldName.equals(MutableWorkloadGroupFragment.SETTINGS_STRING)
                         || fieldName.equals(MutableWorkloadGroupFragment.THROTTLING_STRING)

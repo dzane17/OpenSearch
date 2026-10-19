@@ -926,4 +926,15 @@ public class WorkloadGroupTests extends AbstractSerializingTestCase<WorkloadGrou
         MutableWorkloadGroupFragment fragment = builder.getMutableWorkloadGroupFragment();
         assertTrue(fragment.getQueue().isEmpty());
     }
+
+    public void testArrayFieldIsRejected() {
+        for (String field : List.of("throttling", "settings", "queue", "resource_limits")) {
+            String json = "{\"" + field + "\":[{\"x\":1}]}";
+            IllegalArgumentException e = expectThrows(
+                IllegalArgumentException.class,
+                () -> WorkloadGroup.Builder.fromXContent(createParser(JsonXContent.jsonXContent, json))
+            );
+            assertEquals(field + " is not a valid array in WorkloadGroup", e.getMessage());
+        }
+    }
 }
