@@ -903,14 +903,12 @@ public class WorkloadGroupSharedThrottleService implements ClusterStateListener 
      * release that DID free a slot always drives one.
      */
     void handleRelease(ReleasePermitRequest request) {
-        final boolean freed = tracker.release(request.bucketKey, request.permitId);
-        // If this release is a coordinator returning an UNUSED grant (it had no queued request for the bucket), drop it
-        // from the waiter set so it stops drawing wasted grants (remote analog of the local removeWaiter). Only trust the
-        // signal when the permit id belonged to THIS tracker: a grant issued by the previous owner can cross a ring
-        // change and be returned to the new owner, where its unknown id must not deregister a valid new-owner waiter.
-        if (freed && request.queueEmptyOnNodeId.isEmpty() == false) {
+        // An unused-grant return deregisters the coordinator, but only for a permit this tracker issued (one from a
+        // previous owner must not remove a valid waiter). Deregister before freeing, or the grant's ACK can push it again.
+        if (request.queueEmptyOnNodeId.isEmpty() == false && tracker.isRecorded(request.bucketKey, request.permitId)) {
             removeWaiterByNodeId(request.bucketKey, request.queueEmptyOnNodeId);
         }
+        final boolean freed = tracker.release(request.bucketKey, request.permitId);
         if (freed) {
             offerSharedSlots(request.bucketKey, 1);
         }
@@ -1091,8 +1089,8 @@ public class WorkloadGroupSharedThrottleService implements ClusterStateListener 
     private LocalGrantResult consumeGrantLocal(String bucketKey, int sharedLimit, String reservedPermitId, DiscoveryNode self) {
         final GrantConsumer consumer = grantConsumer;
         if (consumer == null) {
-            tracker.release(bucketKey, reservedPermitId);
             removeWaiter(bucketKey, self);
+            tracker.release(bucketKey, reservedPermitId);
             return LocalGrantResult.NO_DEMAND;
         }
         final DiscoveryNode owner = clusterService.localNode(); // local path: this node owns the bucket
@@ -1309,11 +1307,11 @@ public class WorkloadGroupSharedThrottleService implements ClusterStateListener 
         if (owner.getId().equals(self.getId())) {
             // Same rules as the remote path's handleRelease, so local-owner and remote-owner behave identically: push is
             // driven only if a permit really went away, against this node's own view of the ceiling.
-            final boolean freed = tracker.release(bucketKey, reservedPermitId);
-            if (freed) {
-                // As on the remote release path, an unknown grant id may belong to a previous owner and must not
-                // deregister this node from the current owner's waiter set.
+            // As on the remote release path: deregister only for a permit this tracker issued, and before freeing it.
+            if (tracker.isRecorded(bucketKey, reservedPermitId)) {
                 removeWaiter(bucketKey, self);
+            }
+            if (tracker.release(bucketKey, reservedPermitId)) {
                 offerSharedSlots(bucketKey, 1);
             }
         } else {

@@ -149,6 +149,12 @@ public class SharedThrottleTracker {
         return removed[0];
     }
 
+    /** Whether {@code permitId} is currently recorded for {@code bucketKey} (expired-but-unpruned permits included). */
+    public boolean isRecorded(String bucketKey, String permitId) {
+        final Bucket bucket = permitsByBucket.get(bucketKey);
+        return bucket != null && bucket.permits.containsKey(permitId);
+    }
+
     /**
      * Reclaims all expired permits across every bucket. Intended to be called periodically by the owning service.
      * Safe to run concurrently with {@link #tryAcquire}/{@link #release} thanks to per-key {@code compute}.
