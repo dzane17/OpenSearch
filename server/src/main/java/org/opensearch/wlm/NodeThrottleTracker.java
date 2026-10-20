@@ -21,10 +21,9 @@ import java.util.concurrent.atomic.AtomicInteger;
  * node and enforces the bucket's {@code node_limit}. Its cluster-wide sibling is {@link SharedThrottleTracker}, and
  * {@code WorkloadGroupService.acquireThrottlePermit} composes the two (local first, then shared on overflow).
  * <p>
- * A bucket is identified by an opaque key (see {@code WorkloadGroupService} for how the key is built from a
- * workload group and its throttle attribute). A counter exists only while a bucket has at least one in-flight
- * request: it is created on first acquire and removed when it drains back to zero, so memory scales with the
- * number of concurrently active buckets rather than the total population of users/roles.
+ * A bucket is identified by an opaque key (see {@code WorkloadGroupThrottleSettings#bucketKey}). A counter exists only
+ * while a bucket has at least one in-flight request: it is created on first acquire and removed when it drains back to
+ * zero, so memory scales with the number of concurrently active buckets rather than the total population of users/roles.
  * <p>
  * This tier is fully local — no cross-node coordination — mirroring the acquire/rollback + {@link Releasable}
  * release shape of {@link org.opensearch.index.IndexingPressure}. Because acquire and release happen in the same

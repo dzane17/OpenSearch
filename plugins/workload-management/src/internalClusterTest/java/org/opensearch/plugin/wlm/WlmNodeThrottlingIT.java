@@ -239,18 +239,85 @@ public class WlmNodeThrottlingIT extends OpenSearchIntegTestCase {
         assertNotNull(bobBlocked.actionGet(TIMEOUT));
     }
 
+    public void testUsernameAndRoleRulesAreBothEnforced() throws Exception {
+        String workloadGroupId = "wlm_multi_rule_group";
+        String indexName = "multi_rule_index";
+
+        setWlmMode("enabled");
+
+        // Two independent rules: 2 searches per node per user, 1 per role bucket (each caller here has a single role).
+        Settings throttling = Settings.builder()
+            .put("username." + WorkloadGroupThrottleSettings.NODE_LIMIT.getKey(), 2)
+            .put("role." + WorkloadGroupThrottleSettings.NODE_LIMIT.getKey(), 1)
+            .build();
+        updateWorkloadGroupInClusterState(PUT, createThrottledWorkloadGroup("multi_rule_test_group", workloadGroupId, throttling));
+        FeatureType featureType = AutoTaggingRegistry.getFeatureType(WorkloadGroupFeatureType.NAME);
+        assertBusy(
+            () -> assertTrue(
+                "workload group not yet applied in cluster state",
+                client().admin().cluster().prepareState().get().getState().metadata().workloadGroups().containsKey(workloadGroupId)
+            ),
+            30,
+            TimeUnit.SECONDS
+        );
+        createRule("wlm_multi_rule_rule", "multi rule", indexName, featureType, workloadGroupId);
+        indexDocument(indexName);
+        assertBusy(() -> {
+            int before = getCompletions(workloadGroupId);
+            searchAs("alice", "analyst", indexName).setQuery(org.opensearch.index.query.QueryBuilders.matchAllQuery()).get();
+            assertTrue("Expected search to be tagged to the throttled workload group", getCompletions(workloadGroupId) > before);
+        }, 30, TimeUnit.SECONDS);
+
+        List<ScriptedBlockPlugin> plugins = initBlockFactory();
+
+        // alice/analyst holds one of alice's two user slots and the analyst role's only slot.
+        ActionFuture<org.opensearch.action.search.SearchResponse> aliceAnalyst = blockingSearchAs("alice", "analyst", indexName).execute();
+        awaitForBlock(plugins);
+        int throttledBefore = getThrottled(workloadGroupId);
+
+        // bob has room under the username rule, but the analyst role is full -> 429 naming the role rule.
+        Throwable rejection = expectThrows(Throwable.class, () -> blockingSearchAs("bob", "analyst", indexName).get());
+        OpenSearchRejectedExecutionException rejected = rejectedExecutionCause(rejection);
+        assertNotNull("Expected an OpenSearchRejectedExecutionException in the cause chain but was: " + rejection, rejected);
+        assertTrue(rejected.getMessage(), rejected.getMessage().contains("for role [analyst] reached its per-node limit of 1"));
+        assertEquals("total_throttled should increment by exactly one", throttledBefore + 1, getThrottled(workloadGroupId));
+
+        // alice under a different role still fits under both of her rules.
+        ActionFuture<org.opensearch.action.search.SearchResponse> aliceAdmin = blockingSearchAs("alice", "admin", indexName).execute();
+        assertBusy(() -> {
+            int blocked = 0;
+            for (ScriptedBlockPlugin plugin : plugins) {
+                blocked += plugin.hits.get();
+            }
+            assertThat("alice/admin should have been admitted and reached the blocking script", blocked, greaterThan(1));
+        }, 30, TimeUnit.SECONDS);
+        assertEquals(throttledBefore + 1, getThrottled(workloadGroupId));
+
+        disableBlocks(plugins);
+        assertNotNull(aliceAnalyst.actionGet(TIMEOUT));
+        assertNotNull(aliceAdmin.actionGet(TIMEOUT));
+        assertBusy(() -> assertEquals("in-flight search gauge must drain to zero", 0L, currentInFlightSearches()), 30, TimeUnit.SECONDS);
+
+        // Every permit was released: bob/analyst now gets through.
+        assertNotNull(searchAs("bob", "analyst", indexName).setQuery(org.opensearch.index.query.QueryBuilders.matchAllQuery()).get());
+    }
+
     // Helpers
 
     private static boolean hasRejectedExecutionCause(Throwable t) {
+        return rejectedExecutionCause(t) != null;
+    }
+
+    private static OpenSearchRejectedExecutionException rejectedExecutionCause(Throwable t) {
         for (Throwable cur = t; cur != null; cur = cur.getCause()) {
             if (cur instanceof OpenSearchRejectedExecutionException) {
-                return true;
+                return (OpenSearchRejectedExecutionException) cur;
             }
             if (cur.getCause() == cur) {
                 break;
             }
         }
-        return false;
+        return null;
     }
 
     private int getCompletions(String groupId) throws Exception {
@@ -330,6 +397,24 @@ public class WlmNodeThrottlingIT extends OpenSearchIntegTestCase {
         return clientAs(username).prepareSearch(indexName);
     }
 
+    private org.opensearch.transport.client.Client clientAs(String username, String role) {
+        return client().filterWithHeader(
+            Map.of(
+                org.opensearch.wlm.WorkloadGroupTask.WORKLOAD_GROUP_PRINCIPAL_HEADER,
+                "username|" + username + org.opensearch.wlm.WorkloadGroupTask.WORKLOAD_GROUP_PRINCIPAL_VALUE_DELIMITER + "role|" + role
+            )
+        );
+    }
+
+    private SearchRequestBuilder searchAs(String username, String role, String indexName) {
+        return clientAs(username, role).prepareSearch(indexName);
+    }
+
+    private SearchRequestBuilder blockingSearchAs(String username, String role, String indexName) {
+        return clientAs(username, role).prepareSearch(indexName)
+            .setQuery(scriptQuery(new Script(ScriptType.INLINE, "mockscript", ScriptedBlockPlugin.SCRIPT_NAME, Collections.emptyMap())));
+    }
+
     private SearchRequestBuilder blockingSearchAs(String username, String indexName) {
         return clientAs(username).prepareSearch(indexName)
             .setQuery(scriptQuery(new Script(ScriptType.INLINE, "mockscript", ScriptedBlockPlugin.SCRIPT_NAME, Collections.emptyMap())));
@@ -388,9 +473,12 @@ public class WlmNodeThrottlingIT extends OpenSearchIntegTestCase {
 
     private WorkloadGroup createThrottledWorkloadGroup(String name, String id, int nodeLimit, String attribute) {
         Settings throttling = Settings.builder()
-            .put(WorkloadGroupThrottleSettings.ATTRIBUTE.getKey(), attribute)
-            .put(WorkloadGroupThrottleSettings.NODE_LIMIT.getKey(), nodeLimit)
+            .put(attribute + "." + WorkloadGroupThrottleSettings.NODE_LIMIT.getKey(), nodeLimit)
             .build();
+        return createThrottledWorkloadGroup(name, id, throttling);
+    }
+
+    private WorkloadGroup createThrottledWorkloadGroup(String name, String id, Settings throttling) {
         return new WorkloadGroup(
             name,
             id,

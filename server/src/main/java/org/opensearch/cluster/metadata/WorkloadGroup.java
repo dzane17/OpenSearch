@@ -62,6 +62,22 @@ public class WorkloadGroup extends AbstractDiffable<WorkloadGroup> implements To
     }
 
     public WorkloadGroup(String name, String _id, MutableWorkloadGroupFragment mutableWorkloadGroupFragment, long updatedAt) {
+        this(name, _id, mutableWorkloadGroupFragment, updatedAt, true);
+    }
+
+    /**
+     * @param validateThrottling whether to run the throttle-rule checks meant for user input. False on the read paths
+     *                           (cluster-state stream, persisted metadata): a throw there is not a rejected request but a
+     *                           node that cannot apply or load metadata, so stored config is accepted as-is and any rule
+     *                           this build cannot enforce is simply inert.
+     */
+    private WorkloadGroup(
+        String name,
+        String _id,
+        MutableWorkloadGroupFragment mutableWorkloadGroupFragment,
+        long updatedAt,
+        boolean validateThrottling
+    ) {
         Objects.requireNonNull(name, "WorkloadGroup.name can't be null");
         Objects.requireNonNull(mutableWorkloadGroupFragment.getResourceLimits(), "WorkloadGroup.resourceLimits can't be null");
         Objects.requireNonNull(mutableWorkloadGroupFragment.getResiliencyMode(), "WorkloadGroup.resiliencyMode can't be null");
@@ -82,7 +98,8 @@ public class WorkloadGroup extends AbstractDiffable<WorkloadGroup> implements To
         if (normalizedSettings.equals(mutableWorkloadGroupFragment.getSettings()) == false
             || normalizedThrottling.equals(mutableWorkloadGroupFragment.getThrottling()) == false
             || normalizedQueue.equals(mutableWorkloadGroupFragment.getQueue()) == false) {
-            mutableWorkloadGroupFragment = new MutableWorkloadGroupFragment(
+            // Stripping clear markers can't invalidate throttling, so don't re-run the user-input checks.
+            mutableWorkloadGroupFragment = MutableWorkloadGroupFragment.ofStoredThrottling(
                 mutableWorkloadGroupFragment.getResiliencyMode(),
                 mutableWorkloadGroupFragment.getResourceLimits(),
                 normalizedSettings,
@@ -91,8 +108,9 @@ public class WorkloadGroup extends AbstractDiffable<WorkloadGroup> implements To
             );
         }
 
-        // Cross-field checks on the merged throttling config (attribute required with a limit; ceiling must be >= 1).
-        WorkloadGroupThrottleSettings.validateMergedConfig(mutableWorkloadGroupFragment.getThrottling());
+        if (validateThrottling) {
+            WorkloadGroupThrottleSettings.validateMergedConfig(mutableWorkloadGroupFragment.getThrottling());
+        }
         // A queue is deliberately NOT required to come with a throttle limit. Queueing engages only on a throttle denial,
         // so a queue configured without one is simply inert — admission fails open before it can ever reach the queue, and
         // the queue object is allocated lazily on first enqueue, so it costs nothing at all. Rejecting the combination
@@ -125,7 +143,7 @@ public class WorkloadGroup extends AbstractDiffable<WorkloadGroup> implements To
     }
 
     public WorkloadGroup(StreamInput in) throws IOException {
-        this(in.readString(), in.readString(), new MutableWorkloadGroupFragment(in), in.readLong());
+        this(in.readString(), in.readString(), new MutableWorkloadGroupFragment(in), in.readLong(), false);
     }
 
     public static WorkloadGroup updateExistingWorkloadGroup(
@@ -140,7 +158,11 @@ public class WorkloadGroup extends AbstractDiffable<WorkloadGroup> implements To
         final ResiliencyMode mode = Optional.ofNullable(mutableWorkloadGroupFragment.getResiliencyMode())
             .orElse(existingGroup.getResiliencyMode());
         final Settings updatedSettings = mergeSettings(existingGroup.getSettings(), mutableWorkloadGroupFragment.getSettings());
-        final Settings updatedThrottling = mergeSettings(
+        // The update may have skipped the strict REST parser (transport), so check its keys; the constructor checks the merge.
+        if (mutableWorkloadGroupFragment.getThrottling() != null) {
+            WorkloadGroupThrottleSettings.validate(mutableWorkloadGroupFragment.getThrottling());
+        }
+        final Settings updatedThrottling = WorkloadGroupThrottleSettings.merge(
             existingGroup.getMutableWorkloadGroupFragment().getThrottling(),
             mutableWorkloadGroupFragment.getThrottling()
         );
@@ -151,7 +173,8 @@ public class WorkloadGroup extends AbstractDiffable<WorkloadGroup> implements To
         return new WorkloadGroup(
             existingGroup.getName(),
             existingGroup.get_id(),
-            new MutableWorkloadGroupFragment(mode, updatedResourceLimits, updatedSettings, updatedThrottling, updatedQueue),
+            // Stored rules this build doesn't know must not block unrelated updates.
+            MutableWorkloadGroupFragment.ofStoredThrottling(mode, updatedResourceLimits, updatedSettings, updatedThrottling, updatedQueue),
             Instant.now().getMillis()
         );
     }
@@ -233,8 +256,13 @@ public class WorkloadGroup extends AbstractDiffable<WorkloadGroup> implements To
         return builder;
     }
 
+    /**
+     * Parses a workload group from persisted metadata. Lenient about throttling (see
+     * {@link MutableWorkloadGroupFragment#parseField(XContentParser, String, boolean)}); user input goes through
+     * {@link Builder#fromXContent}, which is strict.
+     */
     public static WorkloadGroup fromXContent(final XContentParser parser) throws IOException {
-        return Builder.fromXContent(parser).build();
+        return Builder.fromXContent(parser, true).build();
     }
 
     public static Diff<WorkloadGroup> readDiff(final StreamInput in) throws IOException {
@@ -317,15 +345,21 @@ public class WorkloadGroup extends AbstractDiffable<WorkloadGroup> implements To
         private String _id;
         private MutableWorkloadGroupFragment mutableWorkloadGroupFragment;
         private long updatedAt;
+        private boolean stored;
 
         private Builder() {}
 
         public static Builder fromXContent(XContentParser parser) throws IOException {
+            return fromXContent(parser, false);
+        }
+
+        private static Builder fromXContent(XContentParser parser, boolean stored) throws IOException {
             if (parser.currentToken() == null) { // fresh parser? move to the first token
                 parser.nextToken();
             }
 
             Builder builder = builder();
+            builder.stored = stored;
 
             XContentParser.Token token = parser.currentToken();
 
@@ -344,7 +378,7 @@ public class WorkloadGroup extends AbstractDiffable<WorkloadGroup> implements To
                     } else if (fieldName.equals(NAME_STRING)) {
                         builder.name(parser.text());
                     } else if (MutableWorkloadGroupFragment.shouldParse(fieldName)) {
-                        mutableWorkloadGroupFragment1.parseField(parser, fieldName);
+                        mutableWorkloadGroupFragment1.parseField(parser, fieldName, stored);
                     } else if (fieldName.equals(UPDATED_AT_STRING)) {
                         builder.updatedAt(parser.longValue());
                     } else {
@@ -354,12 +388,18 @@ public class WorkloadGroup extends AbstractDiffable<WorkloadGroup> implements To
                     if (!MutableWorkloadGroupFragment.shouldParse(fieldName)) {
                         throw new IllegalArgumentException(fieldName + " is not a valid object in WorkloadGroup");
                     }
-                    mutableWorkloadGroupFragment1.parseField(parser, fieldName);
+                    mutableWorkloadGroupFragment1.parseField(parser, fieldName, stored);
+                } else if (token == XContentParser.Token.START_ARRAY) {
+                    // No WorkloadGroup field is an array. Reject it in user input; skip it when loading stored metadata.
+                    if (stored == false) {
+                        throw new IllegalArgumentException(fieldName + " is not a valid array in WorkloadGroup");
+                    }
+                    parser.skipChildren();
                 } else if (token == XContentParser.Token.VALUE_NULL) {
                     if (fieldName.equals(MutableWorkloadGroupFragment.SETTINGS_STRING)
                         || fieldName.equals(MutableWorkloadGroupFragment.THROTTLING_STRING)
                         || fieldName.equals(MutableWorkloadGroupFragment.QUEUE_STRING)) {
-                        mutableWorkloadGroupFragment1.parseField(parser, fieldName);
+                        mutableWorkloadGroupFragment1.parseField(parser, fieldName, stored);
                     }
                 }
             }
@@ -387,7 +427,7 @@ public class WorkloadGroup extends AbstractDiffable<WorkloadGroup> implements To
         }
 
         public WorkloadGroup build() {
-            return new WorkloadGroup(name, _id, mutableWorkloadGroupFragment, updatedAt);
+            return new WorkloadGroup(name, _id, mutableWorkloadGroupFragment, updatedAt, stored == false);
         }
 
         public MutableWorkloadGroupFragment getMutableWorkloadGroupFragment() {

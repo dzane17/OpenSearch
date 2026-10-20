@@ -20,6 +20,7 @@ import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.collect.Tuple;
 import org.opensearch.common.settings.ClusterSettings;
 import org.opensearch.common.settings.Settings;
+import org.opensearch.common.xcontent.json.JsonXContent;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.plugin.wlm.WorkloadManagementTestUtils;
 import org.opensearch.plugin.wlm.action.CreateWorkloadGroupResponse;
@@ -88,6 +89,31 @@ public class WorkloadGroupPersistenceServiceTests extends OpenSearchTestCase {
         listOne.add(workloadGroupOne);
         listTwo.add(updatedGroupsMap.get(_ID_ONE));
         assertEqualWorkloadGroups(listOne, listTwo, false);
+    }
+
+    /**
+     * A create that reached the cluster manager over the transport layer is deserialized without the user-input throttle
+     * checks, so the persistence service must apply them before writing.
+     */
+    public void testCreateRejectsInvalidThrottlingThatBypassedTheRestParser() throws Exception {
+        Tuple<WorkloadGroupPersistenceService, ClusterState> setup = preparePersistenceServiceSetup(new HashMap<>());
+        for (String throttling : List.of(
+            "{\"username\":{\"node_limit\":0}}", // ceiling 0
+            "{\"username\":{\"node_limit\":\"abc\"}}",
+            "{\"tenant\":{\"node_limit\":3}}" // unknown attribute
+        )) {
+            // The lenient read path stands in for a group deserialized from a transport request.
+            WorkloadGroup toCreate = WorkloadGroup.fromXContent(
+                createParser(
+                    JsonXContent.jsonXContent,
+                    "{\"_id\":\"bad_id\",\"name\":\"bad_throttling\",\"resiliency_mode\":\"enforced\","
+                        + "\"resource_limits\":{\"memory\":0.1},\"throttling\":"
+                        + throttling
+                        + ",\"updated_at\":1720047207}"
+                )
+            );
+            expectThrows(IllegalArgumentException.class, () -> setup.v1().saveWorkloadGroupInClusterState(toCreate, setup.v2()));
+        }
     }
 
     /**

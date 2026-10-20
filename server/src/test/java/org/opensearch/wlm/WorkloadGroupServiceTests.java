@@ -44,6 +44,7 @@ import java.util.Collection;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ExecutorService;
@@ -58,7 +59,12 @@ import org.mockito.Mockito;
 
 import static org.opensearch.wlm.tracker.ResourceUsageCalculatorTests.createMockTaskWithResourceStats;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyInt;
+import static org.mockito.ArgumentMatchers.anyLong;
+import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.doAnswer;
+import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.spy;
 import static org.mockito.Mockito.times;
@@ -635,7 +641,7 @@ public class WorkloadGroupServiceTests extends OpenSearchTestCase {
         mockWorkloadGroupsStateAccessor.addNewWorkloadGroup("wg-1");
         when(mockThreadPool.executor(ThreadPool.Names.GENERIC)).thenReturn(OpenSearchExecutors.newDirectExecutorService());
 
-        Settings throttling = Settings.builder().put("attribute", "group").put("node_limit", 1).build();
+        Settings throttling = Settings.builder().put("group.node_limit", 1).build();
         Settings queue = Settings.builder().put("size_per_bucket", 5).build();
         WorkloadGroup throttled = queueingGroup("wg-1", throttling, queue, MutableWorkloadGroupFragment.ResiliencyMode.ENFORCED);
         stubClusterStateWithGroup(throttled);
@@ -669,7 +675,7 @@ public class WorkloadGroupServiceTests extends OpenSearchTestCase {
         assertEquals(1, queueService.currentDepth("wg-1"));
         assertEquals(2, queueService.retainedDepth("wg-1"));
 
-        Settings throttling = Settings.builder().put("attribute", "group").put("node_limit", 1).build();
+        Settings throttling = Settings.builder().put("group.node_limit", 1).build();
         Settings queue = Settings.builder().put("size_per_bucket", 10).build();
         WorkloadGroup group = queueingGroup("wg-1", throttling, queue, MutableWorkloadGroupFragment.ResiliencyMode.ENFORCED);
         deliverWorkloadGroupsChanged(Map.of("wg-1", group), Map.of());
@@ -686,13 +692,13 @@ public class WorkloadGroupServiceTests extends OpenSearchTestCase {
         Settings queue = Settings.builder().put("size_per_bucket", 10).build();
         WorkloadGroup groupAttribute = queueingGroup(
             "wg-1",
-            Settings.builder().put("attribute", "group").put("node_limit", 1).build(),
+            Settings.builder().put("group.node_limit", 1).build(),
             queue,
             MutableWorkloadGroupFragment.ResiliencyMode.ENFORCED
         );
         WorkloadGroup usernameAttribute = queueingGroup(
             "wg-1",
-            Settings.builder().put("attribute", "username").put("node_limit", 1).build(),
+            Settings.builder().put("username.node_limit", 1).build(),
             queue,
             MutableWorkloadGroupFragment.ResiliencyMode.ENFORCED
         );
@@ -710,13 +716,13 @@ public class WorkloadGroupServiceTests extends OpenSearchTestCase {
         Settings queue = Settings.builder().put("size_per_bucket", 10).build();
         WorkloadGroup nodeOnly = queueingGroup(
             "wg-1",
-            Settings.builder().put("attribute", "group").put("node_limit", 1).build(),
+            Settings.builder().put("group.node_limit", 1).build(),
             queue,
             MutableWorkloadGroupFragment.ResiliencyMode.ENFORCED
         );
         WorkloadGroup sharedOnly = queueingGroup(
             "wg-1",
-            Settings.builder().put("attribute", "group").put("shared_limit", 1).build(),
+            Settings.builder().put("group.shared_limit", 1).build(),
             queue,
             MutableWorkloadGroupFragment.ResiliencyMode.ENFORCED
         );
@@ -734,13 +740,13 @@ public class WorkloadGroupServiceTests extends OpenSearchTestCase {
         Settings queue = Settings.builder().put("size_per_bucket", 10).build();
         WorkloadGroup nodeOnly = queueingGroup(
             "wg-1",
-            Settings.builder().put("attribute", "group").put("node_limit", 1).build(),
+            Settings.builder().put("group.node_limit", 1).build(),
             queue,
             MutableWorkloadGroupFragment.ResiliencyMode.ENFORCED
         );
         WorkloadGroup bothTiers = queueingGroup(
             "wg-1",
-            Settings.builder().put("attribute", "group").put("node_limit", 1).put("shared_limit", 1).build(),
+            Settings.builder().put("group.node_limit", 1).put("group.shared_limit", 1).build(),
             queue,
             MutableWorkloadGroupFragment.ResiliencyMode.ENFORCED
         );
@@ -755,7 +761,7 @@ public class WorkloadGroupServiceTests extends OpenSearchTestCase {
         AtomicInteger admissions = new AtomicInteger();
         enqueueWaitingRequest(queueService, "wg-1", "wg-1:group", admissions);
 
-        Settings throttling = Settings.builder().put("attribute", "group").put("node_limit", 1).build();
+        Settings throttling = Settings.builder().put("group.node_limit", 1).build();
         Settings queue = Settings.builder().put("size_per_bucket", 10).build();
         WorkloadGroup enforced = queueingGroup("wg-1", throttling, queue, MutableWorkloadGroupFragment.ResiliencyMode.ENFORCED);
         WorkloadGroup monitor = queueingGroup("wg-1", throttling, queue, MutableWorkloadGroupFragment.ResiliencyMode.MONITOR);
@@ -773,7 +779,7 @@ public class WorkloadGroupServiceTests extends OpenSearchTestCase {
         AtomicInteger admissions = new AtomicInteger();
         enqueueWaitingRequest(queueService, "wg-1", "wg-1:group", admissions);
 
-        Settings throttling = Settings.builder().put("attribute", "group").put("node_limit", 1).build();
+        Settings throttling = Settings.builder().put("group.node_limit", 1).build();
         Settings queue = Settings.builder().put("size_per_bucket", 10).build();
         WorkloadGroup enforced = queueingGroup("wg-1", throttling, queue, MutableWorkloadGroupFragment.ResiliencyMode.ENFORCED);
         WorkloadGroup monitor = queueingGroup("wg-1", throttling, queue, MutableWorkloadGroupFragment.ResiliencyMode.MONITOR);
@@ -799,13 +805,13 @@ public class WorkloadGroupServiceTests extends OpenSearchTestCase {
         Settings queue = Settings.builder().put("size_per_bucket", 10).build();
         WorkloadGroup previous = queueingGroup(
             "wg-1",
-            Settings.builder().put("attribute", "group").put("node_limit", 1).put("shared_limit", 2).build(),
+            Settings.builder().put("group.node_limit", 1).put("group.shared_limit", 2).build(),
             queue,
             MutableWorkloadGroupFragment.ResiliencyMode.ENFORCED
         );
         WorkloadGroup current = queueingGroup(
             "wg-1",
-            Settings.builder().put("attribute", "group").put("node_limit", 3).put("shared_limit", 4).build(),
+            Settings.builder().put("group.node_limit", 3).put("group.shared_limit", 4).build(),
             queue,
             MutableWorkloadGroupFragment.ResiliencyMode.ENFORCED
         );
@@ -820,7 +826,7 @@ public class WorkloadGroupServiceTests extends OpenSearchTestCase {
         AtomicInteger admissions = new AtomicInteger();
         enqueueWaitingRequest(queueService, "wg-1", "wg-1:group", admissions);
 
-        Settings throttling = Settings.builder().put("attribute", "group").put("node_limit", 1).build();
+        Settings throttling = Settings.builder().put("group.node_limit", 1).build();
         WorkloadGroup original = queueingGroup(
             "wg-1",
             throttling,
@@ -884,7 +890,7 @@ public class WorkloadGroupServiceTests extends OpenSearchTestCase {
         mockWorkloadGroupsStateAccessor.addNewWorkloadGroup("wg-1");
         when(mockThreadPool.executor(ThreadPool.Names.GENERIC)).thenReturn(OpenSearchExecutors.newDirectExecutorService());
 
-        Settings throttling = Settings.builder().put("attribute", "group").put("node_limit", 1).build();
+        Settings throttling = Settings.builder().put("group.node_limit", 1).build();
         Settings queue = Settings.builder().put("size_per_bucket", 5).build();
         stubClusterStateWithGroup(queueingGroup("wg-1", throttling, queue, MutableWorkloadGroupFragment.ResiliencyMode.ENFORCED));
 
@@ -953,7 +959,7 @@ public class WorkloadGroupServiceTests extends OpenSearchTestCase {
         Settings queue = Settings.builder().put("size_per_bucket", 5).build();
 
         // Start at node_limit=2 and fill both slots, then park a third request.
-        Settings limit2 = Settings.builder().put("attribute", "group").put("node_limit", 2).build();
+        Settings limit2 = Settings.builder().put("group.node_limit", 2).build();
         stubClusterStateWithGroup(queueingGroup("wg-1", limit2, queue, MutableWorkloadGroupFragment.ResiliencyMode.ENFORCED));
         // This is the only test here that actually admits FROM the queue, so it needs a real executor: admit()
         // dispatches the parked listener off the caller thread. Direct (same-thread) keeps the assertions synchronous —
@@ -971,7 +977,7 @@ public class WorkloadGroupServiceTests extends OpenSearchTestCase {
         assertEquals(1, queueService.currentDepth("wg-1"));
 
         // Operator lowers node_limit to 1 while the bucket is busy with a backlog.
-        Settings limit1 = Settings.builder().put("attribute", "group").put("node_limit", 1).build();
+        Settings limit1 = Settings.builder().put("group.node_limit", 1).build();
         stubClusterStateWithGroup(queueingGroup("wg-1", limit1, queue, MutableWorkloadGroupFragment.ResiliencyMode.ENFORCED));
 
         // Completing one request drops in-flight to 1, which is already AT the new limit — so the drain must not admit
@@ -992,7 +998,7 @@ public class WorkloadGroupServiceTests extends OpenSearchTestCase {
         // queue depth is what actually distinguishes them.
         when(mockWorkloadManagementSettings.getWlmMode()).thenReturn(WlmMode.ENABLED);
         mockWorkloadGroupsStateAccessor.addNewWorkloadGroup("wg-1");
-        Settings throttling = Settings.builder().put("attribute", "group").put("node_limit", 1).build();
+        Settings throttling = Settings.builder().put("group.node_limit", 1).build();
         Settings queue = Settings.builder().put("size_per_bucket", 5).build();
         stubClusterStateWithGroup(queueingGroup("wg-1", throttling, queue, MutableWorkloadGroupFragment.ResiliencyMode.MONITOR));
         WorkloadGroupQueueService queueService = new WorkloadGroupQueueService(mockThreadPool, mockWorkloadGroupsStateAccessor);
@@ -1020,7 +1026,7 @@ public class WorkloadGroupServiceTests extends OpenSearchTestCase {
     public void testAcquireThrottleRejectsAtLimitAndIncrementsStat() {
         when(mockWorkloadManagementSettings.getWlmMode()).thenReturn(WlmMode.ENABLED);
         mockWorkloadGroupsStateAccessor.addNewWorkloadGroup("wg-1");
-        Settings throttling = Settings.builder().put("attribute", "group").put("node_limit", 1).build();
+        Settings throttling = Settings.builder().put("group.node_limit", 1).build();
         stubClusterStateWithGroup(throttledGroup("wg-1", throttling));
 
         Releasable permit = acquireThrottlePermitSync(workloadGroupService, "wg-1", null); // first admit succeeds
@@ -1041,7 +1047,7 @@ public class WorkloadGroupServiceTests extends OpenSearchTestCase {
     public void testMonitorModeObservesButDoesNotThrottle() throws Exception {
         when(mockWorkloadManagementSettings.getWlmMode()).thenReturn(WlmMode.ENABLED);
         mockWorkloadGroupsStateAccessor.addNewWorkloadGroup("wg-1");
-        Settings throttling = Settings.builder().put("attribute", "group").put("node_limit", 1).build();
+        Settings throttling = Settings.builder().put("group.node_limit", 1).build();
         // Same node_limit=1 as the reject test, but the group is in MONITOR resiliency mode.
         stubClusterStateWithGroup(throttledGroup("wg-1", throttling, MutableWorkloadGroupFragment.ResiliencyMode.MONITOR));
 
@@ -1079,7 +1085,7 @@ public class WorkloadGroupServiceTests extends OpenSearchTestCase {
     public void testMonitorModeLogNamesTheUsernameAttribute() throws Exception {
         when(mockWorkloadManagementSettings.getWlmMode()).thenReturn(WlmMode.ENABLED);
         mockWorkloadGroupsStateAccessor.addNewWorkloadGroup("wg-1");
-        Settings throttling = Settings.builder().put("attribute", "username").put("node_limit", 1).build();
+        Settings throttling = Settings.builder().put("username.node_limit", 1).build();
         stubClusterStateWithGroup(throttledGroup("wg-1", throttling, MutableWorkloadGroupFragment.ResiliencyMode.MONITOR));
 
         Logger serviceLogger = LogManager.getLogger(WorkloadGroupService.class);
@@ -1113,7 +1119,7 @@ public class WorkloadGroupServiceTests extends OpenSearchTestCase {
     public void testAcquireThrottleUsernameKeepsPerUserBuckets() {
         when(mockWorkloadManagementSettings.getWlmMode()).thenReturn(WlmMode.ENABLED);
         mockWorkloadGroupsStateAccessor.addNewWorkloadGroup("wg-1");
-        Settings throttling = Settings.builder().put("attribute", "username").put("node_limit", 1).build();
+        Settings throttling = Settings.builder().put("username.node_limit", 1).build();
         stubClusterStateWithGroup(throttledGroup("wg-1", throttling));
 
         // alice takes her single slot; a second alice request is rejected — and the message names the username.
@@ -1141,7 +1147,7 @@ public class WorkloadGroupServiceTests extends OpenSearchTestCase {
     public void testAcquireThrottleUsernameWithCommaDoesNotCollide() {
         when(mockWorkloadManagementSettings.getWlmMode()).thenReturn(WlmMode.ENABLED);
         mockWorkloadGroupsStateAccessor.addNewWorkloadGroup("wg-1");
-        Settings throttling = Settings.builder().put("attribute", "username").put("node_limit", 1).build();
+        Settings throttling = Settings.builder().put("username.node_limit", 1).build();
         stubClusterStateWithGroup(throttledGroup("wg-1", throttling));
 
         String delim = WorkloadGroupTask.WORKLOAD_GROUP_PRINCIPAL_VALUE_DELIMITER;
@@ -1161,7 +1167,7 @@ public class WorkloadGroupServiceTests extends OpenSearchTestCase {
     public void testAcquireThrottleRolePicksMatchingSubfieldFromMultiTokenPrincipal() {
         when(mockWorkloadManagementSettings.getWlmMode()).thenReturn(WlmMode.ENABLED);
         mockWorkloadGroupsStateAccessor.addNewWorkloadGroup("wg-1");
-        Settings throttling = Settings.builder().put("attribute", "role").put("node_limit", 1).build();
+        Settings throttling = Settings.builder().put("role.node_limit", 1).build();
         stubClusterStateWithGroup(throttledGroup("wg-1", throttling));
 
         // A principal header may carry both subfields; the role bucket must key off the role token only.
@@ -1177,7 +1183,7 @@ public class WorkloadGroupServiceTests extends OpenSearchTestCase {
     public void testAcquireThrottleFailsOpenWhenPrincipalMissingForUsername() {
         when(mockWorkloadManagementSettings.getWlmMode()).thenReturn(WlmMode.ENABLED);
         mockWorkloadGroupsStateAccessor.addNewWorkloadGroup("wg-1");
-        Settings throttling = Settings.builder().put("attribute", "username").put("node_limit", 1).build();
+        Settings throttling = Settings.builder().put("username.node_limit", 1).build();
         stubClusterStateWithGroup(throttledGroup("wg-1", throttling));
 
         // No principal (e.g. security plugin not installed) or no matching subfield -> not throttled (fail open).
@@ -1194,7 +1200,7 @@ public class WorkloadGroupServiceTests extends OpenSearchTestCase {
      */
     public void testAcquireThrottleStillRejectsWhenStatUpdateFails() {
         when(mockWorkloadManagementSettings.getWlmMode()).thenReturn(WlmMode.ENABLED);
-        Settings throttling = Settings.builder().put("attribute", "group").put("node_limit", 1).build();
+        Settings throttling = Settings.builder().put("group.node_limit", 1).build();
         stubClusterStateWithGroup(throttledGroup("wg-1", throttling));
 
         // state map with no entry for wg-1 (as during the state-registration lag) -> raw get(id) returns null
@@ -1239,7 +1245,7 @@ public class WorkloadGroupServiceTests extends OpenSearchTestCase {
      */
     public void testAcquireThrottleDoesNotMisattributeToDefaultDuringRegistrationLag() {
         when(mockWorkloadManagementSettings.getWlmMode()).thenReturn(WlmMode.ENABLED);
-        Settings throttling = Settings.builder().put("attribute", "group").put("node_limit", 1).build();
+        Settings throttling = Settings.builder().put("group.node_limit", 1).build();
         stubClusterStateWithGroup(throttledGroup("wg-1", throttling));
 
         // DEFAULT group state exists, but wg-1 is NOT yet registered (registration lag).
@@ -1266,7 +1272,7 @@ public class WorkloadGroupServiceTests extends OpenSearchTestCase {
         when(mockWorkloadManagementSettings.getWlmMode()).thenReturn(WlmMode.ENABLED);
         mockWorkloadGroupsStateAccessor.addNewWorkloadGroup("wg-1");
 
-        Settings throttling = Settings.builder().put("attribute", "group").put("node_limit", 1).put("shared_limit", 1).build();
+        Settings throttling = Settings.builder().put("group.node_limit", 1).put("group.shared_limit", 1).build();
         WorkloadGroup group = throttledGroup("wg-1", throttling);
 
         // Cluster state must expose both the group metadata and a single data node (so this node owns every bucket).
@@ -1324,7 +1330,7 @@ public class WorkloadGroupServiceTests extends OpenSearchTestCase {
         when(mockWorkloadManagementSettings.getWlmMode()).thenReturn(WlmMode.ENABLED);
         mockWorkloadGroupsStateAccessor.addNewWorkloadGroup("wg-1");
 
-        Settings throttling = Settings.builder().put("attribute", "group").put("node_limit", 1).put("shared_limit", 1).build();
+        Settings throttling = Settings.builder().put("group.node_limit", 1).put("group.shared_limit", 1).build();
         // Same two-tier config as testAdmitFallsThroughNodeTierToSharedTier, but MONITOR resiliency mode.
         WorkloadGroup group = throttledGroup("wg-1", throttling, MutableWorkloadGroupFragment.ResiliencyMode.MONITOR);
 
@@ -1372,7 +1378,7 @@ public class WorkloadGroupServiceTests extends OpenSearchTestCase {
         when(mockWorkloadManagementSettings.getWlmMode()).thenReturn(WlmMode.ENABLED);
         mockWorkloadGroupsStateAccessor.addNewWorkloadGroup("wg-1");
 
-        Settings throttling = Settings.builder().put("attribute", "group").put("node_limit", 1).put("shared_limit", 1).build();
+        Settings throttling = Settings.builder().put("group.node_limit", 1).put("group.shared_limit", 1).build();
         Settings queue = Settings.builder().put("size_per_bucket", 5).build();
         WorkloadGroup group = queueingGroup("wg-1", throttling, queue, MutableWorkloadGroupFragment.ResiliencyMode.MONITOR);
 
@@ -1522,5 +1528,659 @@ public class WorkloadGroupServiceTests extends OpenSearchTestCase {
         ) {
 
         }
+    }
+
+    // Starts an admission and records how it completes, so a test can tell "parked" (not completed) from "admitted
+    // untracked" (completed with a null permit).
+    private static final class PendingAdmission {
+        final AtomicBoolean completed = new AtomicBoolean();
+        final AtomicReference<Releasable> permit = new AtomicReference<>();
+        final AtomicReference<Exception> failure = new AtomicReference<>();
+    }
+
+    private PendingAdmission startAdmission(String workloadGroupId, String principal) {
+        PendingAdmission admission = new PendingAdmission();
+        workloadGroupService.acquireThrottlePermit(taskForGroup(workloadGroupId), principal, ActionListener.wrap(p -> {
+            admission.permit.set(p);
+            admission.completed.set(true);
+        }, e -> {
+            admission.failure.set(e);
+            admission.completed.set(true);
+        }));
+        return admission;
+    }
+
+    private static String principal(String... tokens) {
+        return String.join(WorkloadGroupTask.WORKLOAD_GROUP_PRINCIPAL_VALUE_DELIMITER, tokens);
+    }
+
+    public void testMultiRuleRequestNeedsAPermitFromEveryRule() {
+        when(mockWorkloadManagementSettings.getWlmMode()).thenReturn(WlmMode.ENABLED);
+        mockWorkloadGroupsStateAccessor.addNewWorkloadGroup("wg-1");
+        Settings throttling = Settings.builder().put("username.node_limit", 1).put("role.node_limit", 1).build();
+        stubClusterStateWithGroup(throttledGroup("wg-1", throttling));
+
+        Releasable aliceAnalyst = acquireThrottlePermitSync(workloadGroupService, "wg-1", principal("username|alice", "role|analyst"));
+        assertNotNull(aliceAnalyst);
+
+        // bob has room under the username rule but the analyst role is full: rejected, naming the role rule.
+        OpenSearchRejectedExecutionException e = expectThrows(
+            OpenSearchRejectedExecutionException.class,
+            () -> acquireThrottlePermitSync(workloadGroupService, "wg-1", principal("username|bob", "role|analyst"))
+        );
+        assertEquals(
+            "Request throttled: workload group [wg-1-name] for role [analyst] reached its per-node limit of 1 concurrent requests.",
+            e.getMessage()
+        );
+        assertEquals(1, mockWorkloadGroupsStateAccessor.getWorkloadGroupState("wg-1").getTotalThrottled());
+
+        // The rejection released the username permit bob took first, so bob still fits under a different role.
+        Releasable bobAdmin = acquireThrottlePermitSync(workloadGroupService, "wg-1", principal("username|bob", "role|admin"));
+        assertNotNull(bobAdmin);
+
+        // Closing alice's combined permit frees both of her buckets.
+        aliceAnalyst.close();
+        aliceAnalyst.close(); // idempotent
+        assertNotNull(acquireThrottlePermitSync(workloadGroupService, "wg-1", principal("username|alice", "role|analyst")));
+        bobAdmin.close();
+    }
+
+    public void testUserWithSeveralRolesIsChargedToTheirSmallestRole() {
+        when(mockWorkloadManagementSettings.getWlmMode()).thenReturn(WlmMode.ENABLED);
+        mockWorkloadGroupsStateAccessor.addNewWorkloadGroup("wg-1");
+        stubClusterStateWithGroup(throttledGroup("wg-1", Settings.builder().put("role.node_limit", 1).build()));
+
+        // alice holds [analyst, admin]: she lands in the lexicographically smallest role's bucket, admin, only.
+        Releasable alice = acquireThrottlePermitSync(
+            workloadGroupService,
+            "wg-1",
+            principal("username|alice", "role|analyst", "role|admin")
+        );
+        assertNotNull(alice);
+        OpenSearchRejectedExecutionException e = expectThrows(
+            OpenSearchRejectedExecutionException.class,
+            () -> acquireThrottlePermitSync(workloadGroupService, "wg-1", principal("username|carol", "role|admin"))
+        );
+        assertTrue(e.getMessage(), e.getMessage().contains("for role [admin]"));
+        // The analyst bucket was never charged, so bob (analyst only) is admitted.
+        Releasable bob = acquireThrottlePermitSync(workloadGroupService, "wg-1", principal("username|bob", "role|analyst"));
+        assertNotNull(bob);
+
+        alice.close();
+        bob.close();
+        Releasable carol = acquireThrottlePermitSync(workloadGroupService, "wg-1", principal("username|carol", "role|admin"));
+        assertNotNull(carol);
+        carol.close();
+    }
+
+    public void testRulesAreAcquiredNarrowestFirst() {
+        when(mockWorkloadManagementSettings.getWlmMode()).thenReturn(WlmMode.ENABLED);
+        mockWorkloadGroupsStateAccessor.addNewWorkloadGroup("wg-1");
+        Settings throttling = Settings.builder().put("group.node_limit", 1).put("username.node_limit", 1).build();
+        stubClusterStateWithGroup(throttledGroup("wg-1", throttling));
+
+        Releasable alice = acquireThrottlePermitSync(workloadGroupService, "wg-1", "username|alice");
+        assertNotNull(alice);
+        // Both of alice's buckets are full; the username rule is checked first, so it is the one named.
+        OpenSearchRejectedExecutionException aliceAgain = expectThrows(
+            OpenSearchRejectedExecutionException.class,
+            () -> acquireThrottlePermitSync(workloadGroupService, "wg-1", "username|alice")
+        );
+        assertTrue(aliceAgain.getMessage(), aliceAgain.getMessage().contains("for username [alice] reached its per-node limit"));
+        // bob passes his own username rule and is stopped by the group rule.
+        OpenSearchRejectedExecutionException bob = expectThrows(
+            OpenSearchRejectedExecutionException.class,
+            () -> acquireThrottlePermitSync(workloadGroupService, "wg-1", "username|bob")
+        );
+        assertEquals(
+            "Request throttled: workload group [wg-1-name] reached its per-node limit of 1 concurrent requests.",
+            bob.getMessage()
+        );
+        alice.close();
+    }
+
+    public void testRuleWithoutAValueIsSkippedButOtherRulesStillApply() {
+        when(mockWorkloadManagementSettings.getWlmMode()).thenReturn(WlmMode.ENABLED);
+        mockWorkloadGroupsStateAccessor.addNewWorkloadGroup("wg-1");
+        Settings throttling = Settings.builder().put("username.node_limit", 1).put("group.node_limit", 2).build();
+        stubClusterStateWithGroup(throttledGroup("wg-1", throttling));
+
+        // No principal: the username rule can't attribute the request, but the group rule still counts it.
+        Releasable first = acquireThrottlePermitSync(workloadGroupService, "wg-1", null);
+        Releasable second = acquireThrottlePermitSync(workloadGroupService, "wg-1", null);
+        assertNotNull(first);
+        assertNotNull(second);
+        expectThrows(OpenSearchRejectedExecutionException.class, () -> acquireThrottlePermitSync(workloadGroupService, "wg-1", null));
+        first.close();
+        second.close();
+    }
+
+    public void testMonitorModeObservesEachRuleAndKeepsGoing() {
+        when(mockWorkloadManagementSettings.getWlmMode()).thenReturn(WlmMode.ENABLED);
+        mockWorkloadGroupsStateAccessor.addNewWorkloadGroup("wg-1");
+        Settings throttling = Settings.builder().put("username.node_limit", 1).put("group.node_limit", 5).build();
+        stubClusterStateWithGroup(throttledGroup("wg-1", throttling, MutableWorkloadGroupFragment.ResiliencyMode.MONITOR));
+
+        Releasable first = acquireThrottlePermitSync(workloadGroupService, "wg-1", "username|alice");
+        assertNotNull(first);
+        // alice's username bucket would breach: observed and skipped, but the group rule still tracks the request.
+        Releasable second = acquireThrottlePermitSync(workloadGroupService, "wg-1", "username|alice");
+        assertNotNull("the group rule must still hand out a tracked permit", second);
+        assertEquals(0, mockWorkloadGroupsStateAccessor.getWorkloadGroupState("wg-1").getTotalThrottled());
+        first.close();
+        second.close();
+    }
+
+    public void testRequestQueuedAtALaterRuleHoldsEarlierPermitsAndResumes() {
+        when(mockWorkloadManagementSettings.getWlmMode()).thenReturn(WlmMode.ENABLED);
+        mockWorkloadGroupsStateAccessor.addNewWorkloadGroup("wg-1");
+        Settings throttling = Settings.builder().put("username.node_limit", 1).put("group.node_limit", 1).build();
+        Settings queue = Settings.builder().put("size_per_bucket", 5).build();
+        stubClusterStateWithGroup(queueingGroup("wg-1", throttling, queue, MutableWorkloadGroupFragment.ResiliencyMode.ENFORCED));
+        WorkloadGroupQueueService queueService = newDirectQueueService();
+
+        Releasable bob = acquireThrottlePermitSync(workloadGroupService, "wg-1", "username|bob");
+        assertNotNull(bob);
+
+        // alice gets her username permit, then parks on the full group bucket while holding it.
+        PendingAdmission alice = startAdmission("wg-1", "username|alice");
+        assertFalse("alice must be parked on the group bucket", alice.completed.get());
+        assertEquals(1, queueService.currentDepth("wg-1"));
+        PendingAdmission aliceAgain = startAdmission("wg-1", "username|alice");
+        assertFalse("alice's second request waits on her own (held) username bucket", aliceAgain.completed.get());
+
+        // bob finishing hands the group slot to alice, who then completes with both permits.
+        bob.close();
+        assertTrue(alice.completed.get());
+        assertNull(alice.failure.get());
+        assertNotNull(alice.permit.get());
+        assertFalse("alice's second request is still waiting behind her first", aliceAgain.completed.get());
+
+        // alice finishing releases both buckets: her queued second request takes the username slot, then the group slot.
+        alice.permit.get().close();
+        assertTrue(aliceAgain.completed.get());
+        assertNotNull(aliceAgain.permit.get());
+        aliceAgain.permit.get().close();
+        assertEquals(0, queueService.retainedDepth("wg-1"));
+
+        // Nothing leaked: both buckets admit again.
+        Releasable after = acquireThrottlePermitSync(workloadGroupService, "wg-1", "username|alice");
+        assertNotNull(after);
+        after.close();
+    }
+
+    public void testRejectionAfterQueueingReleasesEarlierPermits() {
+        when(mockWorkloadManagementSettings.getWlmMode()).thenReturn(WlmMode.ENABLED);
+        mockWorkloadGroupsStateAccessor.addNewWorkloadGroup("wg-1");
+        Settings throttling = Settings.builder().put("username.node_limit", 1).put("group.node_limit", 1).build();
+        Settings queue = Settings.builder().put("size_per_bucket", 1).build();
+        stubClusterStateWithGroup(queueingGroup("wg-1", throttling, queue, MutableWorkloadGroupFragment.ResiliencyMode.ENFORCED));
+        WorkloadGroupQueueService queueService = newDirectQueueService();
+
+        Releasable bob = acquireThrottlePermitSync(workloadGroupService, "wg-1", "username|bob");
+        PendingAdmission carol = startAdmission("wg-1", "username|carol"); // parks on the group bucket (fills it)
+        assertFalse(carol.completed.get());
+
+        // dave: username ok, group bucket full and its queue full -> 429, and dave's username permit must be returned.
+        expectThrows(
+            OpenSearchRejectedExecutionException.class,
+            () -> acquireThrottlePermitSync(workloadGroupService, "wg-1", "username|dave")
+        );
+        bob.close(); // carol is admitted
+        assertNotNull(carol.permit.get());
+        carol.permit.get().close();
+        Releasable dave = acquireThrottlePermitSync(workloadGroupService, "wg-1", "username|dave");
+        assertNotNull("dave's username permit from the rejected attempt must have been released", dave);
+        dave.close();
+        assertEquals(0, queueService.retainedDepth("wg-1"));
+    }
+
+    public void testLiveConfigDrainReleasesTheBucketButKeepsUnchangedRules() {
+        when(mockWorkloadManagementSettings.getWlmMode()).thenReturn(WlmMode.ENABLED);
+        mockWorkloadGroupsStateAccessor.addNewWorkloadGroup("wg-1");
+        Settings throttling = Settings.builder().put("username.node_limit", 1).put("group.node_limit", 1).build();
+        Settings queue = Settings.builder().put("size_per_bucket", 5).build();
+        WorkloadGroup original = queueingGroup("wg-1", throttling, queue, MutableWorkloadGroupFragment.ResiliencyMode.ENFORCED);
+        stubClusterStateWithGroup(original);
+        WorkloadGroupQueueService queueService = newDirectQueueService();
+
+        Releasable alice = acquireThrottlePermitSync(workloadGroupService, "wg-1", "username|alice");
+        assertNotNull(alice);
+        // alice's second request parks on her username bucket, before reaching the (also full) group bucket.
+        PendingAdmission parked = startAdmission("wg-1", "username|alice");
+        assertFalse(parked.completed.get());
+
+        // Removing the username rule changes the group's admission shape, so the backlog is released from the username
+        // bucket. The unchanged group rule still applies: the request moves on and waits for the group bucket.
+        WorkloadGroup groupOnly = queueingGroup(
+            "wg-1",
+            Settings.builder().put("group.node_limit", 1).build(),
+            queue,
+            MutableWorkloadGroupFragment.ResiliencyMode.ENFORCED
+        );
+        stubClusterStateWithGroup(groupOnly);
+        deliverWorkloadGroupsChanged(Map.of("wg-1", original), Map.of("wg-1", groupOnly));
+
+        assertFalse("the unchanged group rule must still hold the request back", parked.completed.get());
+        assertEquals(1, queueService.currentDepth("wg-1"));
+        alice.close();
+        assertTrue(parked.completed.get());
+        assertNull(parked.failure.get());
+        assertNotNull("admitted against the group bucket", parked.permit.get());
+        parked.permit.get().close();
+        assertEquals(0, queueService.retainedDepth("wg-1"));
+    }
+
+    public void testLaterBucketsUseLiveLimits() {
+        when(mockWorkloadManagementSettings.getWlmMode()).thenReturn(WlmMode.ENABLED);
+        mockWorkloadGroupsStateAccessor.addNewWorkloadGroup("wg-1");
+        Settings queue = Settings.builder().put("size_per_bucket", 5).build();
+        WorkloadGroup wide = queueingGroup(
+            "wg-1",
+            Settings.builder().put("username.node_limit", 1).put("group.node_limit", 100).build(),
+            queue,
+            MutableWorkloadGroupFragment.ResiliencyMode.ENFORCED
+        );
+        stubClusterStateWithGroup(wide);
+        WorkloadGroupQueueService queueService = newDirectQueueService();
+
+        Releasable alice = acquireThrottlePermitSync(workloadGroupService, "wg-1", "username|alice"); // group 1/100
+        Releasable bob = acquireThrottlePermitSync(workloadGroupService, "wg-1", "username|bob");     // group 2/100
+        PendingAdmission parked = startAdmission("wg-1", "username|alice"); // waits on alice's username bucket
+        assertFalse(parked.completed.get());
+
+        // The operator lowers group.node_limit to 2 (same shape, so nothing drains). When alice's queued request resumes,
+        // it must acquire the group bucket against the live limit of 2, which is full — not the 100 seen on arrival.
+        stubClusterStateWithGroup(
+            queueingGroup(
+                "wg-1",
+                Settings.builder().put("username.node_limit", 1).put("group.node_limit", 2).build(),
+                queue,
+                MutableWorkloadGroupFragment.ResiliencyMode.ENFORCED
+            )
+        );
+        alice.close(); // hands alice's username slot to the parked request; the group bucket is now at 1/2 (bob)
+        assertTrue("1 of 2 group slots is free, so it is admitted", parked.completed.get());
+        assertNotNull(parked.permit.get());
+        // group is now 2/2: a third request (carol) must wait at the live limit of 2.
+        PendingAdmission carol = startAdmission("wg-1", "username|carol");
+        assertFalse("the live group limit of 2 is reached", carol.completed.get());
+        bob.close();
+        assertTrue(carol.completed.get());
+        carol.permit.get().close();
+        parked.permit.get().close();
+        assertEquals(0, queueService.retainedDepth("wg-1"));
+    }
+
+    public void testRuleRemovedMidChainIsSkippedNotWaitedOn() {
+        when(mockWorkloadManagementSettings.getWlmMode()).thenReturn(WlmMode.ENABLED);
+        mockWorkloadGroupsStateAccessor.addNewWorkloadGroup("wg-1");
+        Settings queue = Settings.builder().put("size_per_bucket", 5).build();
+        WorkloadGroup both = queueingGroup(
+            "wg-1",
+            Settings.builder().put("username.node_limit", 1).put("group.node_limit", 1).build(),
+            queue,
+            MutableWorkloadGroupFragment.ResiliencyMode.ENFORCED
+        );
+        stubClusterStateWithGroup(both);
+        WorkloadGroupQueueService queueService = newDirectQueueService();
+
+        Releasable alice = acquireThrottlePermitSync(workloadGroupService, "wg-1", "username|alice");
+        PendingAdmission parked = startAdmission("wg-1", "username|alice");
+        assertFalse(parked.completed.get());
+
+        // The group rule is removed before this node processes the change (no drain): the resumed request must skip it.
+        stubClusterStateWithGroup(
+            queueingGroup(
+                "wg-1",
+                Settings.builder().put("username.node_limit", 1).build(),
+                queue,
+                MutableWorkloadGroupFragment.ResiliencyMode.ENFORCED
+            )
+        );
+        alice.close();
+        assertTrue(parked.completed.get());
+        assertNull(parked.failure.get());
+        assertNotNull("holds only its username permit", parked.permit.get());
+        parked.permit.get().close();
+        assertEquals(0, queueService.retainedDepth("wg-1"));
+    }
+
+    public void testCancelledRequestStopsAcquiringAndReleasesHeldPermits() {
+        when(mockWorkloadManagementSettings.getWlmMode()).thenReturn(WlmMode.ENABLED);
+        mockWorkloadGroupsStateAccessor.addNewWorkloadGroup("wg-1");
+        Settings throttling = Settings.builder().put("username.node_limit", 1).put("group.node_limit", 1).build();
+        Settings queue = Settings.builder().put("size_per_bucket", 5).build();
+        stubClusterStateWithGroup(queueingGroup("wg-1", throttling, queue, MutableWorkloadGroupFragment.ResiliencyMode.ENFORCED));
+        WorkloadGroupQueueService queueService = newDirectQueueService();
+
+        Releasable bob = acquireThrottlePermitSync(workloadGroupService, "wg-1", "username|bob");
+        // alice takes her username permit and parks on the group bucket while holding it.
+        WorkloadGroupTask aliceTask = taskForGroup("wg-1");
+        PendingAdmission alice = new PendingAdmission();
+        workloadGroupService.acquireThrottlePermit(aliceTask, "username|alice", ActionListener.wrap(p -> {
+            alice.permit.set(p);
+            alice.completed.set(true);
+        }, e -> {
+            alice.failure.set(e);
+            alice.completed.set(true);
+        }));
+        assertFalse(alice.completed.get());
+
+        // Cancelling the parked task evicts it and must release the username permit it was holding.
+        aliceTask.cancel("client went away");
+        assertTrue(alice.completed.get());
+        assertNotNull(alice.failure.get());
+        assertEquals(0, queueService.retainedDepth("wg-1"));
+        bob.close();
+        // If the cancelled request had leaked its username permit, alice's next request would be held at username.
+        Releasable aliceAgain = acquireThrottlePermitSync(workloadGroupService, "wg-1", "username|alice");
+        assertNotNull(aliceAgain);
+        aliceAgain.close();
+    }
+
+    public void testAddingARuleDrainsTheQueue() {
+        WorkloadGroupQueueService queueService = newDirectQueueService();
+        AtomicInteger admissions = new AtomicInteger();
+        enqueueWaitingRequest(queueService, "wg-1", "wg-1:group", admissions);
+
+        Settings queue = Settings.builder().put("size_per_bucket", 10).build();
+        WorkloadGroup groupOnly = queueingGroup(
+            "wg-1",
+            Settings.builder().put("group.node_limit", 1).build(),
+            queue,
+            MutableWorkloadGroupFragment.ResiliencyMode.ENFORCED
+        );
+        WorkloadGroup withUsername = queueingGroup(
+            "wg-1",
+            Settings.builder().put("group.node_limit", 1).put("username.node_limit", 3).build(),
+            queue,
+            MutableWorkloadGroupFragment.ResiliencyMode.ENFORCED
+        );
+        deliverWorkloadGroupsChanged(Map.of("wg-1", groupOnly), Map.of("wg-1", withUsername));
+        assertEquals(1, admissions.get());
+    }
+
+    public void testChangingOneRulesLimitKeepsTheQueue() {
+        WorkloadGroupQueueService queueService = newDirectQueueService();
+        AtomicInteger admissions = new AtomicInteger();
+        enqueueWaitingRequest(queueService, "wg-1", "wg-1:group", admissions);
+
+        Settings queue = Settings.builder().put("size_per_bucket", 10).build();
+        WorkloadGroup previous = queueingGroup(
+            "wg-1",
+            Settings.builder().put("group.node_limit", 1).put("username.node_limit", 3).build(),
+            queue,
+            MutableWorkloadGroupFragment.ResiliencyMode.ENFORCED
+        );
+        WorkloadGroup current = queueingGroup(
+            "wg-1",
+            Settings.builder().put("group.node_limit", 1).put("username.node_limit", 7).build(),
+            queue,
+            MutableWorkloadGroupFragment.ResiliencyMode.ENFORCED
+        );
+        deliverWorkloadGroupsChanged(Map.of("wg-1", previous), Map.of("wg-1", current));
+        assertEquals("a numeric change with the same rules and tiers must not drain", 0, admissions.get());
+        assertEquals(1, queueService.currentDepth("wg-1"));
+    }
+
+    // A shared-throttle service whose ring holds only this node, so every shared acquire takes the local-owner path.
+    private WorkloadGroupSharedThrottleService localSharedThrottleService(WorkloadGroup group) {
+        DiscoveryNode localNode = new DiscoveryNode(
+            "local",
+            "local",
+            buildNewFakeTransportAddress(),
+            Collections.emptyMap(),
+            Set.of(DiscoveryNodeRole.DATA_ROLE),
+            org.opensearch.Version.CURRENT
+        );
+        DiscoveryNodes nodes = DiscoveryNodes.builder().add(localNode).localNodeId("local").build();
+        ClusterState clusterState = Mockito.mock(ClusterState.class);
+        Metadata metadata = Mockito.mock(Metadata.class);
+        when(mockClusterService.state()).thenReturn(clusterState);
+        when(mockClusterService.localNode()).thenReturn(localNode);
+        when(clusterState.metadata()).thenReturn(metadata);
+        when(clusterState.nodes()).thenReturn(nodes);
+        when(metadata.workloadGroups()).thenReturn(Map.of(group.get_id(), group));
+        WorkloadGroupSharedThrottleService sharedService = new WorkloadGroupSharedThrottleService(
+            mockClusterService,
+            mockThreadPool,
+            Mockito.mock(org.opensearch.transport.TransportService.class)
+        );
+        ClusterState previous = Mockito.mock(ClusterState.class);
+        when(previous.nodes()).thenReturn(DiscoveryNodes.EMPTY_NODES);
+        sharedService.clusterChanged(new ClusterChangedEvent("test", clusterState, previous));
+        workloadGroupService.setSharedThrottleService(sharedService);
+        return sharedService;
+    }
+
+    public void testHeldSharedPermitsAreKeptAliveWhileWaitingForALaterBucket() {
+        when(mockWorkloadManagementSettings.getWlmMode()).thenReturn(WlmMode.ENABLED);
+        mockWorkloadGroupsStateAccessor.addNewWorkloadGroup("wg-1");
+        Settings throttling = Settings.builder().put("username.shared_limit", 1).put("group.node_limit", 1).build();
+        Settings queue = Settings.builder().put("size_per_bucket", 5).build();
+        WorkloadGroup group = queueingGroup("wg-1", throttling, queue, MutableWorkloadGroupFragment.ResiliencyMode.ENFORCED);
+        WorkloadGroupSharedThrottleService sharedService = localSharedThrottleService(group);
+        WorkloadGroupQueueService queueService = newDirectQueueService();
+
+        Releasable bob = acquireThrottlePermitSync(workloadGroupService, "wg-1", "username|bob");
+        assertNotNull(bob);
+        assertEquals("an admitted request's permits are not kept alive", 0, sharedService.keptAliveCountForTest());
+
+        // alice takes her shared username permit, then waits on the full group bucket: that permit must be renewed.
+        PendingAdmission alice = startAdmission("wg-1", "username|alice");
+        assertFalse(alice.completed.get());
+        assertEquals(1, sharedService.keptAliveCountForTest());
+        sharedService.renewKeptAlivePermits();
+
+        bob.close(); // hands the group slot to alice
+        assertTrue(alice.completed.get());
+        assertNotNull(alice.permit.get());
+        assertEquals("admitted: no longer kept alive", 0, sharedService.keptAliveCountForTest());
+        alice.permit.get().close();
+        assertEquals(0, queueService.retainedDepth("wg-1"));
+    }
+
+    public void testExceptionAtALaterStepReleasesHeldPermitsAndFailsOnce() {
+        when(mockWorkloadManagementSettings.getWlmMode()).thenReturn(WlmMode.ENABLED);
+        mockWorkloadGroupsStateAccessor.addNewWorkloadGroup("wg-1");
+        Settings throttling = Settings.builder().put("username.node_limit", 1).put("group.shared_limit", 1).build();
+        stubClusterStateWithGroup(throttledGroup("wg-1", throttling));
+        WorkloadGroupSharedThrottleService sharedService = Mockito.mock(WorkloadGroupSharedThrottleService.class);
+        when(sharedService.keepAlive(any(), anyLong())).thenReturn(() -> {});
+        doThrow(new IllegalStateException("boom")).doAnswer(invocation -> {
+            ActionListener<Releasable> l = invocation.getArgument(2);
+            l.onResponse(null); // owner unavailable -> fail open
+            return null;
+        }).when(sharedService).acquireAsync(anyString(), anyInt(), any());
+        workloadGroupService.setSharedThrottleService(sharedService);
+
+        AtomicInteger completions = new AtomicInteger();
+        AtomicReference<Exception> failure = new AtomicReference<>();
+        workloadGroupService.acquireThrottlePermit(taskForGroup("wg-1"), "username|alice", ActionListener.wrap(p -> {
+            completions.incrementAndGet();
+        }, e -> {
+            completions.incrementAndGet();
+            failure.set(e);
+        }));
+        assertEquals(1, completions.get());
+        assertTrue(failure.get() instanceof IllegalStateException);
+
+        // The username permit taken before the throw was released: alice is admitted again.
+        Releasable again = acquireThrottlePermitSync(workloadGroupService, "wg-1", "username|alice");
+        assertNotNull(again);
+        again.close();
+    }
+
+    public void testKeepAliveDeadlineIsPerRequestNotPerStep() {
+        when(mockWorkloadManagementSettings.getWlmMode()).thenReturn(WlmMode.ENABLED);
+        mockWorkloadGroupsStateAccessor.addNewWorkloadGroup("wg-1");
+        Settings throttling = Settings.builder()
+            .put("username.shared_limit", 1)
+            .put("role.node_limit", 1)
+            .put("group.node_limit", 1)
+            .build();
+        Settings queue = Settings.builder().put("size_per_bucket", 5).build();
+        stubClusterStateWithGroup(queueingGroup("wg-1", throttling, queue, MutableWorkloadGroupFragment.ResiliencyMode.ENFORCED));
+        WorkloadGroupQueueService queueService = newDirectQueueService();
+        WorkloadGroupSharedThrottleService sharedService = Mockito.mock(WorkloadGroupSharedThrottleService.class);
+        when(sharedService.keepAlive(any(), anyLong())).thenReturn(() -> {});
+        doAnswer(invocation -> {
+            ActionListener<Releasable> l = invocation.getArgument(2);
+            l.onResponse(() -> {}); // a granted shared permit
+            return null;
+        }).when(sharedService).acquireAsync(anyString(), anyInt(), any(), any());
+        workloadGroupService.setSharedThrottleService(sharedService);
+
+        Releasable bob = acquireThrottlePermitSync(workloadGroupService, "wg-1", principal("username|bob", "role|reader"));
+        assertNotNull(bob);
+        // alice holds her shared username permit and waits at the role bucket, then moves on to the group bucket.
+        PendingAdmission alice = startAdmission("wg-1", principal("username|alice", "role|reader"));
+        assertFalse(alice.completed.get());
+        bob.close();
+        assertTrue(alice.completed.get());
+
+        ArgumentCaptor<Long> deadlines = ArgumentCaptor.forClass(Long.class);
+        // Two steps after the first for each of bob and alice: each request reuses one deadline across its steps.
+        verify(sharedService, times(4)).keepAlive(any(), deadlines.capture());
+        List<Long> values = deadlines.getAllValues();
+        assertEquals("bob's steps share one deadline", values.get(0), values.get(1));
+        assertEquals("alice's steps share one deadline", values.get(2), values.get(3));
+        alice.permit.get().close();
+        assertEquals(0, queueService.retainedDepth("wg-1"));
+    }
+
+    public void testRequestEnqueuedJustAfterItsTierWasRemovedIsReleased() {
+        when(mockWorkloadManagementSettings.getWlmMode()).thenReturn(WlmMode.ENABLED);
+        mockWorkloadGroupsStateAccessor.addNewWorkloadGroup("wg-1");
+        Settings queue = Settings.builder().put("size_per_bucket", 5).build();
+        WorkloadGroup withRule = queueingGroup(
+            "wg-1",
+            Settings.builder().put("group.node_limit", 1).build(),
+            queue,
+            MutableWorkloadGroupFragment.ResiliencyMode.ENFORCED
+        );
+        WorkloadGroup withoutRule = queueingGroup(
+            "wg-1",
+            Settings.builder().put("username.node_limit", 1).build(),
+            queue,
+            MutableWorkloadGroupFragment.ResiliencyMode.ENFORCED
+        );
+        WorkloadGroupQueueService queueService = newDirectQueueService();
+        ClusterState clusterState = Mockito.mock(ClusterState.class);
+        Metadata metadata = Mockito.mock(Metadata.class);
+        when(mockClusterService.state()).thenReturn(clusterState);
+        when(clusterState.metadata()).thenReturn(metadata);
+        when(metadata.workloadGroups()).thenReturn(Map.of("wg-1", withRule));
+        Releasable holder = acquireThrottlePermitSync(workloadGroupService, "wg-1", null);
+        assertNotNull(holder);
+
+        // Another request already waits in the bucket (as one queued under a newer config would); it must not be released.
+        AtomicInteger otherAdmissions = new AtomicInteger();
+        enqueueWaitingRequest(queueService, "wg-1", "wg-1:group", otherAdmissions);
+
+        // The second request resolves its plan with the group rule, but the rule is gone by the time it enqueues (and
+        // the change's queue drain has already run): it must be released rather than wait forever.
+        when(metadata.workloadGroups()).thenReturn(Map.of("wg-1", withRule), Map.of("wg-1", withoutRule));
+        PendingAdmission late = startAdmission("wg-1", null);
+        assertTrue("released instead of stranded", late.completed.get());
+        assertNull(late.failure.get());
+        assertEquals("only the late request is released", 0, otherAdmissions.get());
+        assertEquals(1, queueService.retainedDepth("wg-1"));
+        holder.close();
+    }
+
+    public void testSynchronousSharedAcquireFailureDoesNotOrphanThePendingEntry() {
+        when(mockWorkloadManagementSettings.getWlmMode()).thenReturn(WlmMode.ENABLED);
+        mockWorkloadGroupsStateAccessor.addNewWorkloadGroup("wg-1");
+        Settings throttling = Settings.builder().put("group.shared_limit", 1).build();
+        Settings queue = Settings.builder().put("size_per_bucket", 5).build();
+        stubClusterStateWithGroup(queueingGroup("wg-1", throttling, queue, MutableWorkloadGroupFragment.ResiliencyMode.ENFORCED));
+        WorkloadGroupQueueService queueService = newDirectQueueService();
+        WorkloadGroupSharedThrottleService sharedService = Mockito.mock(WorkloadGroupSharedThrottleService.class);
+        doThrow(new IllegalStateException("boom")).when(sharedService).acquireAsync(anyString(), anyInt(), any(), any());
+        workloadGroupService.setSharedThrottleService(sharedService);
+
+        PendingAdmission admission = startAdmission("wg-1", null);
+        assertTrue(admission.completed.get());
+        assertTrue(admission.failure.get() instanceof IllegalStateException);
+        assertEquals("the provisional queue entry is removed with the failed send", 0, queueService.retainedDepth("wg-1"));
+    }
+
+    public void testRejectionStillReachesTheCallerWhenReleasingAHeldPermitThrows() {
+        when(mockWorkloadManagementSettings.getWlmMode()).thenReturn(WlmMode.ENABLED);
+        mockWorkloadGroupsStateAccessor.addNewWorkloadGroup("wg-1");
+        Settings throttling = Settings.builder().put("username.shared_limit", 5).put("group.node_limit", 1).build();
+        stubClusterStateWithGroup(throttledGroup("wg-1", throttling));
+        WorkloadGroupSharedThrottleService sharedService = Mockito.mock(WorkloadGroupSharedThrottleService.class);
+        when(sharedService.keepAlive(any(), anyLong())).thenReturn(() -> {});
+        AtomicInteger grants = new AtomicInteger();
+        doAnswer(invocation -> {
+            ActionListener<Releasable> l = invocation.getArgument(2);
+            boolean second = grants.incrementAndGet() == 2;
+            l.onResponse(() -> {
+                if (second) {
+                    throw new IllegalStateException("release failed (e.g. executor shut down)");
+                }
+            });
+            return null;
+        }).when(sharedService).acquireAsync(anyString(), anyInt(), any());
+        workloadGroupService.setSharedThrottleService(sharedService);
+
+        Releasable holder = acquireThrottlePermitSync(workloadGroupService, "wg-1", "username|alice"); // takes the group slot
+        OpenSearchRejectedExecutionException e = expectThrows(
+            OpenSearchRejectedExecutionException.class,
+            () -> acquireThrottlePermitSync(workloadGroupService, "wg-1", "username|bob")
+        );
+        assertEquals(1, e.getSuppressed().length);
+        holder.close();
+    }
+
+    public void testRequestEnqueuedJustAfterASwitchToMonitorIsReleased() {
+        when(mockWorkloadManagementSettings.getWlmMode()).thenReturn(WlmMode.ENABLED);
+        mockWorkloadGroupsStateAccessor.addNewWorkloadGroup("wg-1");
+        Settings throttling = Settings.builder().put("group.node_limit", 1).build();
+        Settings queue = Settings.builder().put("size_per_bucket", 5).build();
+        WorkloadGroup enforced = queueingGroup("wg-1", throttling, queue, MutableWorkloadGroupFragment.ResiliencyMode.ENFORCED);
+        WorkloadGroup monitor = queueingGroup("wg-1", throttling, queue, MutableWorkloadGroupFragment.ResiliencyMode.MONITOR);
+        WorkloadGroupQueueService queueService = newDirectQueueService();
+        ClusterState clusterState = Mockito.mock(ClusterState.class);
+        Metadata metadata = Mockito.mock(Metadata.class);
+        when(mockClusterService.state()).thenReturn(clusterState);
+        when(clusterState.metadata()).thenReturn(metadata);
+        when(metadata.workloadGroups()).thenReturn(Map.of("wg-1", enforced));
+        Releasable holder = acquireThrottlePermitSync(workloadGroupService, "wg-1", null);
+
+        // Resolved as ENFORCED, but the group is in MONITOR (already drained) when the request enqueues.
+        when(metadata.workloadGroups()).thenReturn(Map.of("wg-1", enforced), Map.of("wg-1", monitor));
+        PendingAdmission late = startAdmission("wg-1", null);
+        assertTrue("MONITOR never keeps a request waiting", late.completed.get());
+        assertEquals(0, queueService.retainedDepth("wg-1"));
+        holder.close();
+    }
+
+    public void testFullGroupQueueRejectionSaysTheQueueIsFull() {
+        when(mockWorkloadManagementSettings.getWlmMode()).thenReturn(WlmMode.ENABLED);
+        mockWorkloadGroupsStateAccessor.addNewWorkloadGroup("wg-1");
+        Settings throttling = Settings.builder().put("group.shared_limit", 1).build();
+        Settings queue = Settings.builder().put("size_per_bucket", 5).build();
+        stubClusterStateWithGroup(queueingGroup("wg-1", throttling, queue, MutableWorkloadGroupFragment.ResiliencyMode.ENFORCED));
+        WorkloadGroupQueueService queueService = newDirectQueueService();
+        workloadGroupService.setSharedThrottleService(Mockito.mock(WorkloadGroupSharedThrottleService.class));
+        for (int i = 0; i < WorkloadGroupQueueSettings.MAX_GROUP_QUEUE_DEPTH; i++) {
+            assertNotNull(
+                queueService.tryRegisterPendingAcquire("wg-1", "wg-1:group", taskForGroup("wg-1"), ActionListener.wrap(p -> {}, e -> {}))
+            );
+        }
+        OpenSearchRejectedExecutionException e = expectThrows(
+            OpenSearchRejectedExecutionException.class,
+            () -> acquireThrottlePermitSync(workloadGroupService, "wg-1", null)
+        );
+        assertEquals(
+            "Request throttled: workload group [wg-1-name] already has the maximum of "
+                + WorkloadGroupQueueSettings.MAX_GROUP_QUEUE_DEPTH
+                + " queued requests.",
+            e.getMessage()
+        );
     }
 }

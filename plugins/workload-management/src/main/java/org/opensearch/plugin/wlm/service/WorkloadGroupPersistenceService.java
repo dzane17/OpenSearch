@@ -33,6 +33,7 @@ import org.opensearch.plugin.wlm.action.UpdateWorkloadGroupRequest;
 import org.opensearch.plugin.wlm.action.UpdateWorkloadGroupResponse;
 import org.opensearch.wlm.MutableWorkloadGroupFragment;
 import org.opensearch.wlm.ResourceType;
+import org.opensearch.wlm.WorkloadGroupThrottleSettings;
 
 import java.util.Collection;
 import java.util.EnumMap;
@@ -157,6 +158,8 @@ public class WorkloadGroupPersistenceService {
      * @param currentClusterState - the cluster state before the update
      */
     ClusterState saveWorkloadGroupInClusterState(final WorkloadGroup workloadGroup, final ClusterState currentClusterState) {
+        // Transport deserialization skips the user-input throttle checks, so apply them before writing.
+        WorkloadGroupThrottleSettings.validateForWrite(workloadGroup.getMutableWorkloadGroupFragment().getThrottling());
         final Map<String, WorkloadGroup> existingWorkloadGroups = currentClusterState.metadata().workloadGroups();
         String groupName = workloadGroup.getName();
 

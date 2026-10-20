@@ -302,10 +302,7 @@ public class WlmQueueingIT extends OpenSearchIntegTestCase {
         ActionFuture<SearchResponse> secondQueued = blockingSearch(indexName).execute();
         assertBusy(() -> assertEquals("second search should be parked", 1, getQueuedCurrent(workloadGroupId)), 30, TimeUnit.SECONDS);
 
-        Settings sharedOnlyThrottling = Settings.builder()
-            .put(WorkloadGroupThrottleSettings.ATTRIBUTE.getKey(), "group")
-            .put(WorkloadGroupThrottleSettings.SHARED_LIMIT.getKey(), 1)
-            .build();
+        Settings sharedOnlyThrottling = Settings.builder().put("group." + WorkloadGroupThrottleSettings.SHARED_LIMIT.getKey(), 1).build();
         WorkloadGroup sharedOnly = createQueueingWorkloadGroup("tier_switch_drain_group", workloadGroupId, sharedOnlyThrottling, 5);
         updateWorkloadGroupInClusterState(PUT, sharedOnly);
 
@@ -434,10 +431,7 @@ public class WlmQueueingIT extends OpenSearchIntegTestCase {
     }
 
     private WorkloadGroup createQueueingWorkloadGroup(String name, String id, int nodeLimit, int queueSizePerBucket) {
-        Settings throttling = Settings.builder()
-            .put(WorkloadGroupThrottleSettings.ATTRIBUTE.getKey(), "group")
-            .put(WorkloadGroupThrottleSettings.NODE_LIMIT.getKey(), nodeLimit)
-            .build();
+        Settings throttling = Settings.builder().put("group." + WorkloadGroupThrottleSettings.NODE_LIMIT.getKey(), nodeLimit).build();
         return createQueueingWorkloadGroup(name, id, throttling, queueSizePerBucket);
     }
 

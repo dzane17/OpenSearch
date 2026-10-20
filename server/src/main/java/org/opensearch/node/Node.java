@@ -1447,6 +1447,7 @@ public class Node implements Closeable {
             workloadGroupSharedThrottleService.setGrantConsumer(workloadGroupQueueService::admitWithPermit);
             // Owner-ring change -> inspect only this coordinator's retained buckets and re-register those that moved.
             workloadGroupSharedThrottleService.setRetainedBucketKeysSupplier(workloadGroupQueueService::retainedBucketKeys);
+            workloadGroupSharedThrottleService.setRetainedBucketCheck(workloadGroupQueueService::hasRetained);
 
             TopNSearchTasksLogger taskConsumer = new TopNSearchTasksLogger(settings, settingsModule.getClusterSettings());
             transportService.getTaskManager().registerTaskResourceConsumer(taskConsumer);

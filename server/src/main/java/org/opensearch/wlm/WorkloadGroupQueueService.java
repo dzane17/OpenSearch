@@ -94,18 +94,29 @@ public class WorkloadGroupQueueService {
         int sizePerBucket,
         ActionListener<Releasable> listener
     ) {
+        return tryEnqueueRequest(groupId, bucketKey, task, sizePerBucket, listener) != null;
+    }
+
+    /** As {@link #tryEnqueue}, returning the retained entry (or {@code null}) so the caller can target it later. */
+    public WorkloadGroupQueue.QueuedRequest tryEnqueueRequest(
+        String groupId,
+        String bucketKey,
+        WorkloadGroupTask task,
+        int sizePerBucket,
+        ActionListener<Releasable> listener
+    ) {
         if (sizePerBucket <= 0) {
-            return false; // queueing disabled: not a queue rejection, the caller rejects with the normal throttle 429
+            return null; // queueing disabled: not a queue rejection, the caller rejects with the normal throttle 429
         }
         final long waitStartNanos = threadPool.relativeTimeInNanos();
         WorkloadGroupQueue.QueuedRequest req = new WorkloadGroupQueue.QueuedRequest(listener, bucketKey, task, waitStartNanos);
         if (enqueueWaiting(groupId, req, sizePerBucket) == false) {
             incrementQueueRejection(groupId); // bucket or group queue full
-            return false;
+            return null;
         }
         // Count the completed wait when this entry is selected for admission, not here, so total_queued and the wait sum
         // describe the same completed WAITING intervals.
-        return true;
+        return req;
     }
 
     /**
@@ -331,6 +342,12 @@ public class WorkloadGroupQueueService {
      * request. Used only after an owner-ring change: the shared throttle service compares each bucket's previous and
      * current owner and re-registers demand that moved.
      */
+    /** Whether {@code bucketKey} currently has a retained (PENDING_ACQUIRE or WAITING) request. */
+    public boolean hasRetained(String bucketKey) {
+        WorkloadGroupQueue queue = queuesByGroup.get(groupIdOf(bucketKey));
+        return queue != null && queue.bucketKeys().contains(bucketKey);
+    }
+
     public Set<String> retainedBucketKeys() {
         Set<String> bucketKeys = new HashSet<>();
         for (WorkloadGroupQueue queue : queuesByGroup.values()) {
@@ -390,7 +407,7 @@ public class WorkloadGroupQueueService {
     }
 
     // The group id is the bucketKey prefix before the first ':' ("<groupId>:group" or "<groupId>:<attr>:<value>", see
-    // WorkloadGroupService.buildBucketKey). Group ids are base64 UUIDs with no ':', so the first ':' is unambiguous.
+    // WorkloadGroupThrottleSettings#bucketKey). Group ids are base64 UUIDs with no ':', so the first ':' is unambiguous.
     private static String groupIdOf(String bucketKey) {
         int idx = bucketKey.indexOf(':');
         return idx < 0 ? bucketKey : bucketKey.substring(0, idx);
