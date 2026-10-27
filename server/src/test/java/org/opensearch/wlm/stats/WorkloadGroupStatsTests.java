@@ -8,15 +8,11 @@
 
 package org.opensearch.wlm.stats;
 
-import org.opensearch.Version;
-import org.opensearch.cluster.node.DiscoveryNode;
-import org.opensearch.cluster.node.DiscoveryNodeRole;
 import org.opensearch.common.xcontent.json.JsonXContent;
 import org.opensearch.core.common.io.stream.Writeable;
 import org.opensearch.core.xcontent.ToXContent;
 import org.opensearch.core.xcontent.XContentBuilder;
 import org.opensearch.test.AbstractWireSerializingTestCase;
-import org.opensearch.test.OpenSearchTestCase;
 import org.opensearch.test.VersionUtils;
 import org.opensearch.wlm.ResourceType;
 import org.opensearch.wlm.WorkloadGroupThrottleSettings;
@@ -24,8 +20,6 @@ import org.opensearch.wlm.WorkloadGroupThrottleSettings;
 import java.io.IOException;
 import java.util.HashMap;
 import java.util.Map;
-
-import static java.util.Collections.emptyMap;
 
 public class WorkloadGroupStatsTests extends AbstractWireSerializingTestCase<WorkloadGroupStats> {
 
@@ -50,7 +44,10 @@ public class WorkloadGroupStatsTests extends AbstractWireSerializingTestCase<Wor
         workloadGroupStats.toXContent(builder, ToXContent.EMPTY_PARAMS);
         builder.endObject();
         assertEquals(
-            "{\"workload_groups\":{\"afakjklaj304041-afaka\":{\"total_completions\":123456789,\"total_rejections\":13,\"total_cancellations\":0,\"total_throttled\":5,\"total_would_throttle\":8,\"cpu\":{\"current_usage\":0.3,\"cancellations\":13,\"rejections\":2}}}}",
+            "{\"workload_groups\":{\"afakjklaj304041-afaka\":{\"total_completions\":123456789,\"total_rejections\":13,"
+                + "\"total_cancellations\":0,\"total_throttled\":5,\"total_would_throttle\":8,\"total_queued\":0,"
+                + "\"total_queue_rejections\":0,\"queued_current\":0,\"queued_peak\":0,\"total_queue_wait_millis\":0,"
+                + "\"cpu\":{\"current_usage\":0.3,\"cancellations\":13,\"rejections\":2}}}}",
             builder.toString()
         );
     }
@@ -96,6 +93,70 @@ public class WorkloadGroupStatsTests extends AbstractWireSerializingTestCase<Wor
         assertEquals(4, legacy.getResourceStats().get(ResourceType.CPU).getRejections());
     }
 
+    // The randomized createTestInstance() covers every field through the full constructor; this drives the queue-wait
+    // fields through the real production path (WorkloadGroupState -> from(...)) so a mapping bug among them is caught.
+    public void testQueueWaitFieldsSurviveWireRoundTrip() throws IOException {
+        WorkloadGroupState state = new WorkloadGroupState();
+        state.recordQueueEntry();
+        state.recordQueueEntry();
+        state.recordQueueEntry(); // three requests entered WAITING ...
+        state.recordQueueWaitMillis(100);
+        state.recordQueueWaitMillis(300); // ... two left: sum=400; one still waits -> mean=400/(3-1)=200
+        WorkloadGroupStats.WorkloadGroupStatsHolder holder = WorkloadGroupStats.WorkloadGroupStatsHolder.from(state, 1L, 2L);
+        assertEquals(3L, holder.getQueued());
+        assertEquals(400L, holder.getTotalQueueWaitMillis());
+
+        WorkloadGroupStats original = new WorkloadGroupStats(Map.of("g", holder));
+        WorkloadGroupStats roundTripped = copyWriteable(original, writableRegistry(), WorkloadGroupStats::new);
+        WorkloadGroupStats.WorkloadGroupStatsHolder rt = roundTripped.getStats().get("g");
+        assertEquals(3L, rt.getQueued());
+        assertEquals(400L, rt.getTotalQueueWaitMillis());
+        assertEquals(1L, rt.getQueuedCurrent());
+        assertEquals(2L, rt.getQueuedPeak());
+        assertEquals(original, roundTripped);
+    }
+
+    public void testQueueStatsAreVersionGatedAndKeepOlderStreamsAligned() throws IOException {
+        WorkloadGroupStats original = new WorkloadGroupStats(
+            Map.of(
+                "group-1",
+                new WorkloadGroupStats.WorkloadGroupStatsHolder(
+                    100,
+                    13,
+                    2,
+                    7,
+                    5,
+                    9,
+                    21,
+                    22,
+                    23,
+                    24,
+                    25,
+                    Map.of(ResourceType.CPU, new WorkloadGroupStats.ResourceStats(0.3, 11, 4))
+                )
+            )
+        );
+
+        WorkloadGroupStats.WorkloadGroupStatsHolder current = copyInstance(original, WorkloadGroupThrottleSettings.MIN_SUPPORTED_VERSION)
+            .getStats()
+            .get("group-1");
+        assertEquals(original.getStats().get("group-1"), current);
+
+        // A peer that predates throttling (and so queueing) writes none of the queue counters: they read as 0 and the
+        // resourceStats map still decodes.
+        WorkloadGroupStats.WorkloadGroupStatsHolder legacy = copyInstance(
+            original,
+            VersionUtils.getPreviousVersion(WorkloadGroupThrottleSettings.MIN_SUPPORTED_VERSION)
+        ).getStats().get("group-1");
+        assertEquals(0, legacy.getQueued());
+        assertEquals(0, legacy.getQueueRejections());
+        assertEquals(0, legacy.getQueuedCurrent());
+        assertEquals(0, legacy.getQueuedPeak());
+        assertEquals(0, legacy.getTotalQueueWaitMillis());
+        assertEquals(100, legacy.getCompletions());
+        assertEquals(11, legacy.getResourceStats().get(ResourceType.CPU).getCancellations());
+    }
+
     @Override
     protected Writeable.Reader<WorkloadGroupStats> instanceReader() {
         return WorkloadGroupStats::new;
@@ -103,32 +164,72 @@ public class WorkloadGroupStatsTests extends AbstractWireSerializingTestCase<Wor
 
     @Override
     protected WorkloadGroupStats createTestInstance() {
-        Map<String, WorkloadGroupStats.WorkloadGroupStatsHolder> stats = new HashMap<>();
-        stats.put(
-            randomAlphaOfLength(10),
-            new WorkloadGroupStats.WorkloadGroupStatsHolder(
-                randomNonNegativeLong(),
-                randomNonNegativeLong(),
-                randomNonNegativeLong(),
-                randomNonNegativeLong(),
-                randomNonNegativeLong(),
-                randomNonNegativeLong(),
-                Map.of(
-                    ResourceType.CPU,
-                    new WorkloadGroupStats.ResourceStats(
-                        randomDoubleBetween(0.0, 0.90, false),
-                        randomNonNegativeLong(),
-                        randomNonNegativeLong()
-                    )
+        return new WorkloadGroupStats(Map.of(randomAlphaOfLength(10), randomStatsHolder()));
+    }
+
+    // A random value for EVERY field, so the wire round-trip (testSerialization) and equals/hashCode
+    // (testEqualsAndHashcode) exercise the queue fields too; a write/read order swap among them would otherwise be invisible.
+    private static WorkloadGroupStats.WorkloadGroupStatsHolder randomStatsHolder() {
+        return new WorkloadGroupStats.WorkloadGroupStatsHolder(
+            randomNonNegativeLong(), // completions
+            randomNonNegativeLong(), // rejections
+            randomNonNegativeLong(), // failures
+            randomNonNegativeLong(), // cancellations
+            randomNonNegativeLong(), // throttled
+            randomNonNegativeLong(), // wouldThrottle
+            randomNonNegativeLong(), // queued
+            randomNonNegativeLong(), // queueRejections
+            randomNonNegativeLong(), // queuedCurrent
+            randomNonNegativeLong(), // queuedPeak
+            randomNonNegativeLong(), // totalQueueWaitMillis
+            Map.of(
+                ResourceType.CPU,
+                new WorkloadGroupStats.ResourceStats(
+                    randomDoubleBetween(0.0, 0.90, false),
+                    randomNonNegativeLong(),
+                    randomNonNegativeLong()
                 )
             )
         );
-        DiscoveryNode discoveryNode = new DiscoveryNode(
-            "node",
-            OpenSearchTestCase.buildNewFakeTransportAddress(),
-            emptyMap(),
-            DiscoveryNodeRole.BUILT_IN_ROLES,
-            VersionUtils.randomCompatibleVersion(random(), Version.CURRENT)
+    }
+
+    // Changes exactly one randomly chosen holder field, copying all others (failures included), so the mutation check
+    // proves every field participates in equals/hashCode.
+    @Override
+    protected WorkloadGroupStats mutateInstance(WorkloadGroupStats instance) {
+        Map<String, WorkloadGroupStats.WorkloadGroupStatsHolder> stats = new HashMap<>(instance.getStats());
+        String key = stats.keySet().iterator().next();
+        WorkloadGroupStats.WorkloadGroupStatsHolder h = stats.get(key);
+        long[] fields = new long[] {
+            h.getCompletions(),
+            h.getRejections(),
+            h.getFailures(),
+            h.getCancellations(),
+            h.getThrottled(),
+            h.getWouldThrottle(),
+            h.getQueued(),
+            h.getQueueRejections(),
+            h.getQueuedCurrent(),
+            h.getQueuedPeak(),
+            h.getTotalQueueWaitMillis() };
+        int mutated = randomIntBetween(0, fields.length - 1);
+        fields[mutated] = fields[mutated] == Long.MAX_VALUE ? 0 : fields[mutated] + 1;
+        stats.put(
+            key,
+            new WorkloadGroupStats.WorkloadGroupStatsHolder(
+                fields[0],
+                fields[1],
+                fields[2],
+                fields[3],
+                fields[4],
+                fields[5],
+                fields[6],
+                fields[7],
+                fields[8],
+                fields[9],
+                fields[10],
+                h.getResourceStats()
+            )
         );
         return new WorkloadGroupStats(stats);
     }

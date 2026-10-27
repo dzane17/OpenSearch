@@ -11,6 +11,7 @@ package org.opensearch.wlm;
 import org.opensearch.common.lease.Releasable;
 
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
@@ -33,7 +34,7 @@ import java.util.function.LongSupplier;
  *   <li><b>Departed coordinators:</b> each permit records its coordinator's ephemeral id, and {@link #releaseAllFrom}
  *       drops a departed coordinator's permits instead of leaving them until the TTL.</li>
  *   <li><b>TTL:</b> expired permits remain counted while their coordinator tasks are checked. Active tasks renew their
- *       permits; completed tasks free their slots.</li>
+ *       permits; completed tasks, and tasks still waiting in their coordinator's queue, free their slots.</li>
  * </ul>
  * A bucket entry exists only while it holds a permit, so memory scales with concurrently active buckets.
  * <p>
@@ -45,8 +46,8 @@ final class SharedThrottleTracker {
 
     /**
      * Per-bucket state, only accessed under the outer map's per-key lock. {@code minExpiry} is a lower bound on the
-     * earliest expiry: tightened on insert and check completion, recomputed on scan, and left stale on release, which can only cost one
-     * extra scan, never skip a scan that would free a slot.
+     * earliest expiry: tightened on insert, check completion and re-key, recomputed on scan, and left stale on release,
+     * which can only cost one extra scan, never skip a scan that would free a slot.
      */
     private static final class Bucket {
         final Map<String, Permit> permits = new ConcurrentHashMap<>();
@@ -145,41 +146,56 @@ final class SharedThrottleTracker {
         return result.granted;
     }
 
-    /** Releases a permit by id; a no-op for an unknown or already-released id. */
-    void release(String bucketKey, String permitId) {
+    /**
+     * Releases a permit by id; a no-op for an unknown or already-released id.
+     *
+     * @return {@code true} if a recorded permit was removed, i.e. a slot just freed. Only the owner can know this, so
+     *         owner-push is driven on {@code true} only and a no-op release never produces a phantom grant.
+     */
+    boolean release(String bucketKey, String permitId) {
+        final boolean[] removed = new boolean[1];
         permitsByBucket.computeIfPresent(bucketKey, (k, bucket) -> {
-            bucket.permits.remove(permitId);
+            removed[0] = bucket.permits.remove(permitId) != null;
             // minExpiry intentionally left as is (see Bucket).
             return bucket.permits.isEmpty() ? null : bucket;
         });
+        return removed[0];
     }
 
     /**
      * Releases every permit held by one of {@code coordinatorIds} (ephemeral node ids of coordinators that left the
      * cluster), across all buckets. An O(total permits) scan, so only call it on node removal.
      *
-     * @return the number of permits released
+     * @return each bucket that lost permits mapped to the number released (empty if none)
      */
-    int releaseAllFrom(Set<String> coordinatorIds) {
+    Map<String, Integer> releaseAllFrom(Set<String> coordinatorIds) {
+        final Map<String, Integer> releasedByBucket = new HashMap<>();
         if (coordinatorIds.isEmpty()) {
-            return 0;
+            return releasedByBucket;
         }
-        final int[] released = new int[1];
         for (String bucketKey : permitsByBucket.keySet()) {
             permitsByBucket.computeIfPresent(bucketKey, (k, bucket) -> {
+                int released = 0;
                 for (Iterator<Permit> it = bucket.permits.values().iterator(); it.hasNext();) {
                     if (coordinatorIds.contains(it.next().coordinatorId())) {
                         it.remove();
-                        released[0]++;
+                        released++;
                     }
+                }
+                if (released > 0) {
+                    releasedByBucket.put(bucketKey, released);
                 }
                 return bucket.permits.isEmpty() ? null : bucket;
             });
         }
-        return released[0];
+        return releasedByBucket;
     }
 
-    /** Collects due task checks across all buckets. */
+    /**
+     * Collects due task checks across all buckets; safe to run concurrently with acquire and release. An expired permit
+     * stays counted while its check is pending, so a sweep never frees a slot by itself: a check that reports the task
+     * inactive (finished, or waiting in its coordinator's queue) frees it in {@link #completeCheck}.
+     */
     void sweepExpired() {
         final long now = nanoTimeSupplier.getAsLong();
         final List<ExpiredPermit> expired = new ArrayList<>();
@@ -196,23 +212,57 @@ final class SharedThrottleTracker {
         }
     }
 
-    /** Applies a task check only while its exact pending permit record remains present. */
-    void completeCheck(ExpiredPermit expired, boolean active) {
+    /**
+     * Applies a task check only while its exact pending permit record remains present.
+     *
+     * @return {@code true} if the check reported the task inactive and removed the permit, i.e. a slot just freed
+     */
+    boolean completeCheck(ExpiredPermit expired, boolean active) {
         if (active) {
             renew(expired, expired.expected.ttlNanos());
-            return;
+            return false;
         }
+        final boolean[] removed = new boolean[1];
         permitsByBucket.computeIfPresent(expired.bucketKey, (k, bucket) -> {
             if (bucket.permits.get(expired.permitId) == expired.expected) {
                 bucket.permits.remove(expired.permitId);
+                removed[0] = true;
             }
             return bucket.permits.isEmpty() ? null : bucket;
         });
+        return removed[0];
     }
 
     /** A failed check receives a short extension; the next active reply restores the original TTL. */
     void renewForRetry(ExpiredPermit expired, long retryTtlNanos) {
         renew(expired, retryTtlNanos);
+    }
+
+    /**
+     * Re-keys a permit from {@code placeholderTaskId} to {@code coordinatorTaskId}: an owner-push reservation learns which
+     * queued request its grant admitted only once the grant is consumed (from the GRANT's reply, or in place for a local
+     * waiter). Applies only while the permit is still recorded under the placeholder, so a release or purge that overtook
+     * the re-key is never undone. The re-keyed permit is a new record with a fresh TTL: a check already pending on the
+     * placeholder is fenced by the identity checks of {@link #completeCheck} and {@link #renewForRetry}, and the permit's
+     * next check asks about {@code coordinatorTaskId}.
+     *
+     * @return {@code true} if this call re-keyed the permit from {@code placeholderTaskId}; {@code false} if the permit is
+     *         no longer recorded (released, purged, or freed by a check) or no longer names the placeholder
+     */
+    boolean rekeyTask(String bucketKey, String permitId, long placeholderTaskId, long coordinatorTaskId) {
+        final long now = nanoTimeSupplier.getAsLong();
+        final boolean[] rekeyed = new boolean[1];
+        permitsByBucket.computeIfPresent(bucketKey, (k, bucket) -> {
+            final Permit current = bucket.permits.get(permitId);
+            if (current != null && current.coordinatorTaskId() == placeholderTaskId) {
+                final long expiresAt = now + current.ttlNanos();
+                bucket.permits.put(permitId, new Permit(expiresAt, current.ttlNanos(), current.coordinatorId(), coordinatorTaskId));
+                bucket.minExpiry = Math.min(bucket.minExpiry, expiresAt);
+                rekeyed[0] = true;
+            }
+            return bucket.permits.isEmpty() ? null : bucket;
+        });
+        return rekeyed[0];
     }
 
     private void renew(ExpiredPermit expired, long extensionNanos) {

@@ -46,6 +46,7 @@ import org.opensearch.search.lookup.LeafFieldsLookup;
 import org.opensearch.test.OpenSearchIntegTestCase;
 import org.opensearch.wlm.MutableWorkloadGroupFragment;
 import org.opensearch.wlm.ResourceType;
+import org.opensearch.wlm.WorkloadGroupQueueSettings;
 import org.opensearch.wlm.WorkloadGroupSharedThrottleService;
 import org.opensearch.wlm.WorkloadGroupThrottleSettings;
 import org.opensearch.wlm.WorkloadManagementSettings;
@@ -253,6 +254,73 @@ public class WlmClusterThrottlingIT extends OpenSearchIntegTestCase {
         }
     }
 
+    /**
+     * Shared-tier QUEUEING via owner-push, on a shared-ONLY group (no {@code node_limit}). A request denied at the shared
+     * limit is PARKED on its coordinator, and the bucket owner pushes it a grant when a slot frees — with no node-tier
+     * drain to fall back on, so the cross-node owner-push path is the only way the parked request can complete.
+     * <p>
+     * The request is retained in the coordinator's queue BEFORE the shared acquire is sent, so a grant can never arrive
+     * to find an empty queue and deregister the waiter, which would otherwise strand the request.
+     */
+    public void testSharedTierQueuesAndDrainsViaOwnerPush() throws Exception {
+        String indexName = "shared_queue_index";
+        setWlmMode("enabled");
+
+        // shared_limit=1, node_limit unset, queue.size_per_bucket=5: one request runs cluster-wide; the rest PARK and drain
+        // via owner-push.
+        SharedGroup group = setUpSharedOnlyGroup("shared_queue_test_group", "wlm_shared_queue_group", indexName, indexName, 1, 5);
+        List<String> coordinators = List.of(internalCluster().getNodeNames());
+
+        List<ClusterScriptedBlockPlugin> plugins = initBlockFactory();
+        ActionFuture<SearchResponse> first;
+        ActionFuture<SearchResponse> second;
+        long totalQueuedBefore;
+        try {
+            // First search fills the single cluster-wide shared slot and blocks in-flight.
+            first = holdSharedPermit(coordinators.get(0), indexName, plugins);
+            assertEquals(1, sharedInFlight(group.bucketKey));
+
+            long throttledBefore = getThrottled(group.id);
+            totalQueuedBefore = getTotalQueued(group.id);
+
+            // Second search on a DIFFERENT coordinator: the shared limit is reached, so instead of a 429 it must be PARKED
+            // and registered for owner-push. It is NOT throttled.
+            ActionFuture<SearchResponse> secondSearch = blockingSearchVia(coordinators.get(1), indexName).execute();
+            second = secondSearch;
+            assertBusy(
+                () -> assertTrue("second search should be parked in the queue", getQueuedCurrent(group.id) == 1 || secondSearch.isDone()),
+                30,
+                TimeUnit.SECONDS
+            );
+            assertFalse("a request denied at the shared limit must park, not complete", secondSearch.isDone());
+            assertEquals("a parked request must not be counted as throttled", throttledBefore, getThrottled(group.id));
+            // total_queued counts a request when it enters WAITING, so the still-parked request is counted already. Polled:
+            // the count is taken just after the depth moves, under the same bucket lock.
+            final long queuedOnPark = totalQueuedBefore + 1;
+            assertBusy(() -> assertEquals("a parked request is counted when it starts waiting", queuedOnPark, getTotalQueued(group.id)));
+        } finally {
+            // Release the blocks. The first completes and frees the single shared slot; the owner pushes a grant to the
+            // coordinator holding the parked second search, which then completes. With no node tier, this can ONLY happen
+            // via cross-node (or local-owner) owner-push.
+            disableBlocks(plugins);
+        }
+        assertNotNull("the first (blocking) search must complete", first.actionGet(TIMEOUT));
+        assertNotNull("the parked second search must be admitted via owner-push and complete", second.actionGet(TIMEOUT));
+
+        assertBusy(() -> assertEquals("queue must drain to empty", 0, getQueuedCurrent(group.id)), 30, TimeUnit.SECONDS);
+        final long queuedBefore = totalQueuedBefore;
+        assertBusy(
+            () -> assertEquals(
+                "the owner-push admission does not count the parked request again",
+                queuedBefore + 1,
+                getTotalQueued(group.id)
+            ),
+            30,
+            TimeUnit.SECONDS
+        );
+        awaitDrained(group);
+    }
+
     // Helpers
 
     /**
@@ -262,8 +330,20 @@ public class WlmClusterThrottlingIT extends OpenSearchIntegTestCase {
      */
     private SharedGroup setUpSharedOnlyGroup(String name, String groupId, String rulePattern, String indexName, int sharedLimit)
         throws Exception {
+        return setUpSharedOnlyGroup(name, groupId, rulePattern, indexName, sharedLimit, 0);
+    }
+
+    // As above, with queue.size_per_bucket (0 = no queue).
+    private SharedGroup setUpSharedOnlyGroup(
+        String name,
+        String groupId,
+        String rulePattern,
+        String indexName,
+        int sharedLimit,
+        int queueSizePerBucket
+    ) throws Exception {
         SharedGroup group = new SharedGroup(groupId, sharedLimit);
-        updateWorkloadGroupInClusterState(createSharedThrottledGroup(name, groupId, group.limit));
+        updateWorkloadGroupInClusterState(createSharedThrottledGroup(name, groupId, group.limit, queueSizePerBucket));
         assertBusy(() -> {
             boolean present = client().admin().cluster().prepareState().get().getState().metadata().workloadGroups().containsKey(groupId);
             assertTrue("workload group not yet applied in cluster state", present);
@@ -332,6 +412,14 @@ public class WlmClusterThrottlingIT extends OpenSearchIntegTestCase {
 
     private long getThrottled(String groupId) throws Exception {
         return sumAcrossNodes(groupId, WorkloadGroupStatsHolder::getThrottled);
+    }
+
+    private long getQueuedCurrent(String groupId) throws Exception {
+        return sumAcrossNodes(groupId, WorkloadGroupStatsHolder::getQueuedCurrent);
+    }
+
+    private long getTotalQueued(String groupId) throws Exception {
+        return sumAcrossNodes(groupId, WorkloadGroupStatsHolder::getQueued);
     }
 
     private long sumAcrossNodes(String groupId, ToLongFunction<WorkloadGroupStatsHolder> extractor) throws Exception {
@@ -430,8 +518,12 @@ public class WlmClusterThrottlingIT extends OpenSearchIntegTestCase {
         assertAcked(client().admin().cluster().updateSettings(request).get());
     }
 
-    private WorkloadGroup createSharedThrottledGroup(String name, String id, int sharedLimit) {
+    // Shared-only throttling (no node_limit); with queueSizePerBucket > 0 a denied request parks and drains via owner-push.
+    private WorkloadGroup createSharedThrottledGroup(String name, String id, int sharedLimit, int queueSizePerBucket) {
         Settings throttling = Settings.builder().put(WorkloadGroupThrottleSettings.SHARED_LIMIT.getKey(), sharedLimit).build();
+        Settings queue = queueSizePerBucket > 0
+            ? Settings.builder().put(WorkloadGroupQueueSettings.SIZE_PER_BUCKET.getKey(), queueSizePerBucket).build()
+            : Settings.EMPTY;
         return new WorkloadGroup(
             name,
             id,
@@ -439,7 +531,8 @@ public class WlmClusterThrottlingIT extends OpenSearchIntegTestCase {
                 MutableWorkloadGroupFragment.ResiliencyMode.SOFT,
                 Map.of(ResourceType.CPU, 0.9, ResourceType.MEMORY, 0.9),
                 Settings.EMPTY,
-                throttling
+                throttling,
+                queue
             ),
             Instant.now().getMillis()
         );

@@ -12,6 +12,9 @@ import org.opensearch.common.settings.ClusterSettings;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.test.OpenSearchTestCase;
 
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
+
 import static org.opensearch.wlm.WorkloadManagementSettings.NODE_CPU_CANCELLATION_THRESHOLD_SETTING_NAME;
 import static org.opensearch.wlm.WorkloadManagementSettings.NODE_CPU_REJECTION_THRESHOLD_SETTING_NAME;
 import static org.opensearch.wlm.WorkloadManagementSettings.NODE_MEMORY_CANCELLATION_THRESHOLD_SETTING_NAME;
@@ -19,6 +22,33 @@ import static org.opensearch.wlm.WorkloadManagementSettings.NODE_MEMORY_REJECTIO
 import static org.hamcrest.Matchers.containsString;
 
 public class WorkloadManagementSettingsTests extends OpenSearchTestCase {
+
+    public void testWlmModeChangeListenerReceivesAppliedTransitionAfterModeUpdate() {
+        Settings initial = Settings.builder().put(WorkloadManagementSettings.WLM_MODE_SETTING_NAME, WlmMode.ENABLED.getName()).build();
+        ClusterSettings cs = new ClusterSettings(initial, ClusterSettings.BUILT_IN_CLUSTER_SETTINGS);
+        WorkloadManagementSettings wlm = new WorkloadManagementSettings(initial, cs);
+        AtomicInteger calls = new AtomicInteger();
+        AtomicReference<WlmMode> previous = new AtomicReference<>();
+        AtomicReference<WlmMode> current = new AtomicReference<>();
+        AtomicReference<WlmMode> observedSetting = new AtomicReference<>();
+        wlm.addWlmModeChangeListener((previousMode, currentMode) -> {
+            calls.incrementAndGet();
+            previous.set(previousMode);
+            current.set(currentMode);
+            observedSetting.set(wlm.getWlmMode());
+        });
+
+        Settings disabled = Settings.builder().put(WorkloadManagementSettings.WLM_MODE_SETTING_NAME, WlmMode.DISABLED.getName()).build();
+        cs.applySettings(disabled);
+
+        assertEquals(1, calls.get());
+        assertEquals(WlmMode.ENABLED, previous.get());
+        assertEquals(WlmMode.DISABLED, current.get());
+        assertEquals("listeners must observe the newly applied mode", WlmMode.DISABLED, observedSetting.get());
+
+        cs.applySettings(disabled);
+        assertEquals("reapplying the same mode is not a transition", 1, calls.get());
+    }
 
     /**
      * Tests the invalid value for {@code wlm.workload_group.node.memory_rejection_threshold}

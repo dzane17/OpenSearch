@@ -28,9 +28,10 @@ import java.util.Set;
 public class WorkloadGroupThrottleSettings {
 
     /**
-     * First version with WLM throttling. Gates every throttling wire format (throttling config in workload group metadata
-     * and in create/update requests, throttle stats) and which nodes can own shared-limit buckets. They all use this one
-     * value, since a reader and a writer that disagree on a gate desync the stream.
+     * First version with WLM throttling and its request queueing. Gates every throttling wire format (throttling and queue
+     * config in workload group metadata and in create/update requests, throttle and queue stats) and which nodes can own
+     * shared-limit buckets. They all use this one value, since a reader and a writer that disagree on a gate desync the
+     * stream.
      */
     public static final Version MIN_SUPPORTED_VERSION = Version.V_3_10_0;
 

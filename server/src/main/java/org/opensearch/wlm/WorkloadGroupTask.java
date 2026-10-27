@@ -17,6 +17,8 @@ import org.opensearch.common.util.concurrent.ThreadContext;
 import org.opensearch.core.tasks.TaskId;
 import org.opensearch.tasks.CancellableTask;
 
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Map;
 import java.util.function.LongSupplier;
 import java.util.function.Supplier;
@@ -44,6 +46,15 @@ public class WorkloadGroupTask extends CancellableTask {
     private boolean isWorkloadGroupSet = false;
     private volatile String throttlePrincipal;
     private volatile boolean throttleCounted;
+
+    // Cancellation callbacks for a request parked in the WLM request queue. A queued request holds no thread; when the
+    // task is cancelled (a search's on client disconnect or by its cancel_after timer, a scroll page's only through the
+    // tasks API; each cancels the task rather than completing the parked listener), the queue must evict the entry and
+    // fail the listener. Guarded by this task's monitor and allocated on first registration, so a task that never queues
+    // (every shard task, and every search when WLM or queueing is off) carries no extra objects. Fired at most once: once
+    // cancelled, a later register runs immediately so there is no lost-cancellation race.
+    private List<Runnable> onCancelledCallbacks; // guarded by this; null until first registration and again once cancelled
+    private boolean cancellationNotified;        // guarded by this
 
     public WorkloadGroupTask(long id, String type, String action, String description, TaskId parentTaskId, Map<String, String> headers) {
         this(id, type, action, description, parentTaskId, headers, NO_TIMEOUT, System::nanoTime);
@@ -152,5 +163,77 @@ public class WorkloadGroupTask extends CancellableTask {
     @Override
     public boolean shouldCancelChildrenOnCancellation() {
         return false;
+    }
+
+    /**
+     * Registers a callback invoked once if this task is cancelled, and returns a {@link Releasable} that deregisters it.
+     * If the task is already cancelled the callback runs immediately (so there is no window where a cancellation between
+     * the cancel check and registration is lost). Used by the WLM request queue to evict and fail a parked request whose
+     * task is cancelled: a search's when its client disconnects or its {@code cancel_after} timer fires, a scroll page's
+     * only through the tasks API. Each cancels the task rather than completing the parked listener, so the queue observes
+     * cancellation here. Package-private: only the queue needs it.
+     *
+     * @param callback run at most once on cancellation
+     * @return a {@link Releasable} that removes the callback if the request is admitted/drained before any cancellation
+     */
+    final Releasable addOnCancelledCallback(Runnable callback) {
+        synchronized (this) {
+            if (cancellationNotified == false && isCancelled() == false) {
+                if (onCancelledCallbacks == null) {
+                    onCancelledCallbacks = new ArrayList<>(1);
+                }
+                onCancelledCallbacks.add(callback);
+                return () -> {
+                    synchronized (this) {
+                        if (onCancelledCallbacks != null) {
+                            onCancelledCallbacks.remove(callback);
+                        }
+                    }
+                };
+            }
+        }
+        // Already cancelled: run now, outside the monitor, rather than register, so a cancellation that landed before
+        // registration is never dropped. Nothing to deregister.
+        callback.run();
+        return () -> {};
+    }
+
+    /**
+     * Cancels this task, then runs the callbacks registered through {@link #addOnCancelledCallback}. They run here rather
+     * than from {@link #onCancelled()}, so a subclass that overrides that hook without calling {@code super} (the
+     * asynchronous search plugin's task does), or whose hook throws, cannot leave a cancelled request parked in the queue.
+     * Each callback runs at most once, however many times the task is cancelled.
+     */
+    @Override
+    public void cancel(String reason) {
+        try {
+            super.cancel(reason);
+        } finally {
+            if (isCancelled()) {
+                runOnCancelledCallbacks();
+            }
+        }
+    }
+
+    private void runOnCancelledCallbacks() {
+        final List<Runnable> callbacks;
+        synchronized (this) {
+            if (cancellationNotified) {
+                return;
+            }
+            cancellationNotified = true;
+            callbacks = onCancelledCallbacks;
+            onCancelledCallbacks = null;
+        }
+        if (callbacks == null) {
+            return; // never registered: the common case
+        }
+        for (Runnable callback : callbacks) {
+            try {
+                callback.run();
+            } catch (Exception e) {
+                logger.warn("WorkloadGroupTask cancellation callback failed", e);
+            }
+        }
     }
 }

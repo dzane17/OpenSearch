@@ -260,6 +260,7 @@ public class WorkloadGroupSearchCancelAfterTimeIntervalResolverTests extends Ope
                 Map.of(ResourceType.MEMORY, 0.5),
                 searchSettings,
                 Settings.EMPTY,
+                Settings.EMPTY,
                 false
             ),
             System.currentTimeMillis()

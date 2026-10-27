@@ -17,6 +17,8 @@ import org.opensearch.common.unit.TimeValue;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.function.BiConsumer;
 import java.util.function.Supplier;
 
 /**
@@ -76,6 +78,7 @@ public class WorkloadManagementSettings {
     public static final String WLM_MODE_SETTING_NAME = "wlm.workload_group.mode";
 
     private volatile WlmMode wlmMode;
+    private final List<BiConsumer<WlmMode, WlmMode>> wlmModeChangeListeners = new CopyOnWriteArrayList<>();
 
     /**
      * WLM mode setting, which determines which mode WLM is operating in
@@ -234,7 +237,19 @@ public class WorkloadManagementSettings {
      * @param mode new mode value
      */
     private void setWlmMode(final WlmMode mode) {
+        final WlmMode previousMode = this.wlmMode;
         this.wlmMode = mode;
+        if (previousMode != mode) {
+            wlmModeChangeListeners.forEach(listener -> listener.accept(previousMode, mode));
+        }
+    }
+
+    /**
+     * Registers an internal listener for applied WLM mode transitions. Package-private so this does not expand the
+     * public settings API.
+     */
+    void addWlmModeChangeListener(BiConsumer<WlmMode, WlmMode> listener) {
+        wlmModeChangeListeners.add(listener);
     }
 
     /**
