@@ -71,12 +71,14 @@ public class CreateWorkloadGroupRequest extends ClusterManagerNodeRequest<Create
 
     @Override
     public void writeTo(StreamOutput out) throws IOException {
+        // The fragment leaves both bags off the wire for an older node, so sending either would silently drop it.
         Settings throttling = workloadGroup.getMutableWorkloadGroupFragment().getThrottling();
+        Settings queue = workloadGroup.getMutableWorkloadGroupFragment().getQueue();
         if (out.getVersion().before(WorkloadGroupThrottleSettings.MIN_SUPPORTED_VERSION)
-            && throttling != null
-            && throttling.isEmpty() == false) {
+            && ((throttling != null && throttling.isEmpty() == false) || (queue != null && queue.isEmpty() == false))) {
             throw new IllegalArgumentException(
-                "cannot send workload group throttling to a node before version " + WorkloadGroupThrottleSettings.MIN_SUPPORTED_VERSION
+                "cannot send workload group throttling or queue config to a node before version "
+                    + WorkloadGroupThrottleSettings.MIN_SUPPORTED_VERSION
             );
         }
         super.writeTo(out);

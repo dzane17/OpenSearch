@@ -25,6 +25,10 @@ import java.util.function.BooleanSupplier;
  * Admits searches and scroll pages against workload group throttles, so the search actions depend only on the core
  * {@link SearchAdmission}. Creating a point in time is never throttled. Active only while
  * {@link WorkloadGroupService#isThrottlingActive()}.
+ * <p>
+ * It never parks a request that runs on an unregistered task: create-PIT, the one search known to do so, is admitted
+ * without being charged. Every request that can wait is on a registered task, which cancellation removes from the queue,
+ * so the wait needs no separate bound (see {@link SearchAdmission#admit}).
  *
  * @opensearch.internal
  */
@@ -58,6 +62,13 @@ public final class WorkloadGroupSearchAdmission implements SearchAdmission {
             listener,
             (l, permit) -> l.onResponse(permit == null ? NOOP_PERMIT : permit)
         );
+        // A scroll page or point-in-time search queues like any other search. Waiting does not renew its keep_alive, so one
+        // that waits longer than that finds its shard contexts gone and fails with a 404 (search context missing) when it
+        // runs. Accepted: with no free permit it could not have run before the contexts expired anyway.
+        // Accepted: a parked scroll page is not cancelled when its client disconnects (_search/scroll does not cancel on
+        // disconnect) and gets no cancel_after_time_interval timer, so a page whose client gave up still runs when a slot
+        // frees and moves the scroll past that page. Any page that outlasts the client's timeout already does this;
+        // queueing only lengthens the window.
         // A scroll page is never a nested search, so it never inherits a parent's charge.
         final BooleanSupplier parentAlreadyCounted = request instanceof SearchScrollRequest
             ? () -> false

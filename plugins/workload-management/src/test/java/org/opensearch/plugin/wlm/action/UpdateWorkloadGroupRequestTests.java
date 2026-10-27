@@ -16,6 +16,7 @@ import org.opensearch.test.VersionUtils;
 import org.opensearch.wlm.MutableWorkloadGroupFragment;
 import org.opensearch.wlm.MutableWorkloadGroupFragment.ResiliencyMode;
 import org.opensearch.wlm.ResourceType;
+import org.opensearch.wlm.WorkloadGroupQueueSettings;
 import org.opensearch.wlm.WorkloadGroupThrottleSettings;
 
 import java.io.IOException;
@@ -97,6 +98,37 @@ public class UpdateWorkloadGroupRequestTests extends OpenSearchTestCase {
         BytesStreamOutput legacyOutput = new BytesStreamOutput();
         legacyOutput.setVersion(VersionUtils.getPreviousVersion(WorkloadGroupThrottleSettings.MIN_SUPPORTED_VERSION));
         new UpdateWorkloadGroupRequest(NAME_ONE, new MutableWorkloadGroupFragment(null, Map.of())).writeTo(legacyOutput);
+    }
+
+    // A queue needs no throttle limit, and an older node would silently drop it, so it is gated like throttling.
+    public void testQueueOnlyUpdateRequiresSupportedWireVersion() throws IOException {
+        UpdateWorkloadGroupRequest request = new UpdateWorkloadGroupRequest(
+            NAME_ONE,
+            new MutableWorkloadGroupFragment(
+                null,
+                Map.of(),
+                Settings.EMPTY,
+                Settings.EMPTY,
+                Settings.builder().put("size_per_bucket", 50).build()
+            )
+        );
+        BytesStreamOutput oldOutput = new BytesStreamOutput();
+        oldOutput.setVersion(VersionUtils.getPreviousVersion(WorkloadGroupThrottleSettings.MIN_SUPPORTED_VERSION));
+
+        IllegalArgumentException error = expectThrows(IllegalArgumentException.class, () -> request.writeTo(oldOutput));
+        assertTrue(error.getMessage(), error.getMessage().contains("queue"));
+        assertTrue(error.getMessage(), error.getMessage().contains(WorkloadGroupThrottleSettings.MIN_SUPPORTED_VERSION.toString()));
+
+        BytesStreamOutput currentOutput = new BytesStreamOutput();
+        currentOutput.setVersion(WorkloadGroupThrottleSettings.MIN_SUPPORTED_VERSION);
+        request.writeTo(currentOutput);
+        StreamInput currentInput = currentOutput.bytes().streamInput();
+        currentInput.setVersion(WorkloadGroupThrottleSettings.MIN_SUPPORTED_VERSION);
+        UpdateWorkloadGroupRequest restored = new UpdateWorkloadGroupRequest(currentInput);
+        assertEquals(
+            Integer.valueOf(50),
+            WorkloadGroupQueueSettings.SIZE_PER_BUCKET.get(restored.getmMutableWorkloadGroupFragment().getQueue())
+        );
     }
 
     /**

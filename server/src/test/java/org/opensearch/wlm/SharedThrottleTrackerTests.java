@@ -13,6 +13,7 @@ import org.opensearch.wlm.SharedThrottleTracker.ExpiredPermit;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
@@ -25,6 +26,7 @@ public class SharedThrottleTrackerTests extends OpenSearchTestCase {
 
     private static final long TTL = TimeUnit.MINUTES.toNanos(5);
     private static final String COORD = "coordinator";
+    private static final long PLACEHOLDER = WorkloadGroupSharedThrottleService.RESERVATION_TASK_ID;
 
     public void testGrantsUpToLimitThenDenies() {
         SharedThrottleTracker tracker = new SharedThrottleTracker();
@@ -45,7 +47,7 @@ public class SharedThrottleTrackerTests extends OpenSearchTestCase {
 
     public void testReleaseAllFromRemovesOnlyMatchingCoordinators() {
         SharedThrottleTracker tracker = new SharedThrottleTracker();
-        assertEquals(0, tracker.releaseAllFrom(Set.of()));
+        assertEquals(Map.of(), tracker.releaseAllFrom(Set.of()));
         assertTrue(tryAcquire(tracker, "b", 3, "gone-1", TTL, "gone"));
         assertTrue(tryAcquire(tracker, "b", 3, "live-1", TTL, "live"));
         assertTrue(tryAcquire(tracker, "b", 3, "other-1", TTL, "other-live"));
@@ -53,7 +55,7 @@ public class SharedThrottleTrackerTests extends OpenSearchTestCase {
         assertTrue(tryAcquire(tracker, "d", 1, "other-gone", TTL, "also-gone"));
         assertFalse("precondition: b is full", tryAcquire(tracker, "b", 3, "x", TTL, "live"));
 
-        assertEquals(3, tracker.releaseAllFrom(Set.of("gone", "also-gone")));
+        assertEquals(Map.of("b", 1, "c", 1, "d", 1), tracker.releaseAllFrom(Set.of("gone", "also-gone")));
         assertEquals("b keeps the permits of coordinators still present", 2, tracker.inFlight("b"));
         assertEquals(0, tracker.inFlight("c"));
         assertEquals(0, tracker.inFlight("d"));
@@ -69,18 +71,18 @@ public class SharedThrottleTrackerTests extends OpenSearchTestCase {
         assertTrue(tryAcquire(tracker, "b", 5, "l1", 1_000, COORD));
         assertTrue(tryAcquire(tracker, "b", 5, "short", 100, COORD));
 
-        tracker.release("b", "does-not-exist");
-        tracker.release("unknown-bucket", "l1");
+        assertFalse("an unknown permit frees nothing", tracker.release("b", "does-not-exist"));
+        assertFalse("an unknown bucket frees nothing", tracker.release("unknown-bucket", "l1"));
         assertEquals(3, tracker.inFlight("b"));
 
-        tracker.release("b", "l1");
-        tracker.release("b", "l1"); // double release
+        assertTrue("the first release removes a recorded permit", tracker.release("b", "l1"));
+        assertFalse("a double release is a no-op", tracker.release("b", "l1"));
         assertEquals(2, tracker.inFlight("b"));
 
         clock.set(100);
         tracker.sweepExpired(); // "short" expires; its task check reports the search finished
-        checks.forEach(expired -> tracker.completeCheck(expired, false));
-        tracker.release("b", "short"); // late release of a reclaimed permit
+        checks.forEach(expired -> assertTrue("the check frees the finished search's slot", tracker.completeCheck(expired, false)));
+        assertFalse("a late release of a reclaimed permit frees nothing", tracker.release("b", "short"));
         assertEquals("a stale release must never decrement another request's permit", 1, tracker.inFlight("b"));
     }
 
@@ -320,7 +322,7 @@ public class SharedThrottleTrackerTests extends OpenSearchTestCase {
         clock.set(100);
         tracker.sweepExpired();
         assertEquals(1, tracker.inFlight("b"));
-        tracker.completeCheck(checks.get(0), false);
+        assertTrue("a finished task's check frees the slot", tracker.completeCheck(checks.get(0), false));
         assertEquals(0, tracker.activeBuckets());
         assertTrue(tryAcquire(tracker, "b", 1, "replacement", 100, COORD, 43));
     }
@@ -376,13 +378,90 @@ public class SharedThrottleTrackerTests extends OpenSearchTestCase {
         tracker.sweepExpired();
         tracker.release("b", "held");
         assertTrue(tryAcquire(tracker, "b", 1, "held", 100, COORD, 43));
-        tracker.completeCheck(checks.get(0), false);
-        tracker.completeCheck(checks.get(0), true);
+        assertFalse("a fenced late reply frees nothing", tracker.completeCheck(checks.get(0), false));
+        assertFalse(tracker.completeCheck(checks.get(0), true));
         assertEquals(1, tracker.inFlight("b"));
         clock.set(200);
         tracker.sweepExpired();
         assertEquals(2, checks.size());
         assertEquals(43, checks.get(1).coordinatorTaskId());
+    }
+
+    public void testRekeyNamesTheAdmittedTaskAndRestartsTheTtl() {
+        AtomicLong clock = new AtomicLong();
+        List<ExpiredPermit> checks = new ArrayList<>();
+        SharedThrottleTracker tracker = new SharedThrottleTracker(clock::get, checks::addAll);
+        assertTrue(tryAcquire(tracker, "b", 1, "reserved", 100, COORD, PLACEHOLDER));
+        clock.set(40);
+        assertTrue(tracker.rekeyTask("b", "reserved", PLACEHOLDER, 42));
+        assertFalse("only the placeholder is re-keyed, and only once", tracker.rekeyTask("b", "reserved", PLACEHOLDER, 43));
+        assertEquals(1, tracker.inFlight("b"));
+        clock.set(139);
+        tracker.sweepExpired();
+        assertTrue("the TTL restarts at the re-key", checks.isEmpty());
+        clock.set(140);
+        tracker.sweepExpired();
+        assertEquals(1, checks.size());
+        assertEquals("the check asks about the admitted task", 42, checks.get(0).coordinatorTaskId());
+        assertEquals(COORD, checks.get(0).coordinatorId());
+        assertFalse("an active task renews it", tracker.completeCheck(checks.get(0), true));
+        assertEquals(1, tracker.inFlight("b"));
+    }
+
+    public void testRekeyNeverResurrectsAReleasedOrPurgedPermit() {
+        SharedThrottleTracker tracker = new SharedThrottleTracker();
+        assertTrue(tryAcquire(tracker, "b", 2, "released", TTL, COORD, PLACEHOLDER));
+        assertTrue(tryAcquire(tracker, "b", 2, "kept", TTL, COORD));
+        assertTrue(tracker.release("b", "released"));
+        assertFalse("a release that overtook the re-key wins", tracker.rekeyTask("b", "released", PLACEHOLDER, 42));
+        assertEquals(1, tracker.inFlight("b"));
+
+        assertTrue(tryAcquire(tracker, "c", 1, "purged", TTL, "gone", PLACEHOLDER));
+        assertEquals(Map.of("c", 1), tracker.releaseAllFrom(Set.of("gone")));
+        assertFalse(tracker.rekeyTask("c", "purged", PLACEHOLDER, 42));
+        assertEquals("no bucket is re-created", 0, tracker.inFlight("c"));
+        assertEquals(1, tracker.activeBuckets());
+    }
+
+    public void testRekeyLeavesAPermitThatNamesARealTask() {
+        AtomicLong clock = new AtomicLong();
+        List<ExpiredPermit> checks = new ArrayList<>();
+        SharedThrottleTracker tracker = new SharedThrottleTracker(clock::get, checks::addAll);
+        assertTrue(tryAcquire(tracker, "b", 1, "direct", 100, COORD, 7));
+        assertFalse(tracker.rekeyTask("b", "direct", PLACEHOLDER, 42));
+        clock.set(100);
+        tracker.sweepExpired();
+        assertEquals(7, checks.get(0).coordinatorTaskId());
+    }
+
+    public void testRekeyFencesACheckPendingOnThePlaceholder() {
+        // The reply can arrive while the placeholder's own expiry check is in flight. That stale check asked about a task
+        // that cannot exist, so its "finished" answer must not free the re-keyed permit, and the re-keyed permit must still
+        // be checked later (it may not stay pending forever).
+        AtomicLong clock = new AtomicLong();
+        List<ExpiredPermit> checks = new ArrayList<>();
+        SharedThrottleTracker tracker = new SharedThrottleTracker(clock::get, checks::addAll);
+        assertTrue(tryAcquire(tracker, "b", 1, "reserved", 100, COORD, PLACEHOLDER));
+        clock.set(100);
+        tracker.sweepExpired();
+        assertEquals(1, tracker.pendingChecks());
+        ExpiredPermit stale = checks.get(0);
+
+        assertTrue(tracker.rekeyTask("b", "reserved", PLACEHOLDER, 42));
+        assertEquals("the re-keyed permit is no longer pending", 0, tracker.pendingChecks());
+        assertFalse("the stale check is fenced", tracker.completeCheck(stale, false));
+        tracker.renewForRetry(stale, 10);
+        assertEquals(1, tracker.inFlight("b"));
+
+        clock.set(199);
+        tracker.sweepExpired();
+        assertEquals(1, checks.size());
+        clock.set(200);
+        tracker.sweepExpired();
+        assertEquals("the re-keyed permit is checked one TTL after the re-key", 2, checks.size());
+        assertEquals(42, checks.get(1).coordinatorTaskId());
+        assertTrue("its own check can free it once the search is gone", tracker.completeCheck(checks.get(1), false));
+        assertEquals(0, tracker.activeBuckets());
     }
 
     public void testCoordinatorPurgeFencesPendingChecks() {
@@ -392,8 +471,33 @@ public class SharedThrottleTrackerTests extends OpenSearchTestCase {
         assertTrue(tryAcquire(tracker, "b", 1, "held", 100, COORD, 42));
         clock.set(100);
         tracker.sweepExpired();
-        assertEquals(1, tracker.releaseAllFrom(Set.of(COORD)));
+        assertEquals(Map.of("b", 1), tracker.releaseAllFrom(Set.of(COORD)));
         tracker.completeCheck(checks.get(0), true);
         assertEquals(0, tracker.activeBuckets());
+    }
+
+    public void testSweepNeverFreesASlotItselfOnlyAFinishedCheckDoes() {
+        // The owning service drives owner-push from completeCheck's return value (an expiry has no release RPC to re-drive
+        // the bucket), so it must report exactly the slots that freed: a miss strands a waiting coordinator, and a false
+        // positive would make the owner reserve-and-grant a slot that does not exist. A sweep only starts checks: every
+        // expired permit stays counted until its check reports the task inactive (its search finished, or waiting in its
+        // coordinator's queue).
+        AtomicLong clock = new AtomicLong();
+        List<ExpiredPermit> checks = new ArrayList<>();
+        SharedThrottleTracker tracker = new SharedThrottleTracker(clock::get, checks::addAll);
+        assertTrue(tryAcquire(tracker, "b", 3, "finished", 100, COORD, 41));
+        assertTrue(tryAcquire(tracker, "b", 3, "running", 100, COORD, 42));
+        assertTrue(tryAcquire(tracker, "b", 3, "fresh", 1_000, COORD, 43));
+        clock.set(100);
+        tracker.sweepExpired();
+        assertEquals(2, checks.size());
+        assertEquals("the sweep frees nothing by itself", 3, tracker.inFlight("b"));
+
+        ExpiredPermit finished = checks.stream().filter(check -> check.permitId.equals("finished")).findFirst().orElseThrow();
+        ExpiredPermit running = checks.stream().filter(check -> check.permitId.equals("running")).findFirst().orElseThrow();
+        assertTrue("a finished search's check frees its slot", tracker.completeCheck(finished, false));
+        assertFalse("a running search's check renews rather than frees", tracker.completeCheck(running, true));
+        assertFalse("a repeated reply frees nothing", tracker.completeCheck(finished, false));
+        assertEquals(2, tracker.inFlight("b"));
     }
 }

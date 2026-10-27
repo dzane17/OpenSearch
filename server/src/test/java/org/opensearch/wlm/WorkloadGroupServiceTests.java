@@ -9,8 +9,12 @@
 package org.opensearch.wlm;
 
 import org.opensearch.Version;
+import org.opensearch.action.ActionRequest;
+import org.opensearch.action.search.SearchAction;
 import org.opensearch.action.search.SearchExecutionGate;
 import org.opensearch.action.search.SearchRequest;
+import org.opensearch.action.search.SearchScrollAction;
+import org.opensearch.action.search.SearchScrollRequest;
 import org.opensearch.action.search.SearchTask;
 import org.opensearch.cluster.ClusterChangedEvent;
 import org.opensearch.cluster.ClusterState;
@@ -24,12 +28,16 @@ import org.opensearch.common.io.stream.BytesStreamOutput;
 import org.opensearch.common.lease.Releasable;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.common.unit.TimeValue;
+import org.opensearch.common.util.concurrent.OpenSearchExecutors;
 import org.opensearch.common.util.concurrent.ThreadContext;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.common.io.stream.StreamInput;
 import org.opensearch.core.concurrency.OpenSearchRejectedExecutionException;
+import org.opensearch.core.tasks.TaskCancelledException;
 import org.opensearch.core.tasks.TaskId;
 import org.opensearch.search.backpressure.trackers.NodeDuressTrackers;
+import org.opensearch.search.builder.PointInTimeBuilder;
+import org.opensearch.search.builder.SearchSourceBuilder;
 import org.opensearch.tasks.Task;
 import org.opensearch.tasks.TaskManager;
 import org.opensearch.test.OpenSearchTestCase;
@@ -43,15 +51,22 @@ import org.opensearch.wlm.stats.WorkloadGroupState;
 import org.opensearch.wlm.tracker.WorkloadGroupResourceUsageTrackerService;
 
 import java.io.IOException;
+import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.ExecutorService;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.BiConsumer;
 import java.util.function.BooleanSupplier;
+import java.util.function.Function;
 
 import org.mockito.ArgumentCaptor;
 import org.mockito.Mockito;
@@ -74,6 +89,7 @@ public class WorkloadGroupServiceTests extends OpenSearchTestCase {
     private WorkloadManagementSettings mockWorkloadManagementSettings;
     private Scheduler.Cancellable mockScheduledFuture;
     private Map<String, WorkloadGroupState> mockWorkloadGroupStateMap;
+    private BiConsumer<WlmMode, WlmMode> wlmModeChangeListener;
     NodeDuressTrackers mockNodeDuressTrackers;
     WorkloadGroupsStateAccessor mockWorkloadGroupsStateAccessor;
 
@@ -81,6 +97,8 @@ public class WorkloadGroupServiceTests extends OpenSearchTestCase {
         super.setUp();
         mockClusterService = Mockito.mock(ClusterService.class);
         mockThreadPool = Mockito.mock(ThreadPool.class);
+        // The queue wraps retained listeners to restore the caller's thread context, so the mock needs a real one.
+        when(mockThreadPool.getThreadContext()).thenReturn(new ThreadContext(Settings.EMPTY));
         mockScheduledFuture = Mockito.mock(Scheduler.Cancellable.class);
         mockWorkloadManagementSettings = Mockito.mock(WorkloadManagementSettings.class);
         mockWorkloadGroupStateMap = new HashMap<>();
@@ -88,6 +106,10 @@ public class WorkloadGroupServiceTests extends OpenSearchTestCase {
         mockCancellationService = Mockito.mock(TestWorkloadGroupCancellationService.class);
         mockWorkloadGroupsStateAccessor = new WorkloadGroupsStateAccessor();
         when(mockNodeDuressTrackers.isNodeInDuress()).thenReturn(false);
+        Mockito.doAnswer(invocation -> {
+            wlmModeChangeListener = invocation.getArgument(0);
+            return null;
+        }).when(mockWorkloadManagementSettings).addWlmModeChangeListener(any());
 
         workloadGroupService = new WorkloadGroupService(
             mockCancellationService,
@@ -222,6 +244,44 @@ public class WorkloadGroupServiceTests extends OpenSearchTestCase {
 
         Mockito.verify(mockCancellationService, never()).cancelTasks(any(), any(), any());
 
+    }
+
+    public void testQueueBackstopRunsEveryFiveSecondsWithoutSlowingEnforcement() {
+        when(mockWorkloadManagementSettings.getWlmMode()).thenReturn(WlmMode.ENABLED);
+        WorkloadGroupQueueService queueService = Mockito.mock(WorkloadGroupQueueService.class);
+        workloadGroupService.setQueueService(queueService);
+        when(mockThreadPool.relativeTimeInNanos()).thenReturn(
+            0L,
+            WorkloadGroupService.QUEUE_BACKSTOP_SWEEP_INTERVAL_NANOS - 1L,
+            WorkloadGroupService.QUEUE_BACKSTOP_SWEEP_INTERVAL_NANOS
+        );
+
+        workloadGroupService.doRun();
+        workloadGroupService.doRun();
+        workloadGroupService.doRun();
+
+        verify(queueService, times(2)).sweep(any());
+        verify(mockCancellationService, times(3)).cancelTasks(any(), any(), any());
+        verify(mockCancellationService, times(3)).pruneDeletedWorkloadGroups(any());
+    }
+
+    public void testQueueBackstopCadenceHoldsForNegativeRelativeClock() {
+        when(mockWorkloadManagementSettings.getWlmMode()).thenReturn(WlmMode.ENABLED);
+        WorkloadGroupQueueService queueService = Mockito.mock(WorkloadGroupQueueService.class);
+        workloadGroupService.setQueueService(queueService);
+        // System.nanoTime's origin is arbitrary (possibly in the future), so the relative clock may read negative.
+        final long origin = -10 * WorkloadGroupService.QUEUE_BACKSTOP_SWEEP_INTERVAL_NANOS;
+        when(mockThreadPool.relativeTimeInNanos()).thenReturn(
+            origin,
+            origin + WorkloadGroupService.QUEUE_BACKSTOP_SWEEP_INTERVAL_NANOS - 1L,
+            origin + WorkloadGroupService.QUEUE_BACKSTOP_SWEEP_INTERVAL_NANOS
+        );
+
+        workloadGroupService.doRun();
+        workloadGroupService.doRun();
+        workloadGroupService.doRun();
+
+        verify(queueService, times(2)).sweep(any());
     }
 
     public void testRejectIfNeeded_whenWorkloadGroupIdIsNullOrDefaultOne() {
@@ -605,25 +665,30 @@ public class WorkloadGroupServiceTests extends OpenSearchTestCase {
         when(metadata.workloadGroups()).thenReturn(Map.of(workloadGroupId, wg));
     }
 
-    private void stubLocalSharedService(WorkloadGroup workloadGroup) {
-        stubLocalSharedService(workloadGroup, Set.of(DiscoveryNodeRole.DATA_ROLE));
+    private void stubClusterStateWithNoGroups() {
+        ClusterState clusterState = Mockito.mock(ClusterState.class);
+        Metadata metadata = Mockito.mock(Metadata.class);
+        when(mockClusterService.state()).thenReturn(clusterState);
+        when(clusterState.metadata()).thenReturn(metadata);
+        when(metadata.workloadGroups()).thenReturn(Map.of());
+    }
+
+    private WorkloadGroupSharedThrottleService stubLocalSharedService(WorkloadGroup workloadGroup) {
+        return stubLocalSharedService(workloadGroup, Set.of(DiscoveryNodeRole.DATA_ROLE));
     }
 
     // A local node without the data role leaves the ring with no eligible owner.
-    private void stubLocalSharedService(WorkloadGroup workloadGroup, Set<DiscoveryNodeRole> localRoles) {
-        DiscoveryNode localNode = new DiscoveryNode(
-            "local",
-            "local",
-            buildNewFakeTransportAddress(),
-            Collections.emptyMap(),
-            localRoles,
-            Version.CURRENT
-        );
-        DiscoveryNodes nodes = DiscoveryNodes.builder().add(localNode).localNodeId(localNode.getId()).build();
+    private WorkloadGroupSharedThrottleService stubLocalSharedService(WorkloadGroup workloadGroup, Set<DiscoveryNodeRole> localRoles) {
+        DiscoveryNode localNode = node("local", localRoles);
+        return stubSharedService(workloadGroup, DiscoveryNodes.builder().add(localNode).localNodeId(localNode.getId()).build());
+    }
+
+    // A real shared service on this node with `nodes` applied, over a transport that is connected to no other node.
+    private WorkloadGroupSharedThrottleService stubSharedService(WorkloadGroup workloadGroup, DiscoveryNodes nodes) {
         stubClusterStateWithGroup(workloadGroup);
         ClusterState clusterState = mockClusterService.state();
         when(clusterState.nodes()).thenReturn(nodes);
-        when(mockClusterService.localNode()).thenReturn(localNode);
+        when(mockClusterService.localNode()).thenReturn(nodes.getLocalNode());
         when(mockClusterService.getSettings()).thenReturn(Settings.EMPTY);
         WorkloadGroupSharedThrottleService sharedService = new WorkloadGroupSharedThrottleService(
             mockClusterService,
@@ -634,6 +699,11 @@ public class WorkloadGroupServiceTests extends OpenSearchTestCase {
         when(previous.nodes()).thenReturn(DiscoveryNodes.EMPTY_NODES);
         sharedService.clusterChanged(new ClusterChangedEvent("test", clusterState, previous));
         workloadGroupService.setSharedThrottleService(sharedService);
+        return sharedService;
+    }
+
+    private static DiscoveryNode node(String id, Set<DiscoveryNodeRole> roles) {
+        return new DiscoveryNode(id, id, buildNewFakeTransportAddress(), Collections.emptyMap(), roles, Version.CURRENT);
     }
 
     private Releasable acquireThrottlePermitSync(WorkloadGroupTask task, BooleanSupplier parentAlreadyCounted) {
@@ -799,6 +869,1086 @@ public class WorkloadGroupServiceTests extends OpenSearchTestCase {
         threadContext.putHeader(WorkloadGroupTask.WORKLOAD_GROUP_ID_HEADER, workloadGroupId);
         task.setWorkloadGroupId(threadContext);
         return task;
+    }
+
+    // --- queueing ---------------------------------------------------------------------------------------------------
+
+    // Whole-group bucket key, as WorkloadGroupService builds it.
+    private static String groupBucket(String groupId) {
+        return groupId + ":group:group";
+    }
+
+    // Same as throttledGroup but with a queue bag, so a throttle denial can park instead of rejecting.
+    private WorkloadGroup queueingGroup(String id, Settings throttling, Settings queue, MutableWorkloadGroupFragment.ResiliencyMode mode) {
+        return new WorkloadGroup(
+            id + "-name",
+            id,
+            new MutableWorkloadGroupFragment(mode, Map.of(ResourceType.MEMORY, 0.5), Settings.EMPTY, throttling, queue),
+            1L
+        );
+    }
+
+    private static Settings queueOf(int sizePerBucket) {
+        return Settings.builder().put("size_per_bucket", sizePerBucket).build();
+    }
+
+    // Installs a real queue service whose GENERIC executor runs inline, so queued-request completions are synchronous.
+    private WorkloadGroupQueueService newDirectQueueService() {
+        when(mockThreadPool.executor(ThreadPool.Names.GENERIC)).thenReturn(OpenSearchExecutors.newDirectExecutorService());
+        WorkloadGroupQueueService queueService = new WorkloadGroupQueueService(mockThreadPool, mockWorkloadGroupsStateAccessor);
+        workloadGroupService.setQueueService(queueService);
+        return queueService;
+    }
+
+    private void enqueueWaitingRequest(WorkloadGroupQueueService queueService, String groupId, String bucketKey, AtomicInteger admissions) {
+        mockWorkloadGroupsStateAccessor.addNewWorkloadGroup(groupId);
+        assertTrue(queueService.tryEnqueue(groupId, bucketKey, throttleTask(groupId), 10, ActionListener.wrap(permit -> {
+            admissions.incrementAndGet();
+            permit.close();
+        }, e -> { throw new AssertionError("queue-drain request failed instead of being admitted", e); })));
+    }
+
+    private void registerPendingRequest(
+        WorkloadGroupQueueService queueService,
+        String groupId,
+        String bucketKey,
+        AtomicInteger admissions
+    ) {
+        mockWorkloadGroupsStateAccessor.addNewWorkloadGroup(groupId);
+        assertNotNull(queueService.tryRegisterPendingAcquire(groupId, bucketKey, throttleTask(groupId), ActionListener.wrap(permit -> {
+            admissions.incrementAndGet();
+            permit.close();
+        }, e -> { throw new AssertionError("pending queue-drain request failed instead of being admitted", e); })));
+    }
+
+    /** What one admission attempt produced. A parked request is neither admitted nor failed (yet). */
+    private static final class Admission {
+        final WorkloadGroupTask task;
+        final AtomicReference<Releasable> permit = new AtomicReference<>();
+        final AtomicReference<Exception> failure = new AtomicReference<>();
+        final AtomicBoolean completed = new AtomicBoolean();
+
+        Admission(WorkloadGroupTask task) {
+            this.task = task;
+        }
+    }
+
+    private Admission admitOrPark(String workloadGroupId) {
+        return admitOrPark(workloadGroupId, null);
+    }
+
+    private Admission admitOrPark(String workloadGroupId, String principal) {
+        Admission admission = new Admission(throttleTask(workloadGroupId));
+        admission.task.setThrottlePrincipal(principal);
+        workloadGroupService.acquireThrottlePermit(admission.task, () -> false, ActionListener.wrap(p -> {
+            admission.permit.set(p);
+            admission.completed.set(true);
+        }, e -> {
+            admission.failure.set(e);
+            admission.completed.set(true);
+        }));
+        return admission;
+    }
+
+    public void testNodeTierBreachParksAndHandsTheCompletingPermitToTheQueue() {
+        when(mockWorkloadManagementSettings.getWlmMode()).thenReturn(WlmMode.ENABLED);
+        mockWorkloadGroupsStateAccessor.addNewWorkloadGroup("wg-1");
+        WorkloadGroupQueueService queueService = newDirectQueueService();
+        stubClusterStateWithGroup(
+            queueingGroup(
+                "wg-1",
+                Settings.builder().put("node_limit", 1).build(),
+                queueOf(5),
+                MutableWorkloadGroupFragment.ResiliencyMode.ENFORCED
+            )
+        );
+
+        Admission holder = admitOrPark("wg-1");
+        assertNotNull(holder.permit.get());
+        Admission parked = admitOrPark("wg-1");
+        assertFalse("a node-tier breach with queue room parks the request", parked.completed.get());
+        assertEquals(1, queueService.waitingDepth("wg-1"));
+        assertEquals("parking is not a rejection", 0, mockWorkloadGroupsStateAccessor.getWorkloadGroupState("wg-1").getTotalThrottled());
+        assertEquals("parking counts it as queued", 1, mockWorkloadGroupsStateAccessor.getWorkloadGroupState("wg-1").getTotalQueued());
+
+        holder.permit.get().close();
+        assertNotNull("the completing request's slot goes to the parked one", parked.permit.get());
+        assertTrue("a handed-off admission carries the throttle charge", parked.task.isThrottleCounted());
+        assertEquals(
+            "the hand-off does not count it again",
+            1,
+            mockWorkloadGroupsStateAccessor.getWorkloadGroupState("wg-1").getTotalQueued()
+        );
+        parked.permit.get().close();
+        assertNotNull("the slot is released once the queue is empty", admitOrPark("wg-1").permit.get());
+    }
+
+    public void testNodeTierQueueFullRejectsWithTheThrottleMessage() {
+        when(mockWorkloadManagementSettings.getWlmMode()).thenReturn(WlmMode.ENABLED);
+        mockWorkloadGroupsStateAccessor.addNewWorkloadGroup("wg-1");
+        WorkloadGroupQueueService queueService = newDirectQueueService();
+        stubClusterStateWithGroup(
+            queueingGroup(
+                "wg-1",
+                Settings.builder().put("node_limit", 1).build(),
+                queueOf(1),
+                MutableWorkloadGroupFragment.ResiliencyMode.ENFORCED
+            )
+        );
+
+        assertNotNull(admitOrPark("wg-1").permit.get());
+        assertFalse(admitOrPark("wg-1").completed.get());
+        Admission rejected = admitOrPark("wg-1");
+        assertTrue(rejected.failure.get() instanceof OpenSearchRejectedExecutionException);
+        assertEquals(
+            "Request throttled: workload group [wg-1-name] reached its per-node limit of 1 concurrent requests.",
+            rejected.failure.get().getMessage()
+        );
+        assertEquals(1, queueService.waitingDepth("wg-1"));
+        assertEquals(1, mockWorkloadGroupsStateAccessor.getWorkloadGroupState("wg-1").getTotalQueueRejections());
+        assertEquals(1, mockWorkloadGroupsStateAccessor.getWorkloadGroupState("wg-1").getTotalThrottled());
+    }
+
+    public void testScrollPageParksAndIsAdmittedWhenASlotFrees() {
+        assertParksThroughTheSearchGateAndIsAdmittedWhenASlotFrees(SearchScrollAction.NAME, new SearchScrollRequest("scroll-id"));
+    }
+
+    public void testPointInTimeSearchParksAndIsAdmittedWhenASlotFrees() {
+        SearchRequest pitSearch = new SearchRequest().source(
+            new SearchSourceBuilder().pointInTimeBuilder(new PointInTimeBuilder("pit-id"))
+        );
+        assertParksThroughTheSearchGateAndIsAdmittedWhenASlotFrees(SearchAction.NAME, pitSearch);
+    }
+
+    // Runs one request for `action` through the real search gate while the group's only node permit is held: it must wait
+    // in the queue, not run or be rejected, and run on the permit the holder frees.
+    private void assertParksThroughTheSearchGateAndIsAdmittedWhenASlotFrees(String action, ActionRequest request) {
+        when(mockWorkloadManagementSettings.getWlmMode()).thenReturn(WlmMode.ENABLED);
+        mockWorkloadGroupsStateAccessor.addNewWorkloadGroup("wg-1");
+        WorkloadGroupQueueService queueService = newDirectQueueService();
+        stubClusterStateWithGroup(
+            queueingGroup(
+                "wg-1",
+                Settings.builder().put("node_limit", 1).build(),
+                queueOf(5),
+                MutableWorkloadGroupFragment.ResiliencyMode.ENFORCED
+            )
+        );
+        Admission holder = admitOrPark("wg-1");
+        assertNotNull(holder.permit.get());
+
+        GatedRequest gated = executeThroughSearchGate(searchTaskFor("wg-1", action), request);
+        assertNull("a request at the limit must wait, not run", gated.running.get());
+        assertNull("nor be rejected", gated.failure.get());
+        assertEquals(1, queueService.retainedDepth("wg-1"));
+        assertEquals(0, mockWorkloadGroupsStateAccessor.getWorkloadGroupState("wg-1").getTotalThrottled());
+
+        holder.permit.get().close();
+        assertNotNull("the freed slot admits the parked request", gated.running.get());
+        assertTrue("it runs on the handed-off permit", gated.task.isThrottleCounted());
+        assertEquals(0, queueService.retainedDepth("wg-1"));
+        assertEquals(1, mockWorkloadGroupsStateAccessor.getWorkloadGroupState("wg-1").getTotalQueued());
+        gated.running.get().onResponse("done");
+        assertEquals("done", gated.response.get());
+        Admission next = admitOrPark("wg-1");
+        assertNotNull("the request returned its slot when it completed", next.permit.get());
+        next.permit.get().close();
+    }
+
+    public void testParkedScrollPageIsEvictedWhenItsTaskIsCancelled() {
+        when(mockWorkloadManagementSettings.getWlmMode()).thenReturn(WlmMode.ENABLED);
+        mockWorkloadGroupsStateAccessor.addNewWorkloadGroup("wg-1");
+        WorkloadGroupQueueService queueService = newDirectQueueService();
+        stubClusterStateWithGroup(
+            queueingGroup(
+                "wg-1",
+                Settings.builder().put("node_limit", 1).build(),
+                queueOf(5),
+                MutableWorkloadGroupFragment.ResiliencyMode.ENFORCED
+            )
+        );
+        Admission holder = admitOrPark("wg-1");
+        GatedRequest page = executeThroughSearchGate(searchTaskFor("wg-1", SearchScrollAction.NAME), new SearchScrollRequest("scroll-id"));
+        assertEquals(1, queueService.retainedDepth("wg-1"));
+
+        page.task.cancel("client gone");
+        assertTrue(page.failure.get() instanceof TaskCancelledException);
+        assertEquals("task cancelled while queued", page.failure.get().getMessage());
+        assertNull("an evicted page never runs", page.running.get());
+        assertEquals(0, queueService.retainedDepth("wg-1"));
+        assertEquals(
+            "a cancelled page is not a throttle",
+            0,
+            mockWorkloadGroupsStateAccessor.getWorkloadGroupState("wg-1").getTotalThrottled()
+        );
+        assertEquals(
+            "it was counted as queued when it parked, and its eviction does not count it again",
+            1,
+            mockWorkloadGroupsStateAccessor.getWorkloadGroupState("wg-1").getTotalQueued()
+        );
+
+        holder.permit.get().close();
+        Admission next = admitOrPark("wg-1");
+        assertNotNull("the evicted page holds no place in the queue", next.permit.get());
+        next.permit.get().close();
+    }
+
+    /** One request run through the search gate: the listener its body got once admitted, and the request's outcome. */
+    private static final class GatedRequest {
+        final SearchTask task;
+        final AtomicReference<ActionListener<String>> running = new AtomicReference<>();
+        final AtomicReference<String> response = new AtomicReference<>();
+        final AtomicReference<Exception> failure = new AtomicReference<>();
+
+        GatedRequest(SearchTask task) {
+            this.task = task;
+        }
+    }
+
+    private GatedRequest executeThroughSearchGate(SearchTask task, ActionRequest request) {
+        GatedRequest gated = new GatedRequest(task);
+        activeSearchGate().execute(task, request, ActionListener.<String>wrap(gated.response::set, gated.failure::set), gated.running::set);
+        return gated;
+    }
+
+    // A search task for `action`, tagged to the workload group the way the search actions tag it.
+    private static SearchTask searchTaskFor(String workloadGroupId, String action) {
+        SearchTask task = new SearchTask(1L, "transport", action, () -> "test", TaskId.EMPTY_TASK_ID, Map.of());
+        ThreadContext threadContext = new ThreadContext(Settings.EMPTY);
+        threadContext.putHeader(WorkloadGroupTask.WORKLOAD_GROUP_ID_HEADER, workloadGroupId);
+        task.setWorkloadGroupId(threadContext);
+        return task;
+    }
+
+    public void testParkedRequestResumesInItsOwnThreadContextAfterANodeHandoff() {
+        when(mockWorkloadManagementSettings.getWlmMode()).thenReturn(WlmMode.ENABLED);
+        mockWorkloadGroupsStateAccessor.addNewWorkloadGroup("wg-1");
+        ThreadContext threadContext = new ThreadContext(Settings.EMPTY);
+        when(mockThreadPool.getThreadContext()).thenReturn(threadContext);
+        newDirectQueueService();
+        stubClusterStateWithGroup(
+            queueingGroup(
+                "wg-1",
+                Settings.builder().put("node_limit", 1).build(),
+                queueOf(5),
+                MutableWorkloadGroupFragment.ResiliencyMode.ENFORCED
+            )
+        );
+
+        Admission holder = admitOrPark("wg-1");
+        AtomicReference<String> seen = new AtomicReference<>();
+        try (ThreadContext.StoredContext ignored = threadContext.stashContext()) {
+            threadContext.putHeader("X", "parked");
+            workloadGroupService.acquireThrottlePermit(throttleTask("wg-1"), () -> false, ActionListener.wrap(p -> {
+                seen.set(threadContext.getHeader("X"));
+                p.close();
+            }, e -> fail(e.toString())));
+        }
+        assertNull("parked", seen.get());
+        try (ThreadContext.StoredContext ignored = threadContext.stashContext()) {
+            threadContext.putHeader("X", "releaser");
+            holder.permit.get().close();
+        }
+        assertEquals("the admitted search must not inherit the releasing request's context", "parked", seen.get());
+    }
+
+    public void testCountedParentIsExemptBeforeTheQueue() {
+        // The nested-search exemption runs before any enqueue: a search whose parent already holds the charge must not
+        // park behind (or deadlock with) that parent.
+        when(mockWorkloadManagementSettings.getWlmMode()).thenReturn(WlmMode.ENABLED);
+        mockWorkloadGroupsStateAccessor.addNewWorkloadGroup("wg-1");
+        WorkloadGroupQueueService queueService = newDirectQueueService();
+        stubClusterStateWithGroup(
+            queueingGroup(
+                "wg-1",
+                Settings.builder().put("node_limit", 1).build(),
+                queueOf(5),
+                MutableWorkloadGroupFragment.ResiliencyMode.ENFORCED
+            )
+        );
+
+        WorkloadGroupTask root = throttleTask("wg-1");
+        Releasable rootPermit = acquireThrottlePermitSync(root, () -> false);
+        assertNotNull(rootPermit);
+        WorkloadGroupTask nested = throttleTask("wg-1");
+        assertNull(acquireThrottlePermitSync(nested, root::isThrottleCounted));
+        assertEquals("an exempt nested search never parks", 0, queueService.retainedDepth("wg-1"));
+        rootPermit.close();
+    }
+
+    public void testRemovingFinalThrottleTierSchedulesQueuedBacklogDrain() {
+        // Removing the final tier leaves parked requests with no permit source, so the config callback must run them all
+        // untracked instead of waiting for the periodic service loop.
+        when(mockWorkloadManagementSettings.getWlmMode()).thenReturn(WlmMode.ENABLED);
+        mockWorkloadGroupsStateAccessor.addNewWorkloadGroup("wg-1");
+        WorkloadGroupQueueService queueService = newDirectQueueService();
+        WorkloadGroup throttled = queueingGroup(
+            "wg-1",
+            Settings.builder().put("node_limit", 1).build(),
+            queueOf(5),
+            MutableWorkloadGroupFragment.ResiliencyMode.ENFORCED
+        );
+        stubClusterStateWithGroup(throttled);
+
+        assertNotNull(admitOrPark("wg-1").permit.get());
+        Admission parkedA = admitOrPark("wg-1");
+        Admission parkedB = admitOrPark("wg-1");
+        assertEquals("two requests should be parked", 2, queueService.waitingDepth("wg-1"));
+
+        // Queue settings may remain configured, but queueing becomes inert; the backlog retained under the old admission
+        // policy must run without waiting for the periodic service sweep.
+        WorkloadGroup unthrottled = queueingGroup("wg-1", Settings.EMPTY, queueOf(5), MutableWorkloadGroupFragment.ResiliencyMode.ENFORCED);
+        applyWorkloadGroups(Map.of("wg-1", throttled), Map.of("wg-1", unthrottled));
+
+        assertEquals("the scheduled policy drain must release the whole backlog", 0, queueService.waitingDepth("wg-1"));
+        assertTrue(parkedA.completed.get() && parkedB.completed.get());
+        assertFalse("an untracked drain holds no permit, so it is not charged", parkedA.task.isThrottleCounted());
+    }
+
+    public void testDeletingGroupDrainsWaitingAndPendingRequests() {
+        WorkloadGroupQueueService queueService = newDirectQueueService();
+        AtomicInteger admissions = new AtomicInteger();
+        enqueueWaitingRequest(queueService, "wg-1", groupBucket("wg-1"), admissions);
+        registerPendingRequest(queueService, "wg-1", groupBucket("wg-1"), admissions);
+        assertEquals(1, queueService.waitingDepth("wg-1"));
+        assertEquals(2, queueService.retainedDepth("wg-1"));
+
+        WorkloadGroup group = queueingGroup(
+            "wg-1",
+            Settings.builder().put("node_limit", 1).build(),
+            queueOf(10),
+            MutableWorkloadGroupFragment.ResiliencyMode.ENFORCED
+        );
+        applyWorkloadGroups(Map.of("wg-1", group), Map.of());
+
+        assertEquals(0, queueService.retainedDepth("wg-1"));
+        assertEquals(2, admissions.get());
+    }
+
+    public void testThrottleByChangeDrainsQueue() {
+        WorkloadGroupQueueService queueService = newDirectQueueService();
+        AtomicInteger admissions = new AtomicInteger();
+        enqueueWaitingRequest(queueService, "wg-1", groupBucket("wg-1"), admissions);
+
+        WorkloadGroup groupScope = queueingGroup(
+            "wg-1",
+            Settings.builder().put("node_limit", 1).build(),
+            queueOf(10),
+            MutableWorkloadGroupFragment.ResiliencyMode.ENFORCED
+        );
+        WorkloadGroup byUsername = queueingGroup(
+            "wg-1",
+            Settings.builder().put("by", "username").put("node_limit", 1).build(),
+            queueOf(10),
+            MutableWorkloadGroupFragment.ResiliencyMode.ENFORCED
+        );
+        applyWorkloadGroups(Map.of("wg-1", groupScope), Map.of("wg-1", byUsername));
+
+        assertEquals(0, queueService.retainedDepth("wg-1"));
+        assertEquals(1, admissions.get());
+    }
+
+    public void testSwitchingThrottleTierDrainsQueue() {
+        WorkloadGroupQueueService queueService = newDirectQueueService();
+        AtomicInteger admissions = new AtomicInteger();
+        enqueueWaitingRequest(queueService, "wg-1", groupBucket("wg-1"), admissions);
+
+        WorkloadGroup nodeOnly = queueingGroup(
+            "wg-1",
+            Settings.builder().put("node_limit", 1).build(),
+            queueOf(10),
+            MutableWorkloadGroupFragment.ResiliencyMode.ENFORCED
+        );
+        WorkloadGroup sharedOnly = queueingGroup(
+            "wg-1",
+            Settings.builder().put("shared_limit", 1).build(),
+            queueOf(10),
+            MutableWorkloadGroupFragment.ResiliencyMode.ENFORCED
+        );
+        applyWorkloadGroups(Map.of("wg-1", nodeOnly), Map.of("wg-1", sharedOnly));
+
+        assertEquals(0, queueService.retainedDepth("wg-1"));
+        assertEquals(1, admissions.get());
+    }
+
+    public void testAddingThrottleTierDrainsQueue() {
+        WorkloadGroupQueueService queueService = newDirectQueueService();
+        AtomicInteger admissions = new AtomicInteger();
+        enqueueWaitingRequest(queueService, "wg-1", groupBucket("wg-1"), admissions);
+
+        WorkloadGroup nodeOnly = queueingGroup(
+            "wg-1",
+            Settings.builder().put("node_limit", 1).build(),
+            queueOf(10),
+            MutableWorkloadGroupFragment.ResiliencyMode.ENFORCED
+        );
+        WorkloadGroup bothTiers = queueingGroup(
+            "wg-1",
+            Settings.builder().put("node_limit", 1).put("shared_limit", 1).build(),
+            queueOf(10),
+            MutableWorkloadGroupFragment.ResiliencyMode.ENFORCED
+        );
+        applyWorkloadGroups(Map.of("wg-1", nodeOnly), Map.of("wg-1", bothTiers));
+
+        assertEquals(0, queueService.retainedDepth("wg-1"));
+        assertEquals(1, admissions.get());
+    }
+
+    public void testZeroToUnsetLimitIsNotATierChange() throws IOException {
+        // A limit below 1 never admits through its tier, so moving between 0 and unset changes no admission contract.
+        WorkloadGroupQueueService queueService = newDirectQueueService();
+        AtomicInteger admissions = new AtomicInteger();
+        enqueueWaitingRequest(queueService, "wg-1", groupBucket("wg-1"), admissions);
+
+        WorkloadGroup zeroNodeLimit = deserializedThrottledGroup(
+            "wg-1",
+            Settings.builder().put("node_limit", 0).put("shared_limit", 2).build()
+        );
+        WorkloadGroup unsetNodeLimit = queueingGroup(
+            "wg-1",
+            Settings.builder().put("shared_limit", 2).build(),
+            queueOf(10),
+            MutableWorkloadGroupFragment.ResiliencyMode.ENFORCED
+        );
+        applyWorkloadGroups(Map.of("wg-1", zeroNodeLimit), Map.of("wg-1", unsetNodeLimit));
+
+        assertEquals(1, queueService.retainedDepth("wg-1"));
+        assertEquals(0, admissions.get());
+    }
+
+    public void testEnteringMonitorModeDrainsQueue() {
+        WorkloadGroupQueueService queueService = newDirectQueueService();
+        AtomicInteger admissions = new AtomicInteger();
+        enqueueWaitingRequest(queueService, "wg-1", groupBucket("wg-1"), admissions);
+
+        Settings throttling = Settings.builder().put("node_limit", 1).build();
+        WorkloadGroup enforced = queueingGroup("wg-1", throttling, queueOf(10), MutableWorkloadGroupFragment.ResiliencyMode.ENFORCED);
+        WorkloadGroup monitor = queueingGroup("wg-1", throttling, queueOf(10), MutableWorkloadGroupFragment.ResiliencyMode.MONITOR);
+        applyWorkloadGroups(Map.of("wg-1", enforced), Map.of("wg-1", monitor));
+
+        assertEquals(0, queueService.retainedDepth("wg-1"));
+        assertEquals(1, admissions.get());
+    }
+
+    public void testConfigChangeDispatchesQueueDrainOffTheClusterApplierThread() {
+        ExecutorService delayedExecutor = Mockito.mock(ExecutorService.class);
+        when(mockThreadPool.executor(ThreadPool.Names.GENERIC)).thenReturn(delayedExecutor);
+        WorkloadGroupQueueService queueService = new WorkloadGroupQueueService(mockThreadPool, mockWorkloadGroupsStateAccessor);
+        workloadGroupService.setQueueService(queueService);
+        AtomicInteger admissions = new AtomicInteger();
+        enqueueWaitingRequest(queueService, "wg-1", groupBucket("wg-1"), admissions);
+
+        Settings throttling = Settings.builder().put("node_limit", 1).build();
+        WorkloadGroup enforced = queueingGroup("wg-1", throttling, queueOf(10), MutableWorkloadGroupFragment.ResiliencyMode.ENFORCED);
+        WorkloadGroup monitor = queueingGroup("wg-1", throttling, queueOf(10), MutableWorkloadGroupFragment.ResiliencyMode.MONITOR);
+        applyWorkloadGroups(Map.of("wg-1", enforced), Map.of("wg-1", monitor));
+
+        ArgumentCaptor<Runnable> drainTask = ArgumentCaptor.forClass(Runnable.class);
+        verify(delayedExecutor).execute(drainTask.capture());
+        assertEquals("the cluster-applier callback must only schedule the drain", 1, queueService.retainedDepth("wg-1"));
+        assertEquals(0, admissions.get());
+
+        when(mockThreadPool.executor(ThreadPool.Names.GENERIC)).thenReturn(OpenSearchExecutors.newDirectExecutorService());
+        drainTask.getValue().run();
+
+        assertEquals(0, queueService.retainedDepth("wg-1"));
+        assertEquals(1, admissions.get());
+    }
+
+    public void testNumericLimitChangesWithSameTiersDoNotDrainQueue() {
+        WorkloadGroupQueueService queueService = newDirectQueueService();
+        AtomicInteger admissions = new AtomicInteger();
+        enqueueWaitingRequest(queueService, "wg-1", groupBucket("wg-1"), admissions);
+
+        WorkloadGroup previous = queueingGroup(
+            "wg-1",
+            Settings.builder().put("node_limit", 1).put("shared_limit", 2).build(),
+            queueOf(10),
+            MutableWorkloadGroupFragment.ResiliencyMode.ENFORCED
+        );
+        WorkloadGroup current = queueingGroup(
+            "wg-1",
+            Settings.builder().put("node_limit", 3).put("shared_limit", 4).build(),
+            queueOf(10),
+            MutableWorkloadGroupFragment.ResiliencyMode.ENFORCED
+        );
+        applyWorkloadGroups(Map.of("wg-1", previous), Map.of("wg-1", current));
+
+        assertEquals(1, queueService.retainedDepth("wg-1"));
+        assertEquals(0, admissions.get());
+    }
+
+    public void testQueueDepthAndOtherNonMonitorChangesDoNotDrainQueue() {
+        WorkloadGroupQueueService queueService = newDirectQueueService();
+        AtomicInteger admissions = new AtomicInteger();
+        enqueueWaitingRequest(queueService, "wg-1", groupBucket("wg-1"), admissions);
+
+        Settings throttling = Settings.builder().put("node_limit", 1).build();
+        WorkloadGroup original = queueingGroup("wg-1", throttling, queueOf(10), MutableWorkloadGroupFragment.ResiliencyMode.ENFORCED);
+        WorkloadGroup resizedQueue = queueingGroup("wg-1", throttling, queueOf(20), MutableWorkloadGroupFragment.ResiliencyMode.ENFORCED);
+        applyWorkloadGroups(Map.of("wg-1", original), Map.of("wg-1", resizedQueue));
+        assertEquals(1, queueService.retainedDepth("wg-1"));
+
+        WorkloadGroup soft = queueingGroup("wg-1", throttling, queueOf(20), MutableWorkloadGroupFragment.ResiliencyMode.SOFT);
+        applyWorkloadGroups(Map.of("wg-1", resizedQueue), Map.of("wg-1", soft));
+
+        assertEquals(1, queueService.retainedDepth("wg-1"));
+        assertEquals(0, admissions.get());
+    }
+
+    public void testGlobalModeLeavingEnabledDrainsAllQueues() {
+        assertNotNull(wlmModeChangeListener);
+        WorkloadGroupQueueService queueService = newDirectQueueService();
+        AtomicInteger admissions = new AtomicInteger();
+
+        enqueueWaitingRequest(queueService, "wg-1", groupBucket("wg-1"), admissions);
+        registerPendingRequest(queueService, "wg-2", groupBucket("wg-2"), admissions);
+        wlmModeChangeListener.accept(WlmMode.ENABLED, WlmMode.DISABLED);
+        assertEquals(0, queueService.retainedDepth("wg-1"));
+        assertEquals(0, queueService.retainedDepth("wg-2"));
+        assertEquals(2, admissions.get());
+
+        registerPendingRequest(queueService, "wg-3", groupBucket("wg-3"), admissions);
+        wlmModeChangeListener.accept(WlmMode.ENABLED, WlmMode.MONITOR_ONLY);
+        assertEquals(0, queueService.retainedDepth("wg-3"));
+        assertEquals(3, admissions.get());
+    }
+
+    public void testServiceLoopReleasesARequestParkedAfterTheModeChangeDrainWhileDisabled() {
+        assertServiceLoopReleasesARequestParkedAfterTheModeChangeDrain(WlmMode.DISABLED);
+        Mockito.verifyNoInteractions(mockCancellationService); // the enforcement work DISABLED skips still never runs
+    }
+
+    public void testServiceLoopReleasesARequestParkedAfterTheModeChangeDrainInMonitorMode() {
+        assertServiceLoopReleasesARequestParkedAfterTheModeChangeDrain(WlmMode.MONITOR_ONLY);
+        // Unlike DISABLED, MONITOR_ONLY still runs the enforcement work after the release.
+        verify(mockCancellationService).cancelTasks(any(), any(), any());
+        verify(mockCancellationService).pruneDeletedWorkloadGroups(any());
+    }
+
+    // A request that resolved its plan while WLM was ENABLED parks just after the one-shot drain that ran when WLM left
+    // ENABLED. Nothing else is bound to admit it (while DISABLED the queue backstop never runs), so the next run of the
+    // service loop releases it, untracked, as the drain would have.
+    private void assertServiceLoopReleasesARequestParkedAfterTheModeChangeDrain(WlmMode notEnabled) {
+        assertNotNull(wlmModeChangeListener);
+        when(mockWorkloadManagementSettings.getWlmMode()).thenReturn(WlmMode.ENABLED);
+        mockWorkloadGroupsStateAccessor.addNewWorkloadGroup("wg-1");
+        WorkloadGroupQueueService queueService = newDirectQueueService();
+        stubClusterStateWithGroup(
+            queueingGroup(
+                "wg-1",
+                Settings.builder().put("node_limit", 1).build(),
+                queueOf(5),
+                MutableWorkloadGroupFragment.ResiliencyMode.ENFORCED
+            )
+        );
+        Admission holder = admitOrPark("wg-1");
+        assertNotNull(holder.permit.get());
+
+        // The straggler's plan is resolved on the first mode read, still ENABLED; every later read sees the new mode.
+        when(mockWorkloadManagementSettings.getWlmMode()).thenReturn(WlmMode.ENABLED, notEnabled);
+        wlmModeChangeListener.accept(WlmMode.ENABLED, notEnabled); // the one-shot drain finds the queue empty
+        Admission straggler = admitOrPark("wg-1");
+        assertFalse("the request parked after the drain", straggler.completed.get());
+        assertEquals(1, queueService.waitingDepth("wg-1"));
+
+        workloadGroupService.doRun();
+
+        assertTrue("the service loop must release the straggler", straggler.completed.get());
+        assertNull(straggler.failure.get());
+        assertNotNull("released with an untracked no-op permit", straggler.permit.get());
+        assertFalse("an untracked release holds no throttle slot", straggler.task.isThrottleCounted());
+        assertEquals(0, queueService.retainedDepth("wg-1"));
+        holder.permit.get().close();
+    }
+
+    public void testServiceLoopRunsNothingWhileDisabledWithAnEmptyQueue() {
+        when(mockWorkloadManagementSettings.getWlmMode()).thenReturn(WlmMode.DISABLED);
+        when(mockThreadPool.executor(ThreadPool.Names.GENERIC)).thenReturn(OpenSearchExecutors.newDirectExecutorService());
+        WorkloadGroupQueueService queueService = spy(new WorkloadGroupQueueService(mockThreadPool, mockWorkloadGroupsStateAccessor));
+        workloadGroupService.setQueueService(queueService);
+        // A group that held a request keeps its emptied queue object: that must not cost the loop anything either.
+        AtomicInteger admissions = new AtomicInteger();
+        enqueueWaitingRequest(queueService, "wg-1", groupBucket("wg-1"), admissions);
+        assertEquals(1, queueService.admitAllUntracked("wg-1"));
+        assertEquals(1, admissions.get());
+        Mockito.clearInvocations(queueService, mockThreadPool);
+
+        workloadGroupService.doRun();
+
+        verify(queueService).hasRetainedRequests();
+        Mockito.verifyNoMoreInteractions(queueService);
+        Mockito.verifyNoInteractions(mockCancellationService, mockThreadPool);
+    }
+
+    public void testGlobalModeTransitionNotLeavingEnabledDoesNotDrainQueue() {
+        assertNotNull(wlmModeChangeListener);
+        WorkloadGroupQueueService queueService = newDirectQueueService();
+        AtomicInteger admissions = new AtomicInteger();
+        enqueueWaitingRequest(queueService, "wg-1", groupBucket("wg-1"), admissions);
+
+        wlmModeChangeListener.accept(WlmMode.MONITOR_ONLY, WlmMode.DISABLED);
+        wlmModeChangeListener.accept(WlmMode.DISABLED, WlmMode.ENABLED);
+
+        assertEquals(1, queueService.retainedDepth("wg-1"));
+        assertEquals(0, admissions.get());
+    }
+
+    public void testNodePermitCompletionHandsSlotToQueueBeforeRacingArrival() {
+        when(mockWorkloadManagementSettings.getWlmMode()).thenReturn(WlmMode.ENABLED);
+        mockWorkloadGroupsStateAccessor.addNewWorkloadGroup("wg-1");
+        when(mockThreadPool.executor(ThreadPool.Names.GENERIC)).thenReturn(OpenSearchExecutors.newDirectExecutorService());
+        stubClusterStateWithGroup(
+            queueingGroup(
+                "wg-1",
+                Settings.builder().put("node_limit", 1).build(),
+                queueOf(5),
+                MutableWorkloadGroupFragment.ResiliencyMode.ENFORCED
+            )
+        );
+
+        AtomicBoolean injectedRacingArrival = new AtomicBoolean(false);
+        AtomicReference<Admission> racingArrival = new AtomicReference<>();
+        WorkloadGroupQueueService queueService = new WorkloadGroupQueueService(mockThreadPool, mockWorkloadGroupsStateAccessor) {
+            @Override
+            boolean handoffNodePermit(String groupId, String bucketKey, Releasable permit) {
+                if (injectedRacingArrival.compareAndSet(false, true)) {
+                    // Run a new arrival at the exact point where a release-then-reacquire implementation would already have
+                    // freed the raw tracker slot. The handoff still owns that slot, so this request must queue instead of
+                    // barging ahead.
+                    racingArrival.set(admitOrPark("wg-1"));
+                    assertFalse("the racing request must not acquire the queued request's slot", racingArrival.get().completed.get());
+                    assertEquals("oldest waiter plus racing arrival", 2, retainedDepth("wg-1"));
+                }
+                return super.handoffNodePermit(groupId, bucketKey, permit);
+            }
+        };
+        workloadGroupService.setQueueService(queueService);
+
+        Admission holder = admitOrPark("wg-1");
+        assertNotNull(holder.permit.get());
+        AtomicReference<Releasable> oldestQueuedPermit = new AtomicReference<>();
+        assertTrue(
+            queueService.tryEnqueue(
+                "wg-1",
+                groupBucket("wg-1"),
+                throttleTask("wg-1"),
+                5,
+                ActionListener.wrap(oldestQueuedPermit::set, e -> fail("oldest queued request failed: " + e))
+            )
+        );
+
+        holder.permit.get().close();
+        holder.permit.get().close(); // the wrapper itself must be one-shot; no second handoff from a duplicate completion
+
+        assertTrue(injectedRacingArrival.get());
+        assertNotNull("the oldest queued request receives the still-held node slot", oldestQueuedPermit.get());
+        assertNull("the racing request remains queued behind it", racingArrival.get().permit.get());
+        assertEquals(1, queueService.retainedDepth("wg-1"));
+
+        oldestQueuedPermit.get().close();
+        assertNotNull("the same underlying slot chains to the next queued request", racingArrival.get().permit.get());
+        assertEquals(0, queueService.retainedDepth("wg-1"));
+        racingArrival.get().permit.get().close();
+
+        Admission afterDrain = admitOrPark("wg-1");
+        assertNotNull("the underlying tracker slot must be released when the queue empties", afterDrain.permit.get());
+        afterDrain.permit.get().close();
+    }
+
+    public void testCompletionDrainHonoursALiveNodeLimitDecrease() {
+        // The node-tier drain chain must re-read node_limit from cluster state on every hop instead of reusing the value
+        // captured when the chain started; otherwise a busy bucket keeps admitting above a lowered limit.
+        when(mockWorkloadManagementSettings.getWlmMode()).thenReturn(WlmMode.ENABLED);
+        mockWorkloadGroupsStateAccessor.addNewWorkloadGroup("wg-1");
+        WorkloadGroupQueueService queueService = newDirectQueueService();
+        stubClusterStateWithGroup(
+            queueingGroup(
+                "wg-1",
+                Settings.builder().put("node_limit", 2).build(),
+                queueOf(5),
+                MutableWorkloadGroupFragment.ResiliencyMode.ENFORCED
+            )
+        );
+
+        Admission first = admitOrPark("wg-1");
+        Admission second = admitOrPark("wg-1");
+        assertNotNull(first.permit.get());
+        assertNotNull(second.permit.get());
+        Admission third = admitOrPark("wg-1");
+        assertFalse("third request should be parked, not admitted", third.completed.get());
+        assertEquals(1, queueService.waitingDepth("wg-1"));
+
+        // Operator lowers node_limit to 1 while the bucket is busy with a backlog.
+        stubClusterStateWithGroup(
+            queueingGroup(
+                "wg-1",
+                Settings.builder().put("node_limit", 1).build(),
+                queueOf(5),
+                MutableWorkloadGroupFragment.ResiliencyMode.ENFORCED
+            )
+        );
+
+        // Completing one request drops in-flight to 1, already AT the new limit, so the drain must not admit.
+        first.permit.get().close();
+        assertEquals("drain must respect the lowered node_limit, leaving the request parked", 1, queueService.waitingDepth("wg-1"));
+
+        // Completing the second leaves room under the new limit -> the parked request drains.
+        second.permit.get().close();
+        assertEquals("a slot under the new limit must still drain the backlog", 0, queueService.waitingDepth("wg-1"));
+        assertNotNull(third.permit.get());
+    }
+
+    public void testQueueBackstopReleasesARequestParkedAfterTheFinalTierWasRemoved() {
+        assertQueueBackstopReleasesStrandedRequest(
+            () -> stubClusterStateWithGroup(
+                queueingGroup("wg-1", Settings.EMPTY, queueOf(5), MutableWorkloadGroupFragment.ResiliencyMode.ENFORCED)
+            )
+        );
+    }
+
+    public void testQueueBackstopReleasesARequestParkedBeforeItsGroupWasDeleted() {
+        assertQueueBackstopReleasesStrandedRequest(this::stubClusterStateWithNoGroups);
+    }
+
+    // A request that resolved the old plan parks just after the one-shot live-config drain (modeled by changing the
+    // applied config without delivering clusterChanged, as if that drain had already run against an empty queue). With no
+    // tier left nothing can ever admit it, so the backstop releases it untracked, as the drain and a new arrival would.
+    private void assertQueueBackstopReleasesStrandedRequest(Runnable removeEveryTier) {
+        when(mockWorkloadManagementSettings.getWlmMode()).thenReturn(WlmMode.ENABLED);
+        mockWorkloadGroupsStateAccessor.addNewWorkloadGroup("wg-1");
+        WorkloadGroupQueueService queueService = newDirectQueueService();
+        stubClusterStateWithGroup(
+            queueingGroup(
+                "wg-1",
+                Settings.builder().put("node_limit", 1).build(),
+                queueOf(5),
+                MutableWorkloadGroupFragment.ResiliencyMode.ENFORCED
+            )
+        );
+        Admission holder = admitOrPark("wg-1");
+        assertNotNull(holder.permit.get());
+        Admission parked = admitOrPark("wg-1");
+        assertEquals(1, queueService.waitingDepth("wg-1"));
+
+        removeEveryTier.run();
+        holder.permit.get().close();
+        assertFalse("with no tier left the completion has no slot to hand off", parked.completed.get());
+
+        workloadGroupService.doRun(); // the mock clock reads 0, so the first backstop pass is due
+
+        assertTrue("the backstop must release the stranded request", parked.completed.get());
+        assertNull(parked.failure.get());
+        assertNotNull("released with an untracked no-op permit", parked.permit.get());
+        assertFalse("an untracked release holds no throttle slot", parked.task.isThrottleCounted());
+        assertEquals(0, queueService.retainedDepth("wg-1"));
+    }
+
+    public void testQueueBackstopLeavesASharedOnlyBucketToOwnerPushUntilItsTierIsGone() {
+        when(mockWorkloadManagementSettings.getWlmMode()).thenReturn(WlmMode.ENABLED);
+        AtomicLong clock = new AtomicLong();
+        when(mockThreadPool.relativeTimeInNanos()).thenAnswer(invocation -> clock.get());
+        WorkloadGroupQueueService queueService = newDirectQueueService();
+        stubClusterStateWithGroup(
+            queueingGroup(
+                "wg-1",
+                Settings.builder().put("shared_limit", 1).build(),
+                queueOf(5),
+                MutableWorkloadGroupFragment.ResiliencyMode.ENFORCED
+            )
+        );
+        AtomicInteger admissions = new AtomicInteger();
+        enqueueWaitingRequest(queueService, "wg-1", groupBucket("wg-1"), admissions);
+
+        workloadGroupService.doRun();
+        assertEquals("a shared-only bucket is left to owner push", 0, admissions.get());
+
+        stubClusterStateWithGroup(queueingGroup("wg-1", Settings.EMPTY, queueOf(5), MutableWorkloadGroupFragment.ResiliencyMode.ENFORCED));
+        clock.addAndGet(WorkloadGroupService.QUEUE_BACKSTOP_SWEEP_INTERVAL_NANOS);
+        workloadGroupService.doRun();
+
+        assertEquals("with no tier left the backstop releases it", 1, admissions.get());
+        assertEquals(0, queueService.retainedDepth("wg-1"));
+    }
+
+    public void testBackstopSweepFillsNodeSlotsAddedByALimitIncrease() {
+        when(mockWorkloadManagementSettings.getWlmMode()).thenReturn(WlmMode.ENABLED);
+        mockWorkloadGroupsStateAccessor.addNewWorkloadGroup("wg-1");
+        WorkloadGroupQueueService queueService = newDirectQueueService();
+        stubClusterStateWithGroup(
+            queueingGroup(
+                "wg-1",
+                Settings.builder().put("node_limit", 1).build(),
+                queueOf(5),
+                MutableWorkloadGroupFragment.ResiliencyMode.ENFORCED
+            )
+        );
+        Admission holder = admitOrPark("wg-1");
+        assertNotNull(holder.permit.get());
+        Admission[] parked = new Admission[3];
+        for (int i = 0; i < parked.length; i++) {
+            parked[i] = admitOrPark("wg-1");
+        }
+        assertEquals(3, queueService.waitingDepth("wg-1"));
+
+        // A numeric node_limit increase is not a queue drain (see requiresQueueDrain), and no completion hands the
+        // added slots to the backlog.
+        stubClusterStateWithGroup(
+            queueingGroup(
+                "wg-1",
+                Settings.builder().put("node_limit", 4).build(),
+                queueOf(5),
+                MutableWorkloadGroupFragment.ResiliencyMode.ENFORCED
+            )
+        );
+        workloadGroupService.doRun(); // the mock clock reads 0, so the first backstop pass is due
+
+        assertEquals("one backstop pass must fill every added slot", 0, queueService.waitingDepth("wg-1"));
+        for (Admission admission : parked) {
+            assertNotNull(admission.permit.get());
+        }
+        Admission next = admitOrPark("wg-1");
+        assertFalse("the bucket is at its new limit", next.completed.get());
+        holder.permit.get().close();
+        assertNotNull("a freed slot goes to the next waiter", next.permit.get());
+        next.permit.get().close();
+        for (Admission admission : parked) {
+            admission.permit.get().close();
+        }
+    }
+
+    public void testNodeTierParkRecoversASlotFreedBeforeItWasRetained() {
+        when(mockWorkloadManagementSettings.getWlmMode()).thenReturn(WlmMode.ENABLED);
+        mockWorkloadGroupsStateAccessor.addNewWorkloadGroup("wg-1");
+        when(mockThreadPool.executor(ThreadPool.Names.GENERIC)).thenReturn(OpenSearchExecutors.newDirectExecutorService());
+        stubClusterStateWithGroup(
+            queueingGroup(
+                "wg-1",
+                Settings.builder().put("node_limit", 1).build(),
+                queueOf(5),
+                MutableWorkloadGroupFragment.ResiliencyMode.ENFORCED
+            )
+        );
+        AtomicReference<Releasable> completesBeforeEnqueue = new AtomicReference<>();
+        WorkloadGroupQueueService queueService = new WorkloadGroupQueueService(mockThreadPool, mockWorkloadGroupsStateAccessor) {
+            @Override
+            boolean tryEnqueue(
+                String groupId,
+                String bucketKey,
+                WorkloadGroupTask task,
+                int sizePerBucket,
+                ActionListener<Releasable> listener
+            ) {
+                // The bucket's only in-flight request completes after this arrival's acquire failed but before it is
+                // retained: its close sees an empty queue and releases the slot to nobody.
+                Releasable completing = completesBeforeEnqueue.getAndSet(null);
+                if (completing != null) {
+                    completing.close();
+                }
+                return super.tryEnqueue(groupId, bucketKey, task, sizePerBucket, listener);
+            }
+        };
+        workloadGroupService.setQueueService(queueService);
+
+        Admission holder = admitOrPark("wg-1");
+        assertNotNull(holder.permit.get());
+        completesBeforeEnqueue.set(holder.permit.get());
+        Admission parked = admitOrPark("wg-1");
+        assertNotNull("a slot freed while the request was being parked must admit it at once", parked.permit.get());
+        assertEquals(0, queueService.retainedDepth("wg-1"));
+        assertEquals(1, mockWorkloadGroupsStateAccessor.getWorkloadGroupState("wg-1").getTotalQueued());
+
+        // The recovered slot is a real one: node_limit=1 still holds and the slot chains to the next waiter.
+        Admission next = admitOrPark("wg-1");
+        assertFalse(next.completed.get());
+        parked.permit.get().close();
+        assertNotNull(next.permit.get());
+        next.permit.get().close();
+        Admission afterDrain = admitOrPark("wg-1");
+        assertNotNull("the tracker slot is released once the queue empties", afterDrain.permit.get());
+        afterDrain.permit.get().close();
+    }
+
+    public void testNodePermitReleaseSkipsQueueWorkWhenOnlyAnotherBucketIsBacklogged() {
+        when(mockWorkloadManagementSettings.getWlmMode()).thenReturn(WlmMode.ENABLED);
+        mockWorkloadGroupsStateAccessor.addNewWorkloadGroup("wg-1");
+        when(mockThreadPool.executor(ThreadPool.Names.GENERIC)).thenReturn(OpenSearchExecutors.newDirectExecutorService());
+        stubClusterStateWithGroup(
+            queueingGroup(
+                "wg-1",
+                Settings.builder().put("by", "username").put("node_limit", 1).build(),
+                queueOf(5),
+                MutableWorkloadGroupFragment.ResiliencyMode.ENFORCED
+            )
+        );
+        List<String> queueWork = new ArrayList<>();
+        WorkloadGroupQueueService queueService = new WorkloadGroupQueueService(mockThreadPool, mockWorkloadGroupsStateAccessor) {
+            @Override
+            boolean handoffNodePermit(String groupId, String bucketKey, Releasable permit) {
+                queueWork.add(bucketKey);
+                return super.handoffNodePermit(groupId, bucketKey, permit);
+            }
+
+            @Override
+            boolean drainNode(String groupId, String bucketKey, Function<String, Releasable> nodeAcquire) {
+                queueWork.add(bucketKey);
+                return super.drainNode(groupId, bucketKey, nodeAcquire);
+            }
+        };
+        workloadGroupService.setQueueService(queueService);
+
+        Admission alice = admitOrPark("wg-1", "username|alice");
+        assertNotNull(alice.permit.get());
+        Admission aliceQueued = admitOrPark("wg-1", "username|alice");
+        assertFalse(aliceQueued.completed.get());
+        Admission bob = admitOrPark("wg-1", "username|bob");
+        assertNotNull(bob.permit.get());
+        queueWork.clear(); // the park's own drain attempt is not what this test measures
+
+        bob.permit.get().close();
+        assertEquals("a release in a bucket with no backlog does no queue work", List.of(), queueWork);
+
+        alice.permit.get().close();
+        assertEquals(List.of("wg-1:username:alice"), queueWork);
+        assertNotNull("alice's freed slot goes to her parked request", aliceQueued.permit.get());
+        aliceQueued.permit.get().close();
+        Admission fresh = admitOrPark("wg-1", "username|alice");
+        assertNotNull("the slot is released once alice's queue empties", fresh.permit.get());
+        fresh.permit.get().close();
+    }
+
+    public void testMonitorModeNeverParksEvenWhenQueueingIsEnabled() {
+        // MONITOR observes and always admits — it must never park a request (that would turn a dry run into a hang).
+        when(mockWorkloadManagementSettings.getWlmMode()).thenReturn(WlmMode.ENABLED);
+        mockWorkloadGroupsStateAccessor.addNewWorkloadGroup("wg-1");
+        WorkloadGroupQueueService queueService = newDirectQueueService();
+        stubClusterStateWithGroup(
+            queueingGroup(
+                "wg-1",
+                Settings.builder().put("node_limit", 1).build(),
+                queueOf(5),
+                MutableWorkloadGroupFragment.ResiliencyMode.MONITOR
+            )
+        );
+
+        assertNotNull(admitOrPark("wg-1").permit.get());
+        Admission observed = admitOrPark("wg-1");
+        assertTrue("MONITOR admits immediately", observed.completed.get());
+        assertNull(observed.permit.get());
+        assertEquals("a monitor-mode request must never be parked", 0, queueService.retainedDepth("wg-1"));
+        assertEquals(0, mockWorkloadGroupsStateAccessor.getWorkloadGroupState("wg-1").getTotalThrottled());
+        assertEquals(1, mockWorkloadGroupsStateAccessor.getWorkloadGroupState("wg-1").getTotalWouldThrottle());
+        assertEquals(
+            "MONITOR never queues, so the queue stats stay 0",
+            0,
+            mockWorkloadGroupsStateAccessor.getWorkloadGroupState("wg-1").getTotalQueued()
+        );
+        assertEquals(0, mockWorkloadGroupsStateAccessor.getWorkloadGroupState("wg-1").getTotalQueueRejections());
+    }
+
+    public void testMonitorModeNeverParksOnSharedTierWithQueueingEnabled() {
+        // The shared tier takes the ENQUEUE-FIRST path, which retains the request BEFORE asking the owner. That path is
+        // gated on MONITOR being off; without the gate a monitor-mode request would be held instead of observed.
+        when(mockWorkloadManagementSettings.getWlmMode()).thenReturn(WlmMode.ENABLED);
+        mockWorkloadGroupsStateAccessor.addNewWorkloadGroup("wg-1");
+        stubLocalSharedService(
+            queueingGroup(
+                "wg-1",
+                Settings.builder().put("node_limit", 1).put("shared_limit", 1).build(),
+                queueOf(5),
+                MutableWorkloadGroupFragment.ResiliencyMode.MONITOR
+            )
+        );
+        WorkloadGroupQueueService queueService = newDirectQueueService();
+
+        assertNotNull(admitOrPark("wg-1").permit.get()); // the local slot
+        assertNotNull(admitOrPark("wg-1").permit.get()); // the shared slot
+        Admission observed = admitOrPark("wg-1");
+        assertTrue(observed.completed.get());
+        assertNull("admitted untracked, never parked", observed.permit.get());
+        assertEquals("a monitor-mode request must never be parked on the shared tier", 0, queueService.retainedDepth("wg-1"));
+        assertEquals(0, mockWorkloadGroupsStateAccessor.getWorkloadGroupState("wg-1").getTotalThrottled());
+        assertEquals(1, mockWorkloadGroupsStateAccessor.getWorkloadGroupState("wg-1").getTotalWouldThrottle());
+        assertEquals(0, mockWorkloadGroupsStateAccessor.getWorkloadGroupState("wg-1").getTotalQueueRejections());
+    }
+
+    public void testSharedTierDenialParksAndOwnerPushAdmitsIt() {
+        // End to end on a local owner: a shared denial with queue room registers this node as a waiter and parks the
+        // request; releasing the shared permit pushes it a grant.
+        when(mockWorkloadManagementSettings.getWlmMode()).thenReturn(WlmMode.ENABLED);
+        mockWorkloadGroupsStateAccessor.addNewWorkloadGroup("wg-1");
+        WorkloadGroupSharedThrottleService sharedService = stubLocalSharedService(
+            queueingGroup(
+                "wg-1",
+                Settings.builder().put("shared_limit", 1).build(),
+                queueOf(5),
+                MutableWorkloadGroupFragment.ResiliencyMode.ENFORCED
+            )
+        );
+        WorkloadGroupQueueService queueService = newDirectQueueService();
+        sharedService.setQueueService(queueService);
+
+        Admission holder = admitOrPark("wg-1");
+        assertNotNull(holder.permit.get());
+        Admission parked = admitOrPark("wg-1");
+        assertFalse(parked.completed.get());
+        assertEquals(1, queueService.waitingDepth("wg-1"));
+        assertEquals(1, sharedService.waiterCount(groupBucket("wg-1")));
+
+        holder.permit.get().close();
+        assertNotNull("owner-push admitted the parked request", parked.permit.get());
+        assertTrue(parked.task.isThrottleCounted());
+        assertEquals(1, sharedService.tracker().inFlight(groupBucket("wg-1")));
+        assertEquals(0, mockWorkloadGroupsStateAccessor.getWorkloadGroupState("wg-1").getTotalThrottled());
+        parked.permit.get().close();
+        assertEquals(0, sharedService.tracker().inFlight(groupBucket("wg-1")));
+    }
+
+    public void testUnavailableSharedTierParksTheRequestWhileItsOwnerIsUnreachable() {
+        // With queueing on, an owner this coordinator is not connected to answers nothing, so the request parks instead of
+        // getting the unavailable 429, and a backstop pass that still cannot reach the owner leaves it parked.
+        when(mockWorkloadManagementSettings.getWlmMode()).thenReturn(WlmMode.ENABLED);
+        mockWorkloadGroupsStateAccessor.addNewWorkloadGroup("wg-1");
+        stubRemoteOwnerSharedService(MutableWorkloadGroupFragment.ResiliencyMode.ENFORCED);
+        WorkloadGroupQueueService queueService = newDirectQueueService();
+
+        Admission parked = admitOrPark("wg-1");
+        assertFalse("neither admitted nor rejected", parked.completed.get());
+        assertEquals(1, queueService.waitingDepth("wg-1"));
+        assertEquals(0, mockWorkloadGroupsStateAccessor.getWorkloadGroupState("wg-1").getTotalThrottled());
+
+        workloadGroupService.doRun(); // the mock clock reads 0, so the first backstop pass is due
+        assertFalse("a pass that cannot reach the owner leaves the request parked", parked.completed.get());
+        assertEquals(1, queueService.waitingDepth("wg-1"));
+        assertEquals(0, mockWorkloadGroupsStateAccessor.getWorkloadGroupState("wg-1").getTotalThrottled());
+    }
+
+    public void testUnavailableSharedTierInMonitorStillAdmitsWithAQueueConfigured() {
+        // MONITOR never parks: an owner this coordinator cannot reach is observed (would_throttle) and the request admitted.
+        when(mockWorkloadManagementSettings.getWlmMode()).thenReturn(WlmMode.ENABLED);
+        mockWorkloadGroupsStateAccessor.addNewWorkloadGroup("wg-1");
+        stubRemoteOwnerSharedService(MutableWorkloadGroupFragment.ResiliencyMode.MONITOR);
+        WorkloadGroupQueueService queueService = newDirectQueueService();
+
+        Admission observed = admitOrPark("wg-1");
+        assertTrue(observed.completed.get());
+        assertNull("admitted untracked", observed.permit.get());
+        assertNull(observed.failure.get());
+        assertEquals(0, queueService.retainedDepth("wg-1"));
+        assertEquals(1, mockWorkloadGroupsStateAccessor.getWorkloadGroupState("wg-1").getTotalWouldThrottle());
+        assertEquals(0, mockWorkloadGroupsStateAccessor.getWorkloadGroupState("wg-1").getTotalThrottled());
+    }
+
+    // A shared-only queueing group whose every bucket is owned by a remote data node this coordinator is not connected to.
+    private void stubRemoteOwnerSharedService(MutableWorkloadGroupFragment.ResiliencyMode mode) {
+        stubSharedService(
+            queueingGroup("wg-1", Settings.builder().put("shared_limit", 1).build(), queueOf(5), mode),
+            DiscoveryNodes.builder()
+                .add(node("local", Set.of()))
+                .add(node("owner", Set.of(DiscoveryNodeRole.DATA_ROLE)))
+                .localNodeId("local")
+                .build()
+        );
     }
 
     public void testAcquireThrottleReturnsNullWhenNodeLimitUnset() {

@@ -470,3 +470,151 @@
         name: "throttled"
 
   - match: { acknowledged: true }
+
+---
+"test queue field on the WorkloadGroup API":
+  - skip:
+      version: " - 3.9.99"
+      reason: "queueing was added to workload groups in 3.10"
+
+  - do:
+      cluster.put_settings:
+        flat_settings: true
+        body:
+          transient:
+            wlm.workload_group.mode: "enabled"
+
+  # create with a queue: size_per_bucket round-trips as a JSON number, not a string
+  - do:
+      create_workload_group_context:
+        body:
+          {
+            "name": "queued",
+            "resiliency_mode": "enforced",
+            "resource_limits": {
+              "cpu": 0.1
+            },
+            "throttling": {
+              "node_limit": 5
+            },
+            "queue": {
+              "size_per_bucket": 50
+            }
+          }
+
+  - match: { queue.size_per_bucket: 50 }
+  - match: { throttling.node_limit: 5 }
+
+  - do:
+      get_workload_group_context:
+        name: "queued"
+
+  - match: { workload_groups.0.queue.size_per_bucket: 50 }
+
+  # a partial update changes the queue and keeps throttling
+  - do:
+      update_workload_group_context:
+        name: "queued"
+        body:
+          {
+            "queue": {
+              "size_per_bucket": 7
+            }
+          }
+
+  - match: { queue.size_per_bucket: 7 }
+  - match: { throttling.node_limit: 5 }
+
+  - do:
+      catch: /queue.size_per_bucket must be non-negative/
+      update_workload_group_context:
+        name: "queued"
+        body:
+          {
+            "queue": {
+              "size_per_bucket": -1
+            }
+          }
+
+  - do:
+      catch: /queue.size_per_bucket must not exceed 1000/
+      update_workload_group_context:
+        name: "queued"
+        body:
+          {
+            "queue": {
+              "size_per_bucket": 1001
+            }
+          }
+
+  # there is no queue.timeout; a search bounds its wait with cancel_after_time_interval
+  - do:
+      catch: /Unknown queue setting/
+      update_workload_group_context:
+        name: "queued"
+        body:
+          {
+            "queue": {
+              "timeout": "30s"
+            }
+          }
+
+  # a per-key null clears size_per_bucket; the now-empty queue is omitted and throttling is untouched
+  - do:
+      update_workload_group_context:
+        name: "queued"
+        body:
+          {
+            "queue": {
+              "size_per_bucket": null
+            }
+          }
+
+  - is_false: queue
+  - match: { throttling.node_limit: 5 }
+
+  - do:
+      update_workload_group_context:
+        name: "queued"
+        body:
+          {
+            "queue": {
+              "size_per_bucket": 3
+            }
+          }
+
+  - match: { queue.size_per_bucket: 3 }
+
+  # clearing throttling keeps the (now inert) queue
+  - do:
+      update_workload_group_context:
+        name: "queued"
+        body:
+          {
+            "throttling": null
+          }
+
+  - is_false: throttling
+  - match: { queue.size_per_bucket: 3 }
+
+  # "queue": null clears all queue config
+  - do:
+      update_workload_group_context:
+        name: "queued"
+        body:
+          {
+            "queue": null
+          }
+
+  - do:
+      get_workload_group_context:
+        name: "queued"
+
+  - is_false: workload_groups.0.queue
+  - is_false: workload_groups.0.throttling
+
+  - do:
+      delete_workload_group_context:
+        name: "queued"
+
+  - match: { acknowledged: true }
