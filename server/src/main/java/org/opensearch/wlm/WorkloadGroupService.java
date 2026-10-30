@@ -682,20 +682,18 @@ public class WorkloadGroupService extends AbstractLifecycleComponent
         if (plan.sharedLimit() < 1) {
             // Node-only config with the local allowance exhausted: park the request until a node permit frees, if the
             // group queues and has room, else reject (or observe, in MONITOR).
-            if (tryParkNodeTierBreach(plan, task, listener) == false) {
-                deliverThrottleBreach(plan, false, task, listener);
-            }
+            parkOrRejectNodeTierBreach(plan, task, listener);
             return;
         }
         WorkloadGroupSharedThrottleService sharedService = sharedThrottleService;
         if (sharedService == null) {
             // Defensive (only test-built instances lack it): reject with the unavailable 429, even if the group queues.
             // Without the shared service no registration or grant could ever wake a parked request.
-            deliverThrottleBreach(plan, true, task, listener);
+            deliverThrottleBreach(plan, true, false, task, listener);
             return;
         }
         final WorkloadGroupQueueService qs = queueService;
-        // Intentional: MONITOR never parks (see tryParkNodeTierBreach), so it takes the unqueued path.
+        // Intentional: MONITOR never parks (see parkOrRejectNodeTierBreach), so it takes the unqueued path.
         if (qs != null && plan.queueSizePerBucket() > 0 && isMonitor(plan) == false) {
             acquireSharedPermitQueued(plan, task, sharedService, qs, listener);
             return;
@@ -704,25 +702,27 @@ public class WorkloadGroupService extends AbstractLifecycleComponent
     }
 
     // Shared-tier admission without retaining the request: a grant admits, while a denial or an acquire the shared tier
-    // could not answer rejects (or observes, in MONITOR). onThrottleBreach, if set, runs before either breach is delivered.
+    // could not answer rejects (or observes, in MONITOR). onQueueFull is set only when the group's queue had no room for
+    // this request: it runs before either breach is delivered, and the 429 then says the queue is full.
     private void acquireSharedPermitUnqueued(
         ThrottlePlan plan,
         WorkloadGroupTask task,
         WorkloadGroupSharedThrottleService sharedService,
-        @Nullable Runnable onThrottleBreach,
+        @Nullable Runnable onQueueFull,
         ActionListener<Releasable> listener
     ) {
         final boolean monitor = isMonitor(plan);
+        final boolean queueFull = onQueueFull != null;
         // MONITOR proceeds on every outcome, so the shared tier never delivers a search-pool rejection for it.
         sharedService.acquireAsync(plan.bucketKey(), plan.sharedLimit(), task.getId(), monitor, ActionListener.wrap(permit -> {
             task.setThrottleCounted(true);
             listener.onResponse(permit);
         }, e -> {
             if (WorkloadGroupSharedThrottleService.isDenial(e)) {
-                if (onThrottleBreach != null) {
-                    onThrottleBreach.run();
+                if (queueFull) {
+                    onQueueFull.run();
                 }
-                deliverThrottleBreach(plan, false, task, listener);
+                deliverThrottleBreach(plan, false, queueFull, task, listener);
             } else if (e instanceof OpenSearchRejectedExecutionException && monitor == false) {
                 // The search pool rejected the hand-off (permit already released): a real 429, not a throttle breach.
                 listener.onFailure(e);
@@ -732,10 +732,10 @@ public class WorkloadGroupService extends AbstractLifecycleComponent
                 if (WorkloadGroupSharedThrottleService.isUnavailable(e) == false) {
                     logger.debug(() -> "Shared throttle for workload group [" + task.getWorkloadGroupId() + "] failed", e);
                 }
-                if (onThrottleBreach != null) {
-                    onThrottleBreach.run();
+                if (queueFull) {
+                    onQueueFull.run();
                 }
-                deliverThrottleBreach(plan, true, task, listener);
+                deliverThrottleBreach(plan, true, queueFull, task, listener);
             }
         }));
     }
@@ -748,10 +748,10 @@ public class WorkloadGroupService extends AbstractLifecycleComponent
      * tier could not answer (owner not connected, acquire timeout, not_owner, transport failure, or any unexpected
      * failure). A registered denial is woken by the owner's pushed grant; for the others the next backstop pass registers
      * this coordinator with the bucket's owner (see {@link #sweepSharedWaiters}), which then offers any capacity already
-     * free. A refusal that does not fit gets the 429 it would get without a queue: the unavailable wording for an
-     * unanswered acquire, the normal breach wording for a denial. Every outcome targets that exact entry, so a delayed
-     * outcome is a no-op once an early pushed grant, a node-permit handoff, or cancellation has already claimed it, and
-     * can never complete a later request.
+     * free. A refusal that does not fit gets the 429 it would get without a queue (the unavailable wording for an
+     * unanswered acquire, the normal breach wording for a denial), which also says the queue is full. Every outcome
+     * targets that exact entry, so a delayed outcome is a no-op once an early pushed grant, a node-permit handoff, or
+     * cancellation has already claimed it, and can never complete a later request.
      * <p>
      * Fail-closed: a request is never admitted untracked because the shared tier could not answer. A search-pool rejection
      * of the hand-off is passed through as-is, like on the non-queueing path. The caller has already excluded MONITOR,
@@ -815,7 +815,7 @@ public class WorkloadGroupService extends AbstractLifecycleComponent
 
     // Moves the exact provisional request to WAITING: the only step that consumes queue.size_per_bucket, and the one that
     // counts it in total_queued. If the bucket's WAITING budget filled while the acquire was in flight, rejects this exact
-    // request with the 429 it would get without a queue (also counted as a queue rejection, not in total_queued), leaving
+    // request with the queue-full 429 (also counted as a queue rejection, not in total_queued), leaving
     // the existing waiters, and any owner registration of this coordinator, untouched. A stale outcome whose entry an
     // early pushed grant, a node-permit handoff or cancellation already removed is a no-op and must not count a throttle.
     private void parkPendingAcquire(
@@ -827,18 +827,19 @@ public class WorkloadGroupService extends AbstractLifecycleComponent
         ActionListener<Releasable> listener
     ) {
         if (qs.transitionPendingAcquireToWaiting(pending, plan.queueSizePerBucket()) == WorkloadGroupQueue.WaitingTransition.BUCKET_FULL) {
-            deliverThrottleBreach(plan, sharedUnavailable, task, listener);
+            deliverThrottleBreach(plan, sharedUnavailable, true, task, listener);
         }
     }
 
     private void deliverThrottleBreach(
         ThrottlePlan plan,
         boolean sharedUnavailable,
+        boolean queueFull,
         WorkloadGroupTask task,
         ActionListener<Releasable> listener
     ) {
         try {
-            onThrottleBreach(plan, sharedUnavailable, task);
+            onThrottleBreach(plan, sharedUnavailable, queueFull, task);
         } catch (OpenSearchRejectedExecutionException e) {
             listener.onFailure(e);
             return;
@@ -856,21 +857,24 @@ public class WorkloadGroupService extends AbstractLifecycleComponent
     // Intentional: MONITOR never parks or queues a request (a shared-tier one still waits for the owner's answer); it
     // observes (total_would_throttle) and
     // admits through deliverThrottleBreach, so the queue stats stay 0.
-    private boolean tryParkNodeTierBreach(ThrottlePlan plan, WorkloadGroupTask task, ActionListener<Releasable> listener) {
+    // A request that does not park gets the breach here: the queue-full wording if the group queues but had no room.
+    private void parkOrRejectNodeTierBreach(ThrottlePlan plan, WorkloadGroupTask task, ActionListener<Releasable> listener) {
         final WorkloadGroupQueueService qs = queueService;
         final String groupId = plan.workloadGroup().get_id();
-        if (qs == null
-            || plan.queueSizePerBucket() <= 0
-            || isMonitor(plan)
-            || qs.tryEnqueue(groupId, plan.bucketKey(), task, plan.queueSizePerBucket(), listener) == false) {
-            return false;
+        if (qs == null || plan.queueSizePerBucket() <= 0 || isMonitor(plan)) {
+            deliverThrottleBreach(plan, false, false, task, listener);
+            return;
+        }
+        if (qs.tryEnqueue(groupId, plan.bucketKey(), task, plan.queueSizePerBucket(), listener) == false) {
+            // Queueing is enabled (checked above), so a refusal means the bucket or group queue is full.
+            deliverThrottleBreach(plan, false, true, task, listener);
+            return;
         }
         // Closes the deny-then-park race, the node-tier twin of the shared owner's offerIfReleasedBeforeRegistration: a
         // completion that freed its slot after this request's acquire failed, but before the request was retained, saw an
         // empty queue and released the slot to nobody. Retry once now that the request is visible; like the sweep, this
         // admits the bucket head only against a slot it actually acquires, so it can never over-admit.
         sweepDrainNode(groupId, plan.bucketKey());
-        return true;
     }
 
     private static boolean isMonitor(ThrottlePlan plan) {
@@ -968,7 +972,8 @@ public class WorkloadGroupService extends AbstractLifecycleComponent
         // Otherwise shared tier only: owner push, re-confirmed by sweepSharedWaiters, admits the bucket.
     }
 
-    private void onThrottleBreach(ThrottlePlan plan, boolean sharedUnavailable, WorkloadGroupTask task) {
+    // queueFull: the group queues, but its queue had no room for this request (never true in MONITOR, which never parks).
+    private void onThrottleBreach(ThrottlePlan plan, boolean sharedUnavailable, boolean queueFull, WorkloadGroupTask task) {
         if (plan.workloadGroup().getResiliencyMode() == MutableWorkloadGroupFragment.ResiliencyMode.MONITOR) {
             if (logger.isDebugEnabled()) {
                 logger.debug("Request would be throttled (monitor mode, not rejected): {}.", throttleDescription(plan, sharedUnavailable));
@@ -978,7 +983,10 @@ public class WorkloadGroupService extends AbstractLifecycleComponent
             return;
         }
         recordThrottleStat(plan.workloadGroup().get_id(), false);
-        throw new OpenSearchRejectedExecutionException("Request throttled: " + throttleDescription(plan, sharedUnavailable) + ".");
+        final String queueSuffix = queueFull ? ", and its request queue is full" : "";
+        throw new OpenSearchRejectedExecutionException(
+            "Request throttled: " + throttleDescription(plan, sharedUnavailable) + queueSuffix + "."
+        );
     }
 
     private static String throttleDescription(ThrottlePlan plan, boolean sharedUnavailable) {
