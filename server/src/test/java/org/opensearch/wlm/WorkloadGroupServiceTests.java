@@ -983,7 +983,7 @@ public class WorkloadGroupServiceTests extends OpenSearchTestCase {
         assertNotNull("the slot is released once the queue is empty", admitOrPark("wg-1").permit.get());
     }
 
-    public void testNodeTierQueueFullRejectsWithTheThrottleMessage() {
+    public void testNodeTierQueueFullRejectsWithTheQueueFullMessage() {
         when(mockWorkloadManagementSettings.getWlmMode()).thenReturn(WlmMode.ENABLED);
         mockWorkloadGroupsStateAccessor.addNewWorkloadGroup("wg-1");
         WorkloadGroupQueueService queueService = newDirectQueueService();
@@ -1001,11 +1001,32 @@ public class WorkloadGroupServiceTests extends OpenSearchTestCase {
         Admission rejected = admitOrPark("wg-1");
         assertTrue(rejected.failure.get() instanceof OpenSearchRejectedExecutionException);
         assertEquals(
-            "Request throttled: workload group [wg-1-name] reached its per-node limit of 1 concurrent requests.",
+            "Request throttled: workload group [wg-1-name] reached its per-node limit of 1 concurrent requests, "
+                + "and its request queue is full.",
             rejected.failure.get().getMessage()
         );
         assertEquals(1, queueService.waitingDepth("wg-1"));
         assertEquals(1, mockWorkloadGroupsStateAccessor.getWorkloadGroupState("wg-1").getTotalQueueRejections());
+        assertEquals(1, mockWorkloadGroupsStateAccessor.getWorkloadGroupState("wg-1").getTotalThrottled());
+    }
+
+    // shared_limit 0 is explicit but disables the shared tier: the 429 names only the node tier, and with no queue
+    // configured it says nothing about a queue.
+    public void testNodeOnlyGroupWithExplicitZeroSharedLimitRejectsWithThePerNodeMessage() {
+        when(mockWorkloadManagementSettings.getWlmMode()).thenReturn(WlmMode.ENABLED);
+        mockWorkloadGroupsStateAccessor.addNewWorkloadGroup("wg-1");
+        newDirectQueueService();
+        stubLocalSharedService(throttledGroup("wg-1", Settings.builder().put("node_limit", 2).put("shared_limit", 0).build()));
+
+        assertNotNull(admitOrPark("wg-1").permit.get());
+        assertNotNull(admitOrPark("wg-1").permit.get());
+        Admission rejected = admitOrPark("wg-1");
+        assertTrue(rejected.failure.get() instanceof OpenSearchRejectedExecutionException);
+        assertEquals(
+            "Request throttled: workload group [wg-1-name] reached its per-node limit of 2 concurrent requests.",
+            rejected.failure.get().getMessage()
+        );
+        assertEquals(0, mockWorkloadGroupsStateAccessor.getWorkloadGroupState("wg-1").getTotalQueueRejections());
         assertEquals(1, mockWorkloadGroupsStateAccessor.getWorkloadGroupState("wg-1").getTotalThrottled());
     }
 

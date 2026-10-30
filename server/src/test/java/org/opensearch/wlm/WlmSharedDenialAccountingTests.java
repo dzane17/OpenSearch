@@ -57,6 +57,13 @@ public class WlmSharedDenialAccountingTests extends OpenSearchTestCase {
 
     private static final String GROUP = "wg-shared";
     private static final String BUCKET = GROUP + ":group:group";
+    private static final String QUEUE_FULL_DENIAL = "Request throttled: workload group ["
+        + GROUP
+        + "-name] reached its shared limit of 1 concurrent requests, and its request queue is full.";
+    private static final String QUEUE_FULL_UNAVAILABLE = "Request throttled: workload group ["
+        + GROUP
+        + "-name] could not check its shared limit of 1 concurrent requests (cluster-wide throttle unavailable), "
+        + "and its request queue is full.";
 
     private ClusterService mockClusterService;
     private ThreadPool mockThreadPool;
@@ -333,7 +340,8 @@ public class WlmSharedDenialAccountingTests extends OpenSearchTestCase {
 
     /**
      * An unavailable outcome that finds the bucket's waiting budget full gets the unavailable 429 it would get without a
-     * queue, counted as a queue rejection, and leaves the request already waiting there untouched.
+     * queue, which also says the queue is full, counted as a queue rejection, and leaves the request already waiting
+     * there untouched.
      */
     public void testUnavailableSharedTierWithAFullBucketRejectsWithTheUnavailable429() {
         stubAcquire((listener, noWaiter) -> listener.onFailure(WorkloadGroupSharedThrottleService.unavailableMarker()));
@@ -343,13 +351,7 @@ public class WlmSharedDenialAccountingTests extends OpenSearchTestCase {
         Outcome rejected = request();
         assertEquals(1, rejected.failed.get());
         assertTrue(rejected.failure.get() instanceof OpenSearchRejectedExecutionException);
-        assertEquals(
-            "Request throttled: workload group ["
-                + GROUP
-                + "-name] could not check its shared limit of 1 concurrent requests "
-                + "(cluster-wide throttle unavailable).",
-            rejected.failure.get().getMessage()
-        );
+        assertEquals(QUEUE_FULL_UNAVAILABLE, rejected.failure.get().getMessage());
         assertEquals(1, state().getTotalQueueRejections());
         assertEquals(1, state().getTotalThrottled());
         assertEquals("only the request that entered WAITING is counted, not the refusal", 1, state().getTotalQueued());
@@ -528,6 +530,8 @@ public class WlmSharedDenialAccountingTests extends OpenSearchTestCase {
 
         assertEquals(0, first.admitted.get() + first.failed.get());
         assertEquals(1, second.failed.get());
+        assertTrue(second.failure.get() instanceof OpenSearchRejectedExecutionException);
+        assertEquals(QUEUE_FULL_DENIAL, second.failure.get().getMessage());
         assertEquals(1, queueService.waitingDepth(GROUP));
         assertEquals(1, queueService.retainedDepth(GROUP));
         assertEquals(1, state().getTotalQueueRejections());
@@ -537,7 +541,7 @@ public class WlmSharedDenialAccountingTests extends OpenSearchTestCase {
 
     /**
      * Unregistered denials consume the bucket's waiting budget exactly like registered ones: the first parks, and once
-     * the bucket is full each further one gets the normal shared-limit 429, counted once as a throttle and a queue
+     * the bucket is full each further one gets the queue-full shared-limit 429, counted once as a throttle and a queue
      * rejection, with no double count and no extra parked request.
      */
     public void testUnregisteredDenialsParkUpToTheBucketCapThenGetTheBreach429() {
@@ -548,7 +552,7 @@ public class WlmSharedDenialAccountingTests extends OpenSearchTestCase {
         for (int i = 1; i <= 4; i++) {
             Outcome o = request();
             assertEquals("request " + i + " must be failed", 1, o.failed.get());
-            assertTrue(o.failure.get().getMessage(), o.failure.get().getMessage().contains("reached its shared limit of 1"));
+            assertEquals(QUEUE_FULL_DENIAL, o.failure.get().getMessage());
             assertEquals("only the first request is parked", 1, queueService.waitingDepth(GROUP));
             assertEquals("one throttle per refused request", i, state().getTotalThrottled());
             assertEquals("one queue rejection per refused request", i, state().getTotalQueueRejections());
@@ -609,21 +613,24 @@ public class WlmSharedDenialAccountingTests extends OpenSearchTestCase {
         assertEquals(0, state().getTotalThrottled());
     }
 
-    /** With the ceiling full, a real shared denial rejects, counted as both a throttle and a queue rejection. */
+    /**
+     * With the ceiling full, a real shared denial rejects with the queue-full 429, counted as both a throttle and a queue
+     * rejection.
+     */
     public void testFullRetainedCeilingRejectsARealDenial() {
         fillRetainedCeilingWithOtherBuckets();
         stubUnqueuedAcquire(listener -> listener.onFailure(WorkloadGroupSharedThrottleService.deniedMarker()));
 
         Outcome o = request();
         assertEquals(1, o.failed.get());
-        assertTrue(o.failure.get().getMessage(), o.failure.get().getMessage().contains("shared limit of 1"));
+        assertEquals(QUEUE_FULL_DENIAL, o.failure.get().getMessage());
         assertEquals(1, state().getTotalQueueRejections());
         assertEquals(1, state().getTotalThrottled());
     }
 
     /**
-     * With the ceiling full, an unavailable shared tier cannot park the request, so it still gets the unavailable 429,
-     * counted as a queue rejection like a denial that could not be queued.
+     * With the ceiling full, an unavailable shared tier cannot park the request, so it still gets the unavailable 429
+     * (which also says the queue is full), counted as a queue rejection like a denial that could not be queued.
      */
     public void testFullRetainedCeilingRejectsAnUnavailableOutcomeWithTheUnavailable429() {
         fillRetainedCeilingWithOtherBuckets();
@@ -632,7 +639,7 @@ public class WlmSharedDenialAccountingTests extends OpenSearchTestCase {
         Outcome o = request();
         assertEquals(0, o.admitted.get());
         assertEquals(1, o.failed.get());
-        assertTrue(o.failure.get().getMessage(), o.failure.get().getMessage().contains("cluster-wide throttle unavailable"));
+        assertEquals(QUEUE_FULL_UNAVAILABLE, o.failure.get().getMessage());
         assertEquals("it would have parked had it fit", 1, state().getTotalQueueRejections());
         assertEquals(1, state().getTotalThrottled());
     }
@@ -645,7 +652,12 @@ public class WlmSharedDenialAccountingTests extends OpenSearchTestCase {
         Outcome o = request();
         assertEquals(0, o.admitted.get());
         assertEquals(1, o.failed.get());
-        assertTrue(o.failure.get().getMessage(), o.failure.get().getMessage().contains("cluster-wide throttle unavailable"));
+        assertEquals(
+            "Request throttled: workload group ["
+                + GROUP
+                + "-name] could not check its shared limit of 1 concurrent requests (cluster-wide throttle unavailable).",
+            o.failure.get().getMessage()
+        );
         assertEquals(0, queueService.retainedDepth(GROUP));
         assertEquals("queueing is off, so this is no queue rejection", 0, state().getTotalQueueRejections());
         assertEquals(1, state().getTotalThrottled());

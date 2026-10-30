@@ -255,12 +255,13 @@ public class WlmQueueingIT extends OpenSearchIntegTestCase {
 
             long queueRejectionsBefore = getQueueRejections(workloadGroupId);
 
-            // Third concurrent search: permit taken, queue full -> the throttle 429, worded exactly as without queueing.
+            // Third concurrent search: permit taken, queue full -> the throttle 429, naming the full queue.
             Throwable rejection = expectThrows(Throwable.class, () -> blockingSearch(indexName).execute().actionGet(TIMEOUT));
             OpenSearchRejectedExecutionException cause = rejectedExecutionCause(rejection);
             assertNotNull("Expected an OpenSearchRejectedExecutionException in the cause chain but was: " + rejection, cause);
             assertEquals(
-                "Request throttled: workload group [queuefull_test_group] reached its per-node limit of 1 concurrent requests.",
+                "Request throttled: workload group [queuefull_test_group] reached its per-node limit of 1 concurrent requests, "
+                    + "and its request queue is full.",
                 cause.getMessage()
             );
             assertEquals(
