@@ -876,6 +876,29 @@ public class WorkloadGroupQueueServiceTests extends OpenSearchTestCase {
         assertFalse("a released request no longer waits", service.isWaiting(otherGroupTask.getId()));
     }
 
+    public void testIsWaitingInAGroupAsksOnlyThatGroupsQueue() throws Exception {
+        stateAccessor.addNewWorkloadGroup("g2");
+        SearchTask admittedTask = task();
+        SearchTask cancelledTask = task();
+        AtomicReference<Exception> evicted = new AtomicReference<>();
+        assertTrue(service.tryEnqueue("g1", "g1:group", admittedTask, 5, ActionListener.wrap(p -> {}, e -> {})));
+        assertTrue(service.tryEnqueue("g1", "g1:group", cancelledTask, 5, ActionListener.wrap(p -> {}, evicted::set)));
+        assertTrue(service.tryEnqueue("g2", "g2:group", task(), 5, ActionListener.wrap(p -> {}, e -> {})));
+
+        assertTrue(service.isWaiting("g1", admittedTask.getId()));
+        assertTrue(service.isWaiting("g1", cancelledTask.getId()));
+        assertFalse("the same task id under another group is not waiting", service.isWaiting("g2", admittedTask.getId()));
+        assertFalse("a group with no queue is not asked", service.isWaiting("unknown", admittedTask.getId()));
+
+        assertEquals("a grant admits the oldest", OptionalLong.of(admittedTask.getId()), service.admitWithPermit("g1:group", () -> {}));
+        assertFalse("an admitted request no longer waits", service.isWaiting("g1", admittedTask.getId()));
+        assertTrue(service.isWaiting("g1", cancelledTask.getId()));
+
+        cancelledTask.cancel("client disconnected");
+        assertBusy(() -> assertTrue(evicted.get() instanceof TaskCancelledException));
+        assertFalse("an evicted request no longer waits", service.isWaiting("g1", cancelledTask.getId()));
+    }
+
     public void testHasRetainedRequestsCoversEveryGroupAndEveryExit() {
         assertFalse("nothing retained yet", service.hasRetainedRequests());
         SearchTask cancelled = task();

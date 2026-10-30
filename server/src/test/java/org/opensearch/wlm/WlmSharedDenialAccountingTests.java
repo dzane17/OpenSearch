@@ -494,6 +494,32 @@ public class WlmSharedDenialAccountingTests extends OpenSearchTestCase {
         assertEquals(0, state().getTotalThrottled());
     }
 
+    /** Only a WAITING request is queued: one still awaiting the owner's first answer (PENDING_ACQUIRE) is not. */
+    public void testIsQueuedIsFalseWhilePendingAcquireAndTrueOnceADenialMovesItToWaiting() {
+        List<ActionListener<Releasable>> ownerReplies = new ArrayList<>();
+        doAnswer(inv -> {
+            @SuppressWarnings("unchecked")
+            ActionListener<Releasable> listener = (ActionListener<Releasable>) inv.getArgument(4);
+            ownerReplies.add(listener);
+            return null;
+        }).when(mockShared).acquireAsync(anyString(), anyInt(), anyLong(), anyBoolean(), any(), any());
+
+        Outcome o = request();
+        assertEquals(1, ownerReplies.size());
+        assertEquals("the request is retained as PENDING_ACQUIRE", 1, queueService.retainedDepth(GROUP));
+        assertEquals(0, queueService.waitingDepth(GROUP));
+        assertFalse("a PENDING_ACQUIRE request is not queued", service.isQueued(GROUP, o.task.getId()));
+
+        ownerReplies.get(0).onFailure(WorkloadGroupSharedThrottleService.deniedMarker());
+        assertEquals("the request must stay parked, not completed", 0, o.admitted.get() + o.failed.get());
+        assertEquals(1, queueService.waitingDepth(GROUP));
+        assertTrue("a denial moves it to WAITING, so it is queued", service.isQueued(GROUP, o.task.getId()));
+
+        assertTrue(queueService.admitWithPermit(BUCKET, () -> {}).isPresent());
+        assertEquals(1, o.admitted.get());
+        assertFalse("an admitted request is no longer queued", service.isQueued(GROUP, o.task.getId()));
+    }
+
     /** An early pushed grant followed by the original registered denial response completes the request exactly once. */
     public void testPushedGrantBeforeRegisteredDenialResponseMakesDenialNoOp() {
         stubAcquire((listener, noWaiter) -> {

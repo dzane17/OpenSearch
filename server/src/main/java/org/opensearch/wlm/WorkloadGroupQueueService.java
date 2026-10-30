@@ -403,6 +403,15 @@ public class WorkloadGroupQueueService {
     }
 
     /**
+     * Whether the task {@code taskId} has a request WAITING in group {@code groupId}'s queue on this coordinator. One
+     * lookup, lock-free, so a racing admission or eviction can change it at once. A PENDING_ACQUIRE request is not WAITING.
+     */
+    boolean isWaiting(String groupId, long taskId) {
+        final WorkloadGroupQueue queue = queuesByGroup.get(groupId);
+        return queue != null && queue.hasWaitingTask(taskId);
+    }
+
+    /**
      * Snapshot of every bucket on this coordinator that currently retains at least one PENDING_ACQUIRE or WAITING
      * request. Used only after an owner-ring change: the shared throttle service compares each bucket's previous and
      * current owner and re-registers demand that moved.
