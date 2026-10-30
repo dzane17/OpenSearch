@@ -864,7 +864,11 @@ public class WorkloadGroupServiceTests extends OpenSearchTestCase {
     }
 
     private WorkloadGroupTask throttleTask(String workloadGroupId) {
-        WorkloadGroupTask task = new WorkloadGroupTask(1L, "transport", "Search", "test task", TaskId.EMPTY_TASK_ID, Map.of());
+        return throttleTask(workloadGroupId, 1L);
+    }
+
+    private WorkloadGroupTask throttleTask(String workloadGroupId, long taskId) {
+        WorkloadGroupTask task = new WorkloadGroupTask(taskId, "transport", "Search", "test task", TaskId.EMPTY_TASK_ID, Map.of());
         ThreadContext threadContext = new ThreadContext(Settings.EMPTY);
         threadContext.putHeader(WorkloadGroupTask.WORKLOAD_GROUP_ID_HEADER, workloadGroupId);
         task.setWorkloadGroupId(threadContext);
@@ -938,8 +942,13 @@ public class WorkloadGroupServiceTests extends OpenSearchTestCase {
     }
 
     private Admission admitOrPark(String workloadGroupId, String principal) {
-        Admission admission = new Admission(throttleTask(workloadGroupId));
-        admission.task.setThrottlePrincipal(principal);
+        WorkloadGroupTask task = throttleTask(workloadGroupId);
+        task.setThrottlePrincipal(principal);
+        return admitOrPark(task);
+    }
+
+    private Admission admitOrPark(WorkloadGroupTask task) {
+        Admission admission = new Admission(task);
         workloadGroupService.acquireThrottlePermit(admission.task, () -> false, ActionListener.wrap(p -> {
             admission.permit.set(p);
             admission.completed.set(true);
@@ -1008,6 +1017,38 @@ public class WorkloadGroupServiceTests extends OpenSearchTestCase {
         assertEquals(1, queueService.waitingDepth("wg-1"));
         assertEquals(1, mockWorkloadGroupsStateAccessor.getWorkloadGroupState("wg-1").getTotalQueueRejections());
         assertEquals(1, mockWorkloadGroupsStateAccessor.getWorkloadGroupState("wg-1").getTotalThrottled());
+    }
+
+    public void testIsQueuedIsTrueOnlyWhileANodeTierDeniedSearchIsParked() {
+        when(mockWorkloadManagementSettings.getWlmMode()).thenReturn(WlmMode.ENABLED);
+        mockWorkloadGroupsStateAccessor.addNewWorkloadGroup("wg-1");
+        newDirectQueueService();
+        stubClusterStateWithGroup(
+            queueingGroup(
+                "wg-1",
+                Settings.builder().put("node_limit", 1).build(),
+                queueOf(5),
+                MutableWorkloadGroupFragment.ResiliencyMode.ENFORCED
+            )
+        );
+
+        Admission holder = admitOrPark(throttleTask("wg-1", 1L));
+        assertNotNull(holder.permit.get());
+        assertFalse("a running request is not queued", workloadGroupService.isQueued("wg-1", 1L));
+        Admission parked = admitOrPark(throttleTask("wg-1", 2L));
+        assertFalse(parked.completed.get());
+        assertTrue("a node-tier-denied search that parked is queued", workloadGroupService.isQueued("wg-1", 2L));
+        assertFalse("the wrong group id is not asked", workloadGroupService.isQueued("wg-2", 2L));
+        assertFalse("a task with no group id is not queued", workloadGroupService.isQueued(null, 2L));
+
+        holder.permit.get().close();
+        assertNotNull("the freed permit admits the parked request", parked.permit.get());
+        assertFalse("an admitted request is no longer queued", workloadGroupService.isQueued("wg-1", 2L));
+        parked.permit.get().close();
+    }
+
+    public void testIsQueuedIsFalseWithoutAQueueService() {
+        assertFalse(workloadGroupService.isQueued("wg-1", 1L));
     }
 
     // shared_limit 0 is explicit but disables the shared tier: the 429 names only the node tier, and with no queue

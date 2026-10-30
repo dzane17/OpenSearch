@@ -18,6 +18,7 @@ import org.opensearch.cluster.metadata.Metadata;
 import org.opensearch.cluster.metadata.WorkloadGroup;
 import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.Nullable;
+import org.opensearch.common.annotation.InternalApi;
 import org.opensearch.common.lease.Releasable;
 import org.opensearch.common.lifecycle.AbstractLifecycleComponent;
 import org.opensearch.common.settings.Setting;
@@ -616,6 +617,22 @@ public class WorkloadGroupService extends AbstractLifecycleComponent
      */
     public void setQueueService(WorkloadGroupQueueService queueService) {
         this.queueService = queueService;
+    }
+
+    /**
+     * Whether the search task {@code taskId}, coordinated by this node, is parked in workload group
+     * {@code workloadGroupId}'s request queue waiting for a throttle permit. Only a request that was refused a permit and
+     * fit the queue counts; one still awaiting the shared tier owner's first answer does not. A point-in-time answer that
+     * a racing admission or cancellation can change at once. For monitoring callers such as Query Insights live queries.
+     *
+     * @param workloadGroupId the task's workload group id
+     * @param taskId the coordinator-local search task id
+     * @return {@code true} if the task is queued, {@code false} otherwise, including when queueing is not set up
+     */
+    @InternalApi
+    public boolean isQueued(String workloadGroupId, long taskId) {
+        final WorkloadGroupQueueService qs = queueService;
+        return qs != null && workloadGroupId != null && qs.isWaiting(workloadGroupId, taskId);
     }
 
     /**
