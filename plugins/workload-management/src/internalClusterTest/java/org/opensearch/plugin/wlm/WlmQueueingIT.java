@@ -313,7 +313,10 @@ public class WlmQueueingIT extends OpenSearchIntegTestCase {
             final long parkedSearchMillis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - parkedSubmittedNanos);
             Throwable cancelled = ExceptionsHelper.unwrap(failure, TaskCancelledException.class);
             assertNotNull("Expected a TaskCancelledException in the cause chain but was: " + failure, cancelled);
-            assertEquals("task cancelled while queued", cancelled.getMessage());
+            assertEquals(
+                "cancelled task while waiting for a WLM throttle permit, with reason: Cancellation timeout of 10s is expired",
+                cancelled.getMessage()
+            );
             // The first search still holds the only permit, so only the task-cancellation callback can have completed the
             // parked search (a freed permit would fail it with the same message via admit's cancellation re-check).
             assertFalse("the first search must still hold the only permit", firstBlocked.isDone());

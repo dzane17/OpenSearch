@@ -1135,7 +1135,7 @@ public class WorkloadGroupServiceTests extends OpenSearchTestCase {
 
         page.task.cancel("client gone");
         assertTrue(page.failure.get() instanceof TaskCancelledException);
-        assertEquals("task cancelled while queued", page.failure.get().getMessage());
+        assertEquals("cancelled task while waiting for a WLM throttle permit, with reason: client gone", page.failure.get().getMessage());
         assertNull("an evicted page never runs", page.running.get());
         assertEquals(0, queueService.retainedDepth("wg-1"));
         assertEquals(

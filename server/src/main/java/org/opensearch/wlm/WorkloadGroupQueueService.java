@@ -235,7 +235,7 @@ public class WorkloadGroupQueueService {
         req.releaseCancellationHandle();
         if (req.task().isCancelled()) {
             permit.close();
-            req.listener().onFailure(new TaskCancelledException("task cancelled while queued"));
+            req.listener().onFailure(cancelledWhileQueued(req.task()));
         } else {
             req.task().setThrottleCounted(true);
             req.listener().onResponse(permit);
@@ -581,7 +581,7 @@ public class WorkloadGroupQueueService {
         threadPool.executor(ThreadPool.Names.GENERIC).execute(() -> {
             if (req.task().isCancelled()) {
                 permit.close();
-                req.listener().onFailure(new TaskCancelledException("task cancelled while queued"));
+                req.listener().onFailure(cancelledWhileQueued(req.task()));
                 return;
             }
             if (tracked) {
@@ -618,8 +618,17 @@ public class WorkloadGroupQueueService {
         if (wasWaiting) {
             recordQueueWait(groupId, TimeUnit.NANOSECONDS.toMillis(req.waitNanos(threadPool.preciseRelativeTimeInNanos())));
         }
-        threadPool.executor(ThreadPool.Names.GENERIC)
-            .execute(() -> req.listener().onFailure(new TaskCancelledException("task cancelled while queued")));
+        threadPool.executor(ThreadPool.Names.GENERIC).execute(() -> req.listener().onFailure(cancelledWhileQueued(req.task())));
+    }
+
+    // Queue wait is ordinary request time, so the message carries the task's own reason (a cancel_after_time_interval expiry,
+    // a tasks API cancel, or a parent cancellation), and says only where the request was: a retained request never reached
+    // a shard phase, so nothing else tells the client it was still waiting for a throttle permit. "Permit", not "queue",
+    // also covers a request still awaiting the shared tier owner's first answer.
+    private static TaskCancelledException cancelledWhileQueued(WorkloadGroupTask task) {
+        return new TaskCancelledException(
+            "cancelled task while waiting for a WLM throttle permit, with reason: " + task.getReasonCancelled()
+        );
     }
 
     private static boolean hasRetainedRequest(WorkloadGroupQueue queue, String bucketKey) {
