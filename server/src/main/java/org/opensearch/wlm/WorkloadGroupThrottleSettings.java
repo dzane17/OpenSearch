@@ -10,17 +10,25 @@ package org.opensearch.wlm;
 
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
+import org.opensearch.OpenSearchStatusException;
+import org.opensearch.cluster.ClusterState;
+import org.opensearch.cluster.metadata.WorkloadGroup;
+import org.opensearch.cluster.node.DiscoveryNode;
+import org.opensearch.cluster.node.DiscoveryNodes;
 import org.opensearch.common.Nullable;
 import org.opensearch.common.annotation.ExperimentalApi;
 import org.opensearch.common.settings.Setting;
 import org.opensearch.common.settings.Settings;
+import org.opensearch.core.rest.RestStatus;
 import org.opensearch.core.xcontent.XContentParser;
 
 import java.io.IOException;
 import java.math.BigInteger;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.Comparator;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -72,6 +80,18 @@ public class WorkloadGroupThrottleSettings {
         .collect(Collectors.toUnmodifiableMap(ThrottleAttribute::key, attribute -> attribute));
 
     private static final Set<String> RULE_FIELDS = Set.of(NODE_LIMIT.getKey(), SHARED_LIMIT.getKey());
+
+    /**
+     * Node attribute ({@code node.attr.wlm_multi_attribute_throttling: true}) set automatically by every build that
+     * supports throttling rules for several attributes, i.e. reads the throttling format keyed by attribute; see
+     * {@code Node}. Never set by users. Rolling a node back in place to such a build is only safe while every group has
+     * at most one rule: a multi-rule group is persisted in the keyed form, which that build cannot load from disk. Earlier builds of this feature know only the flat {@code {attribute, node_limit,
+     * shared_limit}} form, cannot deserialize a keyed config, and report the same {@link org.opensearch.Version}, so the
+     * attribute is the only way to tell them apart. Until every node has it: single-rule groups go to the wire and to disk
+     * in the flat form (see {@link #toLegacyFlat}), multi-rule groups are rejected (see {@link #validateSupportedByCluster}),
+     * and {@code role} resolves to the caller's first role as on those builds (see {@link ThrottleAttribute#resolve}).
+     */
+    public static final String MULTI_ATTRIBUTE_THROTTLING_NODE_ATTRIBUTE = "wlm_multi_attribute_throttling";
 
     private WorkloadGroupThrottleSettings() {
         throw new UnsupportedOperationException("Utility class");
@@ -148,6 +168,187 @@ public class WorkloadGroupThrottleSettings {
         return shape;
     }
 
+    /** Whether {@code node} supports multi-attribute throttling (see {@link #MULTI_ATTRIBUTE_THROTTLING_NODE_ATTRIBUTE}). */
+    public static boolean supportsMultiAttributeThrottling(DiscoveryNode node) {
+        return Boolean.parseBoolean(node.getAttributes().get(MULTI_ATTRIBUTE_THROTTLING_NODE_ATTRIBUTE));
+    }
+
+    /** Whether every node in {@code nodes} supports multi-attribute throttling. */
+    public static boolean allSupportMultiAttributeThrottling(DiscoveryNodes nodes) {
+        for (DiscoveryNode node : nodes) {
+            if (supportsMultiAttributeThrottling(node) == false) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /**
+     * Whether a config needs every node to support multi-attribute throttling: it is non-empty and has no flat
+     * single-rule form ({@link #toLegacyFlat}) that nodes on an older build could read, e.g. it has several rules. The one test the write gate, the
+     * join check and the stored form all use, so they cannot disagree.
+     */
+    public static boolean requiresMultiAttributeSupport(@Nullable Settings throttling) {
+        return throttling != null && throttling.isEmpty() == false && toLegacyFlat(throttling) == null;
+    }
+
+    /**
+     * Rejects a config that nodes in {@code nodes} could not read (see {@link #requiresMultiAttributeSupport}), such as one with
+     * several rules, while any node runs a build that only knows the flat single-rule form. A single-rule config is
+     * always accepted, since it is sent to those nodes in the flat form.
+     *
+     * @throws IllegalArgumentException if the config needs the keyed form and some node does not support it
+     */
+    public static void validateSupportedByCluster(@Nullable Settings throttling, DiscoveryNodes nodes) {
+        if (requiresMultiAttributeSupport(throttling) == false) {
+            return;
+        }
+        List<String> unsupported = new ArrayList<>();
+        for (DiscoveryNode node : nodes) {
+            if (supportsMultiAttributeThrottling(node) == false) {
+                unsupported.add(node.getName());
+            }
+        }
+        if (unsupported.isEmpty() == false) {
+            Collections.sort(unsupported);
+            throw new IllegalArgumentException(
+                "this throttling config (for example one with more than one rule) needs every node to run a build that supports it; "
+                    + unsupported.size()
+                    + " node(s) do not: "
+                    + (unsupported.size() > 10 ? unsupported.subList(0, 10) + " ..." : unsupported)
+                    + ". Finish upgrading those nodes, or use a single rule until then"
+            );
+        }
+    }
+
+    /** Whether the elected cluster manager in {@code nodes} runs a build that predates multi-attribute throttling. */
+    public static boolean clusterManagerPredatesMultiAttributeThrottling(DiscoveryNodes nodes) {
+        final DiscoveryNode clusterManager = nodes.getClusterManagerNode();
+        return clusterManager != null && supportsMultiAttributeThrottling(clusterManager) == false;
+    }
+
+    /**
+     * Coordinator-side translation of a keyed throttling update for a cluster manager on a build that predates
+     * multi-attribute throttling, which only applies the flat form (and silently ignores a keyed change that removes or
+     * clears something). While such a node is present every group has at most one rule, so the update's effect on the
+     * group's current config ({@code existing}, from this node's cluster state) can be expressed as flat keys that build
+     * overwrites or clears: the remaining rule's attribute plus its changed fields, or every flat key cleared when the
+     * update leaves no rule. {@code "throttling": null} (empty) is sent as is; that build also reads it as "clear all".
+     * A race with a concurrent update is caught afterwards by {@link #verifyUpdateApplied}.
+     *
+     * @return the flat-form update to send, or {@code null} if it leaves throttling unchanged
+     * @throws IllegalArgumentException if the update is invalid or would leave the group with more than one rule
+     */
+    @Nullable
+    public static Settings toFlatUpdate(@Nullable Settings update, @Nullable Settings existing) {
+        if (update == null || update.isEmpty()) {
+            return update;
+        }
+        validate(update);
+        final Settings current = existing == null ? Settings.EMPTY : existing;
+        final Settings merged = merge(current, update);
+        if (merged.equals(current)) {
+            return null; // e.g. removing a rule the group doesn't have
+        }
+        final Settings flatResult = toLegacyFlat(merged);
+        if (merged.isEmpty() == false && flatResult == null) {
+            throw new IllegalArgumentException(
+                "this throttling update would give the workload group more than one rule, which needs every node to run a "
+                    + "build that supports it; finish the upgrade first"
+            );
+        }
+        final Settings.Builder flat = Settings.builder();
+        if (flatResult == null) {
+            flat.putNull(LEGACY_ATTRIBUTE); // no rule left: clear every flat key
+            for (String field : RULE_FIELDS) {
+                flat.putNull(field);
+            }
+            return flat.build();
+        }
+        // One rule left: its attribute, and each field as it should end up. Fields are written explicitly (set, or cleared
+        // when absent) so the result doesn't depend on what the older build merges them onto.
+        flat.put(LEGACY_ATTRIBUTE, flatResult.get(LEGACY_ATTRIBUTE));
+        for (String field : RULE_FIELDS) {
+            if (flatResult.get(field) != null) {
+                flat.put(field, flatResult.get(field));
+            } else {
+                flat.putNull(field);
+            }
+        }
+        return flat.build();
+    }
+
+    /**
+     * Join validator: refuses a node on a build that predates keyed rules while any workload group has several rules,
+     * since it could not deserialize that group and would fail to apply the cluster state.
+     *
+     * @throws IllegalStateException if {@code joiningNode} can't read the current workload groups
+     */
+    public static void validateJoiningNode(DiscoveryNode joiningNode, ClusterState state) {
+        if (supportsMultiAttributeThrottling(joiningNode) || state.metadata() == null) {
+            return;
+        }
+        for (WorkloadGroup group : state.metadata().workloadGroups().values()) {
+            if (requiresMultiAttributeSupport(group.getMutableWorkloadGroupFragment().getThrottling())) {
+                throw new IllegalStateException(
+                    "node ["
+                        + joiningNode
+                        + "] runs a build that cannot read the throttling config of workload group ["
+                        + group.getName()
+                        + "] (for example several rules); upgrade the node, or reduce every workload group to a single "
+                        + "throttle rule first"
+                );
+            }
+        }
+    }
+
+    /**
+     * The flat form {@code {attribute, node_limit, shared_limit}} of {@code throttling} for nodes on a build that predates
+     * keyed rules, or {@code null} if it has no such form: it is not exactly one known rule with set limits and nothing
+     * else. {@link #normalizeStored} translates the flat form back, so writing this and reading it is a round trip.
+     */
+    @Nullable
+    public static Settings toLegacyFlat(@Nullable Settings throttling) {
+        if (throttling == null || throttling.isEmpty() || throttling.names().size() != 1) {
+            return null;
+        }
+        final String attribute = throttling.names().iterator().next();
+        if (ATTRIBUTES.containsKey(attribute) == false) {
+            return null;
+        }
+        Settings.Builder flat = Settings.builder().put(LEGACY_ATTRIBUTE, attribute);
+        for (String key : throttling.keySet()) {
+            final String value = throttling.get(key);
+            final String field = key.startsWith(attribute + ".") ? key.substring(attribute.length() + 1) : null;
+            if (field == null || RULE_FIELDS.contains(field) == false || value == null) {
+                return null;
+            }
+            flat.put(field, value);
+        }
+        return flat.build();
+    }
+
+    /**
+     * Attributes whose rule was added, removed, or had its tier set changed between two configs (see {@link #tierShape});
+     * a rule whose only change is a limit value is not included.
+     */
+    public static Set<String> rulesWithChangedTiers(List<Rule> previous, List<Rule> current) {
+        Map<String, List<Boolean>> before = tierShape(previous);
+        Map<String, List<Boolean>> after = tierShape(current);
+        Set<String> changed = new HashSet<>();
+        for (String attribute : before.keySet()) {
+            if (before.get(attribute).equals(after.get(attribute)) == false) {
+                changed.add(attribute);
+            }
+        }
+        for (String attribute : after.keySet()) {
+            if (before.containsKey(attribute) == false) {
+                changed.add(attribute);
+            }
+        }
+        return changed;
+    }
+
     /**
      * The rule for {@code attributeName}, or {@code null} if the attribute is unknown or has neither limit set.
      *
@@ -168,7 +369,8 @@ public class WorkloadGroupThrottleSettings {
             sharedLimit = SHARED_LIMIT.get(ruleSettings);
         } catch (IllegalArgumentException e) {
             // Only stored config that bypassed validation gets here; make the rule inert rather than throw on every use.
-            logger.debug("Ignoring throttling." + attributeName + " with an unreadable limit: " + ruleSettings, e);
+            // WARN: the rule stops being enforced. Rules are resolved once per stored config (cached), so this is rare.
+            logger.warn("Ignoring throttling." + attributeName + " with an unreadable limit, so it is not enforced: " + ruleSettings, e);
             return null;
         }
         if (nodeLimit == UNSET_LIMIT && sharedLimit == UNSET_LIMIT) {
@@ -196,6 +398,15 @@ public class WorkloadGroupThrottleSettings {
         }
         int end = bucketKey.indexOf(':', start + 1);
         return end < 0 ? bucketKey.substring(start + 1) : bucketKey.substring(start + 1, end);
+    }
+
+    /**
+     * The rule {@code bucketKey} belongs to in {@code workloadGroup}'s live config, or {@code null} if the group is gone
+     * or no longer has that rule. The one place a bucket is mapped to its rule.
+     */
+    @Nullable
+    public static Rule ruleForBucket(@Nullable WorkloadGroup workloadGroup, String bucketKey) {
+        return workloadGroup == null ? null : workloadGroup.getMutableWorkloadGroupFragment().getThrottleRule(attributeOf(bucketKey));
     }
 
     /** {@code <groupId>:<attribute>} — identifies the rule a bucket belongs to, across all its values. */
@@ -324,10 +535,7 @@ public class WorkloadGroupThrottleSettings {
 
     // Attribute names in a throttling bag, including bare null "remove this rule" markers.
     private static Set<String> attributeNames(Settings throttling) {
-        return throttling.keySet().stream().map(key -> {
-            int dot = key.indexOf('.');
-            return dot < 0 ? key : key.substring(0, dot);
-        }).collect(Collectors.toCollection(TreeSet::new));
+        return new TreeSet<>(throttling.names()); // sorted, so iteration order is deterministic
     }
 
     /**
@@ -438,6 +646,122 @@ public class WorkloadGroupThrottleSettings {
     public static void validateForWrite(Settings throttling) {
         validate(throttling);
         validateMergedConfig(throttling);
+    }
+
+    /** Whether {@code fragment} is in the flat form a node on an older build sends: any top-level legacy key. */
+    private static boolean isLegacyFlat(@Nullable Settings fragment) {
+        if (fragment == null) {
+            return false;
+        }
+        for (String key : fragment.keySet()) {
+            if (LEGACY_KEYS.contains(key)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Applies an update fragment received from the transport layer onto stored throttling. A keyed fragment is
+     * validated and merged ({@link #merge}). A flat-form fragment, sent by a coordinating node on a build that predates
+     * multi-attribute rules, is applied with that build's semantics instead: its keys overwrite (or, when null, clear)
+     * the flat form of the stored config, so e.g. {@code {attribute: role}} switches the rule's attribute and keeps its
+     * limits. That is well defined because the stored config has at most one rule while such nodes are present (see
+     * {@link #validateSupportedByCluster}); a multi-rule config can't be updated that way and is rejected.
+     *
+     * @throws IllegalArgumentException if the fragment is invalid or can't be applied
+     */
+    public static Settings mergeUpdate(Settings existing, @Nullable Settings incoming) {
+        if (isLegacyFlat(incoming) == false) {
+            if (incoming != null) {
+                validate(incoming);
+            }
+            return merge(existing, incoming);
+        }
+        final Settings flatExisting = existing == null || existing.isEmpty() ? Settings.EMPTY : toLegacyFlat(existing);
+        if (flatExisting == null) {
+            throw new IllegalArgumentException(
+                "this workload group's throttling has several rules, which a node on an older build can't update; "
+                    + "send the request to an upgraded node"
+            );
+        }
+        Settings.Builder merged = Settings.builder().put(flatExisting);
+        for (String key : incoming.keySet()) {
+            if (LEGACY_KEYS.contains(key) == false) {
+                throw new IllegalArgumentException("Unknown throttle setting: " + key);
+            }
+            final String value = incoming.get(key);
+            if (value == null) {
+                merged.remove(key);
+            } else {
+                merged.put(key, value);
+            }
+        }
+        final Settings flat = merged.build();
+        if (flat.isEmpty()) {
+            return Settings.EMPTY;
+        }
+        final String attribute = flat.get(LEGACY_ATTRIBUTE);
+        if (attribute == null) {
+            throw new IllegalArgumentException("throttling.attribute is required when a throttle limit is set");
+        }
+        if (ATTRIBUTES.containsKey(attribute) == false) {
+            throw new IllegalArgumentException(
+                "throttling attribute [" + attribute + "] is not supported; supported attributes are " + new TreeSet<>(ATTRIBUTES.keySet())
+            );
+        }
+        // Back to the keyed form, then the same checks as any keyed update. A flat config left with an attribute but no
+        // limit has no keyed form (no rule); the older build rejects it (its ceiling would be 0), so this does too.
+        final Settings keyed = normalizeStored(flat);
+        if (keyed.isEmpty()) {
+            throw new IllegalArgumentException(
+                "Effective throttle ceiling for throttling."
+                    + attribute
+                    + " is 0 (node_limit=unset, shared_limit=unset); set at "
+                    + "least one limit, or set throttling as null to disable throttling"
+            );
+        }
+        validateForWrite(keyed);
+        return keyed;
+    }
+
+    /**
+     * Coordinator-side check of an update's result: whether the cluster manager actually applied every change in the
+     * keyed {@code update} to {@code result}. A cluster manager on an older build acknowledges a keyed change that only
+     * removes or clears a rule without applying it (its flat-form merge finds no matching key); this turns that silent
+     * no-op into an error. A flat-form update is not checked here.
+     *
+     * @throws OpenSearchStatusException (409) if some change in {@code update} is not reflected in {@code result}
+     */
+    public static void verifyUpdateApplied(@Nullable Settings update, @Nullable Settings result) {
+        if (update == null || isLegacyFlat(update)) {
+            return;
+        }
+        final Settings applied = result == null ? Settings.EMPTY : result;
+        boolean ok = true;
+        if (update.isEmpty()) {
+            ok = applied.isEmpty(); // "throttling": null clears every rule
+        }
+        for (String key : update.keySet()) {
+            final String value = update.get(key);
+            if (value != null) {
+                ok &= value.equals(applied.get(key));
+            } else if (key.indexOf('.') < 0) {
+                ok &= applied.getByPrefix(key + ".").isEmpty() && applied.get(key) == null; // rule removed
+            } else {
+                ok &= applied.get(key) == null; // field cleared
+            }
+        }
+        if (ok == false) {
+            throw new OpenSearchStatusException(
+                "the cluster manager acknowledged the update but did not apply its throttling change (it may run an older "
+                    + "build that ignores this change); the update's other fields may have been applied. Resulting "
+                    + "throttling is "
+                    + applied
+                    + ". Retry once the cluster manager is upgraded",
+                RestStatus.CONFLICT
+            );
+        }
     }
 
     /**

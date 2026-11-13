@@ -29,6 +29,9 @@ import org.opensearch.threadpool.ThreadPool;
 import org.opensearch.transport.ConnectTransportException;
 
 import java.io.IOException;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.CountDownLatch;
@@ -1012,6 +1015,58 @@ public class WorkloadGroupSharedThrottleServiceTransportTests extends OpenSearch
     }
 
     /** Captures the outcome of an async acquire, distinguishing onResponse(null) from an unfired listener via a latch. */
+    private Releasable acquireRemote(int sharedLimit) throws Exception {
+        CapturingListener listener = new CapturingListener();
+        coordinatorService.acquireAsync(remoteKey, sharedLimit, listener);
+        listener.await();
+        assertNotNull("the remote owner must grant", listener.response.get());
+        return listener.response.get();
+    }
+
+    public void testRenewalSendsOneRpcPerOwner() throws Exception {
+        Releasable first = acquireRemote(2);
+        Releasable second = acquireRemote(2);
+        List<Integer> batchSizes = Collections.synchronizedList(new ArrayList<>());
+        ownerTransport.addRequestHandlingBehavior(
+            WorkloadGroupSharedThrottleService.RENEW_ACTION_NAME,
+            (handler, request, channel, task) -> {
+                batchSizes.add(((WorkloadGroupSharedThrottleService.RenewPermitRequest) request).permitIds.size());
+                handler.messageReceived(request, channel, task);
+            }
+        );
+        Releasable keepAlive = coordinatorService.keepAlive(List.of(first, second), () -> true);
+        coordinatorService.renewKeptAlivePermits();
+        assertBusy(() -> assertEquals("both permits renewed in one request", List.of(2), batchSizes));
+        keepAlive.close();
+        first.close();
+        second.close();
+        ownerTransport.clearAllRules();
+    }
+
+    public void testAFailedRenewalDoesNotMarkThePermitFresh() throws Exception {
+        Releasable permit = acquireRemote(1);
+        AtomicInteger renewals = new AtomicInteger();
+        ownerTransport.addRequestHandlingBehavior(
+            WorkloadGroupSharedThrottleService.RENEW_ACTION_NAME,
+            (handler, request, channel, task) -> {
+                renewals.incrementAndGet();
+                channel.sendResponse(new IllegalStateException("owner briefly unavailable"));
+            }
+        );
+        ((WorkloadGroupSharedThrottleService.SharedPermit) permit).setRefreshedAtForTest(
+            System.nanoTime() - WorkloadGroupSharedThrottleService.END_OF_WAIT_RENEW_MIN_AGE_NANOS
+        );
+        Releasable keepAlive = coordinatorService.keepAlive(List.of(permit), () -> true);
+        coordinatorService.renewKeptAlivePermits();
+        assertBusy(() -> assertEquals(1, renewals.get()));
+        // The periodic renewal failed, so the end-of-wait renewal must still be sent rather than skipped as fresh.
+        keepAlive.close();
+        coordinatorService.renewStale(List.of(permit));
+        assertBusy(() -> assertEquals(2, renewals.get()));
+        permit.close();
+        ownerTransport.clearAllRules();
+    }
+
     private static final class CapturingListener implements ActionListener<Releasable> {
         final CountDownLatch latch = new CountDownLatch(1);
         final AtomicReference<Releasable> response = new AtomicReference<>();

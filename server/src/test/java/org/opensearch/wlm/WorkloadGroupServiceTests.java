@@ -44,7 +44,6 @@ import java.util.Collection;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
-import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ExecutorService;
@@ -60,7 +59,6 @@ import org.mockito.Mockito;
 import static org.opensearch.wlm.tracker.ResourceUsageCalculatorTests.createMockTaskWithResourceStats;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyInt;
-import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.doAnswer;
@@ -1613,6 +1611,35 @@ public class WorkloadGroupServiceTests extends OpenSearchTestCase {
         carol.close();
     }
 
+    public void testWhileAnOlderBuildNodeIsPresentRolesResolveToTheFirstOne() {
+        when(mockWorkloadManagementSettings.getWlmMode()).thenReturn(WlmMode.ENABLED);
+        mockWorkloadGroupsStateAccessor.addNewWorkloadGroup("wg-1");
+        stubClusterStateWithGroup(throttledGroup("wg-1", Settings.builder().put("role.node_limit", 1).build()));
+        DiscoveryNode olderBuild = new DiscoveryNode(
+            "old",
+            "old",
+            buildNewFakeTransportAddress(),
+            Collections.emptyMap(),
+            Set.of(DiscoveryNodeRole.DATA_ROLE),
+            org.opensearch.Version.CURRENT
+        );
+        when(mockClusterService.state().nodes()).thenReturn(DiscoveryNodes.builder().add(olderBuild).build());
+
+        // As older builds do: alice [analyst, admin] is charged to analyst, her first role, so the two builds agree.
+        Releasable alice = acquireThrottlePermitSync(
+            workloadGroupService,
+            "wg-1",
+            principal("username|alice", "role|analyst", "role|admin")
+        );
+        assertNotNull(alice);
+        OpenSearchRejectedExecutionException e = expectThrows(
+            OpenSearchRejectedExecutionException.class,
+            () -> acquireThrottlePermitSync(workloadGroupService, "wg-1", principal("username|bob", "role|analyst"))
+        );
+        assertTrue(e.getMessage(), e.getMessage().contains("for role [analyst]"));
+        alice.close();
+    }
+
     public void testRulesAreAcquiredNarrowestFirst() {
         when(mockWorkloadManagementSettings.getWlmMode()).thenReturn(WlmMode.ENABLED);
         mockWorkloadGroupsStateAccessor.addNewWorkloadGroup("wg-1");
@@ -1879,7 +1906,7 @@ public class WorkloadGroupServiceTests extends OpenSearchTestCase {
         aliceAgain.close();
     }
 
-    public void testAddingARuleDrainsTheQueue() {
+    public void testAddingARuleKeepsOtherRulesWaiters() {
         WorkloadGroupQueueService queueService = newDirectQueueService();
         AtomicInteger admissions = new AtomicInteger();
         enqueueWaitingRequest(queueService, "wg-1", "wg-1:group", admissions);
@@ -1898,7 +1925,34 @@ public class WorkloadGroupServiceTests extends OpenSearchTestCase {
             MutableWorkloadGroupFragment.ResiliencyMode.ENFORCED
         );
         deliverWorkloadGroupsChanged(Map.of("wg-1", groupOnly), Map.of("wg-1", withUsername));
-        assertEquals(1, admissions.get());
+        assertEquals("the unchanged group rule keeps its waiter", 0, admissions.get());
+        assertEquals(1, queueService.currentDepth("wg-1"));
+    }
+
+    public void testChangingOneRulesTiersDrainsOnlyThatRulesBuckets() {
+        WorkloadGroupQueueService queueService = newDirectQueueService();
+        AtomicInteger groupAdmissions = new AtomicInteger();
+        AtomicInteger aliceAdmissions = new AtomicInteger();
+        enqueueWaitingRequest(queueService, "wg-1", "wg-1:group", groupAdmissions);
+        enqueueWaitingRequest(queueService, "wg-1", "wg-1:username:alice", aliceAdmissions);
+
+        Settings queue = Settings.builder().put("size_per_bucket", 10).build();
+        WorkloadGroup previous = queueingGroup(
+            "wg-1",
+            Settings.builder().put("group.node_limit", 1).put("username.node_limit", 1).build(),
+            queue,
+            MutableWorkloadGroupFragment.ResiliencyMode.ENFORCED
+        );
+        WorkloadGroup current = queueingGroup(
+            "wg-1",
+            Settings.builder().put("group.node_limit", 1).put("username.shared_limit", 1).build(),
+            queue,
+            MutableWorkloadGroupFragment.ResiliencyMode.ENFORCED
+        );
+        deliverWorkloadGroupsChanged(Map.of("wg-1", previous), Map.of("wg-1", current));
+        assertEquals("the changed username rule's waiter is released", 1, aliceAdmissions.get());
+        assertEquals("the unchanged group rule keeps its waiter", 0, groupAdmissions.get());
+        assertEquals(1, queueService.currentDepth("wg-1"));
     }
 
     public void testChangingOneRulesLimitKeepsTheQueue() {
@@ -1987,7 +2041,7 @@ public class WorkloadGroupServiceTests extends OpenSearchTestCase {
         Settings throttling = Settings.builder().put("username.node_limit", 1).put("group.shared_limit", 1).build();
         stubClusterStateWithGroup(throttledGroup("wg-1", throttling));
         WorkloadGroupSharedThrottleService sharedService = Mockito.mock(WorkloadGroupSharedThrottleService.class);
-        when(sharedService.keepAlive(any(), anyLong())).thenReturn(() -> {});
+        when(sharedService.keepAlive(any(), any())).thenReturn(() -> {});
         doThrow(new IllegalStateException("boom")).doAnswer(invocation -> {
             ActionListener<Releasable> l = invocation.getArgument(2);
             l.onResponse(null); // owner unavailable -> fail open
@@ -2006,13 +2060,38 @@ public class WorkloadGroupServiceTests extends OpenSearchTestCase {
         assertEquals(1, completions.get());
         assertTrue(failure.get() instanceof IllegalStateException);
 
+        verify(sharedService, never()).renewStale(any());
         // The username permit taken before the throw was released: alice is admitted again.
         Releasable again = acquireThrottlePermitSync(workloadGroupService, "wg-1", "username|alice");
         assertNotNull(again);
         again.close();
     }
 
-    public void testKeepAliveDeadlineIsPerRequestNotPerStep() {
+    public void testSingleRuleSendFailureFailsTheRequestOnce() {
+        when(mockWorkloadManagementSettings.getWlmMode()).thenReturn(WlmMode.ENABLED);
+        mockWorkloadGroupsStateAccessor.addNewWorkloadGroup("wg-1");
+        Settings throttling = Settings.builder().put("group.shared_limit", 1).build();
+        stubClusterStateWithGroup(throttledGroup("wg-1", throttling));
+        WorkloadGroupSharedThrottleService sharedService = Mockito.mock(WorkloadGroupSharedThrottleService.class);
+        doThrow(new IllegalStateException("boom")).when(sharedService).acquireAsync(anyString(), anyInt(), any());
+        workloadGroupService.setSharedThrottleService(sharedService);
+
+        AtomicInteger completions = new AtomicInteger();
+        AtomicReference<Exception> failure = new AtomicReference<>();
+        workloadGroupService.acquireThrottlePermit(
+            taskForGroup("wg-1"),
+            null,
+            ActionListener.wrap(p -> { completions.incrementAndGet(); }, e -> {
+                completions.incrementAndGet();
+                failure.set(e);
+            })
+        );
+        assertEquals(1, completions.get());
+        assertTrue(failure.get() instanceof IllegalStateException);
+        verify(sharedService, never()).keepAlive(any(), any());
+    }
+
+    public void testLaterStepsKeepHeldPermitsAliveWhileTheRequestIsLive() {
         when(mockWorkloadManagementSettings.getWlmMode()).thenReturn(WlmMode.ENABLED);
         mockWorkloadGroupsStateAccessor.addNewWorkloadGroup("wg-1");
         Settings throttling = Settings.builder()
@@ -2024,7 +2103,7 @@ public class WorkloadGroupServiceTests extends OpenSearchTestCase {
         stubClusterStateWithGroup(queueingGroup("wg-1", throttling, queue, MutableWorkloadGroupFragment.ResiliencyMode.ENFORCED));
         WorkloadGroupQueueService queueService = newDirectQueueService();
         WorkloadGroupSharedThrottleService sharedService = Mockito.mock(WorkloadGroupSharedThrottleService.class);
-        when(sharedService.keepAlive(any(), anyLong())).thenReturn(() -> {});
+        when(sharedService.keepAlive(any(), any())).thenReturn(() -> {});
         doAnswer(invocation -> {
             ActionListener<Releasable> l = invocation.getArgument(2);
             l.onResponse(() -> {}); // a granted shared permit
@@ -2040,12 +2119,13 @@ public class WorkloadGroupServiceTests extends OpenSearchTestCase {
         bob.close();
         assertTrue(alice.completed.get());
 
-        ArgumentCaptor<Long> deadlines = ArgumentCaptor.forClass(Long.class);
-        // Two steps after the first for each of bob and alice: each request reuses one deadline across its steps.
-        verify(sharedService, times(4)).keepAlive(any(), deadlines.capture());
-        List<Long> values = deadlines.getAllValues();
-        assertEquals("bob's steps share one deadline", values.get(0), values.get(1));
-        assertEquals("alice's steps share one deadline", values.get(2), values.get(3));
+        ArgumentCaptor<BooleanSupplier> stillWaiting = ArgumentCaptor.forClass(BooleanSupplier.class);
+        // Two steps after the first for each of bob and alice, each kept alive while its (uncancelled) request waits.
+        verify(sharedService, times(4)).keepAlive(any(), stillWaiting.capture());
+        for (BooleanSupplier live : stillWaiting.getAllValues()) {
+            assertTrue("renewed while the request is not cancelled", live.getAsBoolean());
+        }
+        verify(sharedService, times(4)).renewStale(any()); // once per successful kept-alive step
         alice.permit.get().close();
         assertEquals(0, queueService.retainedDepth("wg-1"));
     }
@@ -2113,7 +2193,7 @@ public class WorkloadGroupServiceTests extends OpenSearchTestCase {
         Settings throttling = Settings.builder().put("username.shared_limit", 5).put("group.node_limit", 1).build();
         stubClusterStateWithGroup(throttledGroup("wg-1", throttling));
         WorkloadGroupSharedThrottleService sharedService = Mockito.mock(WorkloadGroupSharedThrottleService.class);
-        when(sharedService.keepAlive(any(), anyLong())).thenReturn(() -> {});
+        when(sharedService.keepAlive(any(), any())).thenReturn(() -> {});
         AtomicInteger grants = new AtomicInteger();
         doAnswer(invocation -> {
             ActionListener<Releasable> l = invocation.getArgument(2);
@@ -2175,6 +2255,37 @@ public class WorkloadGroupServiceTests extends OpenSearchTestCase {
         OpenSearchRejectedExecutionException e = expectThrows(
             OpenSearchRejectedExecutionException.class,
             () -> acquireThrottlePermitSync(workloadGroupService, "wg-1", null)
+        );
+        assertEquals(
+            "Request throttled: workload group [wg-1-name] already has the maximum of "
+                + WorkloadGroupQueueSettings.MAX_GROUP_QUEUE_DEPTH
+                + " queued requests.",
+            e.getMessage()
+        );
+    }
+
+    public void testFullGroupQueueRejectionNamesOnlyTheGroupForAKeyedRule() {
+        when(mockWorkloadManagementSettings.getWlmMode()).thenReturn(WlmMode.ENABLED);
+        mockWorkloadGroupsStateAccessor.addNewWorkloadGroup("wg-1");
+        Settings throttling = Settings.builder().put("username.shared_limit", 1).build();
+        Settings queue = Settings.builder().put("size_per_bucket", 5).build();
+        stubClusterStateWithGroup(queueingGroup("wg-1", throttling, queue, MutableWorkloadGroupFragment.ResiliencyMode.ENFORCED));
+        WorkloadGroupQueueService queueService = newDirectQueueService();
+        workloadGroupService.setSharedThrottleService(Mockito.mock(WorkloadGroupSharedThrottleService.class));
+        // The ceiling is group-wide: other users' requests fill it, and alice's first request is the one rejected.
+        for (int i = 0; i < WorkloadGroupQueueSettings.MAX_GROUP_QUEUE_DEPTH; i++) {
+            assertNotNull(
+                queueService.tryRegisterPendingAcquire(
+                    "wg-1",
+                    "wg-1:username:user-" + i,
+                    taskForGroup("wg-1"),
+                    ActionListener.wrap(p -> {}, e -> {})
+                )
+            );
+        }
+        OpenSearchRejectedExecutionException e = expectThrows(
+            OpenSearchRejectedExecutionException.class,
+            () -> acquireThrottlePermitSync(workloadGroupService, "wg-1", "username|alice")
         );
         assertEquals(
             "Request throttled: workload group [wg-1-name] already has the maximum of "

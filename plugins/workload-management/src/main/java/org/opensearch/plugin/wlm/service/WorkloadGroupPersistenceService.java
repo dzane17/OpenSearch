@@ -160,6 +160,10 @@ public class WorkloadGroupPersistenceService {
     ClusterState saveWorkloadGroupInClusterState(final WorkloadGroup workloadGroup, final ClusterState currentClusterState) {
         // Transport deserialization skips the user-input throttle checks, so apply them before writing.
         WorkloadGroupThrottleSettings.validateForWrite(workloadGroup.getMutableWorkloadGroupFragment().getThrottling());
+        WorkloadGroupThrottleSettings.validateSupportedByCluster(
+            workloadGroup.getMutableWorkloadGroupFragment().getThrottling(),
+            currentClusterState.nodes()
+        );
         final Map<String, WorkloadGroup> existingWorkloadGroups = currentClusterState.metadata().workloadGroups();
         String groupName = workloadGroup.getName();
 
@@ -314,13 +318,13 @@ public class WorkloadGroupPersistenceService {
             .orElseThrow(() -> new ResourceNotFoundException("No WorkloadGroup exists with the provided name: " + name));
 
         validateTotalUsage(existingGroups, name, mutableWorkloadGroupFragment.getResourceLimits());
+        final WorkloadGroup updatedGroup = updateExistingWorkloadGroup(existingGroup, mutableWorkloadGroupFragment);
+        WorkloadGroupThrottleSettings.validateSupportedByCluster(
+            updatedGroup.getMutableWorkloadGroupFragment().getThrottling(),
+            currentState.nodes()
+        );
         return ClusterState.builder(currentState)
-            .metadata(
-                Metadata.builder(metadata)
-                    .remove(existingGroup)
-                    .put(updateExistingWorkloadGroup(existingGroup, mutableWorkloadGroupFragment))
-                    .build()
-            )
+            .metadata(Metadata.builder(metadata).remove(existingGroup).put(updatedGroup).build())
             .build();
     }
 

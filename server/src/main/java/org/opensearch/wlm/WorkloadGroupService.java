@@ -13,14 +13,16 @@ import org.apache.logging.log4j.Logger;
 import org.opensearch.ResourceNotFoundException;
 import org.opensearch.action.support.ContextPreservingActionListener;
 import org.opensearch.cluster.ClusterChangedEvent;
+import org.opensearch.cluster.ClusterState;
 import org.opensearch.cluster.ClusterStateListener;
 import org.opensearch.cluster.metadata.Metadata;
 import org.opensearch.cluster.metadata.WorkloadGroup;
+import org.opensearch.cluster.node.DiscoveryNodes;
 import org.opensearch.cluster.service.ClusterService;
+import org.opensearch.common.Nullable;
 import org.opensearch.common.lease.Releasable;
 import org.opensearch.common.lease.Releasables;
 import org.opensearch.common.lifecycle.AbstractLifecycleComponent;
-import org.opensearch.common.settings.Settings;
 import org.opensearch.common.util.concurrent.ThreadContext;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.concurrency.OpenSearchRejectedExecutionException;
@@ -40,7 +42,6 @@ import org.opensearch.wlm.stats.WorkloadGroupStats.WorkloadGroupStatsHolder;
 
 import java.io.IOException;
 import java.util.ArrayList;
-import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
@@ -51,6 +52,7 @@ import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.Predicate;
 import java.util.function.Supplier;
 
 import static org.opensearch.wlm.tracker.WorkloadGroupResourceUsageTrackerService.TRACKED_RESOURCES;
@@ -213,7 +215,7 @@ public class WorkloadGroupService extends AbstractLifecycleComponent
         // Extract the workload groups from both the current and previous cluster states
         Map<String, WorkloadGroup> previousWorkloadGroups = previousMetadata.workloadGroups();
         Map<String, WorkloadGroup> currentWorkloadGroups = currentMetadata.workloadGroups();
-        Set<String> groupIdsToDrain = new HashSet<>();
+        Map<String, Predicate<String>> bucketsToDrain = new HashMap<>();
 
         // Detect new workload groups added in the current cluster state
         for (String workloadGroupName : currentWorkloadGroups.keySet()) {
@@ -234,64 +236,84 @@ public class WorkloadGroupService extends AbstractLifecycleComponent
                 this.deletedWorkloadGroups.add(deletedWorkloadGroup);
                 workloadGroupsStateAccessor.removeWorkloadGroup(deletedWorkloadGroup.get_id());
             }
-            if (requiresQueueDrain(previousWorkloadGroups.get(workloadGroupName), currentWorkloadGroups.get(workloadGroupName))) {
-                groupIdsToDrain.add(workloadGroupName);
+            Predicate<String> toDrain = bucketsRequiringQueueDrain(
+                previousWorkloadGroups.get(workloadGroupName),
+                currentWorkloadGroups.get(workloadGroupName)
+            );
+            if (toDrain != null) {
+                bucketsToDrain.put(workloadGroupName, toDrain);
             }
         }
         this.activeWorkloadGroups = new HashSet<>(currentMetadata.workloadGroups().values());
-        drainQueuedRequestsUntracked(groupIdsToDrain, "workload group admission policy changed");
+        drainQueuedRequestsUntracked(bucketsToDrain, "workload group admission policy changed");
     }
 
     /**
      * Queue-drain policy for live configuration changes. Existing retained requests are released from their current
-     * bucket (untracked for that bucket; any remaining buckets are still acquired under the live config) when a group
-     * is deleted, a throttle rule is added or removed, any rule's configured tiers change (whether {@code node_limit} or
-     * {@code shared_limit} is set), or it enters {@code MONITOR}; the WLM-mode listener below does the same when global
-     * WLM leaves {@code ENABLED}. Numeric limit changes with the same tier set, queue-depth changes, and unrelated group
-     * updates deliberately do not drain the queue.
+     * bucket (untracked for that bucket; any remaining buckets are still acquired under the live config). Every bucket
+     * of the group is released when the group is deleted or enters {@code MONITOR}; the WLM-mode listener below does the
+     * same when global WLM leaves {@code ENABLED}. Otherwise only the buckets of rules that were removed or whose
+     * configured tiers changed (whether {@code node_limit} or {@code shared_limit} is set) are released: requests
+     * waiting on an unchanged rule keep waiting under it, and a newly added rule has no waiters (it does not apply to
+     * requests already in flight). Numeric limit changes with the same tier set, queue-depth changes, and unrelated
+     * group updates deliberately do not drain the queue.
      * <p>
      * This is intentionally a best-effort cutover rather than a policy-generation barrier: the drain runs asynchronously,
      * so a request overlapping the update can land on either side of the drain. There is no strict instantaneous boundary
      * between the old and new configurations.
+     *
+     * @return a filter selecting the bucket keys to release for the group, or {@code null} if none
      */
-    private static boolean requiresQueueDrain(WorkloadGroup previousGroup, WorkloadGroup currentGroup) {
+    @Nullable
+    private static Predicate<String> bucketsRequiringQueueDrain(WorkloadGroup previousGroup, WorkloadGroup currentGroup) {
         if (currentGroup == null) {
-            return true;
+            return bucketKey -> true;
         }
         if (previousGroup.getResiliencyMode() != MutableWorkloadGroupFragment.ResiliencyMode.MONITOR
             && currentGroup.getResiliencyMode() == MutableWorkloadGroupFragment.ResiliencyMode.MONITOR) {
-            return true;
+            return bucketKey -> true;
         }
-
-        return WorkloadGroupThrottleSettings.tierShape(previousGroup.getMutableWorkloadGroupFragment().getThrottleRules())
-            .equals(WorkloadGroupThrottleSettings.tierShape(currentGroup.getMutableWorkloadGroupFragment().getThrottleRules())) == false;
+        final Set<String> changedRules = WorkloadGroupThrottleSettings.rulesWithChangedTiers(
+            previousGroup.getMutableWorkloadGroupFragment().getThrottleRules(),
+            currentGroup.getMutableWorkloadGroupFragment().getThrottleRules()
+        );
+        if (changedRules.isEmpty()) {
+            return null;
+        }
+        return bucketKey -> changedRules.contains(WorkloadGroupThrottleSettings.attributeOf(bucketKey));
     }
 
     private void onWlmModeChanged(WlmMode previousMode, WlmMode currentMode) {
         if (previousMode == WlmMode.ENABLED && currentMode != WlmMode.ENABLED) {
             final WorkloadGroupQueueService qs = queueService;
             if (qs != null) {
-                drainQueuedRequestsUntracked(new HashSet<>(qs.queuedGroupIds()), "global WLM mode left enabled");
+                Map<String, Predicate<String>> everyBucket = new HashMap<>();
+                for (String groupId : qs.queuedGroupIds()) {
+                    everyBucket.put(groupId, bucketKey -> true);
+                }
+                drainQueuedRequestsUntracked(everyBucket, "global WLM mode left enabled");
             }
         }
     }
 
     /**
-     * Submits one asynchronous best-effort task to release retained requests observed for the supplied groups. Concurrent
+     * Submits one asynchronous best-effort task to release retained requests observed for the supplied groups' selected
+     * buckets. Concurrent
      * arrivals may land after the queue snapshot and remain governed by the new policy. Config updates run on
      * cluster-state/settings application threads; polling deep queues and completing one listener per request must not.
      */
-    private void drainQueuedRequestsUntracked(Set<String> groupIds, String reason) {
+    private void drainQueuedRequestsUntracked(Map<String, Predicate<String>> bucketsByGroup, String reason) {
         final WorkloadGroupQueueService qs = queueService;
-        if (qs == null || groupIds.isEmpty()) {
+        if (qs == null || bucketsByGroup.isEmpty()) {
             return;
         }
-        final Set<String> groupIdsSnapshot = new HashSet<>(groupIds);
+        final Map<String, Predicate<String>> snapshot = new HashMap<>(bucketsByGroup);
         try {
             threadPool.executor(ThreadPool.Names.GENERIC).execute(() -> {
-                for (String groupId : groupIdsSnapshot) {
+                for (Map.Entry<String, Predicate<String>> entry : snapshot.entrySet()) {
+                    final String groupId = entry.getKey();
                     try {
-                        int released = qs.admitAllUntracked(groupId);
+                        int released = qs.admitAllUntracked(groupId, entry.getValue());
                         if (released > 0) {
                             logger.info("Released {} queued request(s) for workload group [{}]: {}.", released, groupId, reason);
                         }
@@ -499,36 +521,56 @@ public class WorkloadGroupService extends AbstractLifecycleComponent
             listener.onResponse(null); // not throttled / not attributable -> fail open
             return;
         }
+        if (plans.size() == 1) {
+            // One bucket: nothing is held while waiting, so skip the multi-step machinery (context capture, held list,
+            // keep-alive deadline, per-step guard). The caller's listener carries its own context.
+            final CompleteOnceListener once = new CompleteOnceListener(listener);
+            try {
+                acquireBucketPermit(plans.get(0), task, once);
+            } catch (Exception e) {
+                if (once.isCompleted()) {
+                    throw e; // thrown after completion, i.e. by the caller: not ours to handle
+                }
+                once.onFailure(e);
+            }
+            return;
+        }
         // Later steps can run on another request's thread (queue hand-off), so each restores this request's context.
         final ThreadContext threadContext = threadPool.getThreadContext();
         final Supplier<ThreadContext.StoredContext> requestContext = threadContext == null
             ? null
             : threadContext.newRestorableContext(false);
-        // One renewal deadline for the whole request, however many buckets it waits at.
-        final long keepAliveUntil = System.nanoTime() + WorkloadGroupSharedThrottleService.MAX_KEEP_ALIVE_NANOS;
-        acquireBucketPermits(plans, 0, new ArrayList<>(), task, completeOnce(listener), requestContext, keepAliveUntil);
+        acquireBucketPermits(plans, 0, new ArrayList<>(), task, new CompleteOnceListener(listener), requestContext);
     }
 
     // Like ActionListener.notifyOnce, but a duplicate admission closes its permit instead of leaking it.
-    private static ActionListener<Releasable> completeOnce(ActionListener<Releasable> delegate) {
-        final AtomicBoolean completed = new AtomicBoolean(false);
-        return new ActionListener<>() {
-            @Override
-            public void onResponse(Releasable permit) {
-                if (completed.compareAndSet(false, true)) {
-                    delegate.onResponse(permit);
-                } else {
-                    Releasables.close(permit);
-                }
-            }
+    private static final class CompleteOnceListener implements ActionListener<Releasable> {
+        private final ActionListener<Releasable> delegate;
+        private final AtomicBoolean completed = new AtomicBoolean(false);
 
-            @Override
-            public void onFailure(Exception e) {
-                if (completed.compareAndSet(false, true)) {
-                    delegate.onFailure(e);
-                }
+        CompleteOnceListener(ActionListener<Releasable> delegate) {
+            this.delegate = delegate;
+        }
+
+        boolean isCompleted() {
+            return completed.get();
+        }
+
+        @Override
+        public void onResponse(Releasable permit) {
+            if (completed.compareAndSet(false, true)) {
+                delegate.onResponse(permit);
+            } else {
+                Releasables.close(permit);
             }
-        };
+        }
+
+        @Override
+        public void onFailure(Exception e) {
+            if (completed.compareAndSet(false, true)) {
+                delegate.onFailure(e);
+            }
+        }
     }
 
     // Acquires plans[index..] in order into `held` (steps are sequential, so one thread at a time). Every exit completes
@@ -539,8 +581,7 @@ public class WorkloadGroupService extends AbstractLifecycleComponent
         List<Releasable> held,
         WorkloadGroupTask task,
         ActionListener<Releasable> listener,
-        Supplier<ThreadContext.StoredContext> requestContext,
-        long keepAliveUntil
+        Supplier<ThreadContext.StoredContext> requestContext
     ) {
         if (index == plans.size()) {
             listener.onResponse(combinePermits(held));
@@ -552,19 +593,22 @@ public class WorkloadGroupService extends AbstractLifecycleComponent
         }
         final ThrottlePlan plan;
         final Releasable keepAlive;
+        final WorkloadGroupSharedThrottleService keptAliveBy; // non-null iff this step keeps held permits alive
         try {
             // Re-read the rule live: a later bucket may be reached long after arrival, and its config may have changed.
             plan = index == 0 ? plans.get(0) : refreshPlan(plans.get(index));
             // Keep already-held shared permits alive while this bucket is acquired, so the owner's TTL can't reclaim them.
             final WorkloadGroupSharedThrottleService shared = sharedThrottleService;
-            keepAlive = plan == null || shared == null || held.isEmpty() ? () -> {} : shared.keepAlive(held, keepAliveUntil);
+            keptAliveBy = plan == null || held.isEmpty() ? null : shared;
+            // Renewed for as long as the request is live: a cancelled request is failed (releasing them) by its queue entry.
+            keepAlive = keptAliveBy == null ? () -> {} : keptAliveBy.keepAlive(held, () -> task.isCancelled() == false);
         } catch (Exception e) {
             // Runs after the previous step's guard has fired, so nothing upstream would release `held`.
             releaseAndFail(held, listener, e);
             return;
         }
         if (plan == null) {
-            acquireBucketPermits(plans, index + 1, held, task, listener, requestContext, keepAliveUntil);
+            acquireBucketPermits(plans, index + 1, held, task, listener, requestContext);
             return;
         }
         final AtomicBoolean stepCompleted = new AtomicBoolean(false);
@@ -576,17 +620,22 @@ public class WorkloadGroupService extends AbstractLifecycleComponent
                     return;
                 }
                 keepAlive.close();
+                if (keptAliveBy != null) {
+                    // The wait succeeded: refresh the held permits' TTL. Only on success; a failure releases them.
+                    keptAliveBy.renewStale(held);
+                }
                 if (permit != null) {
                     held.add(permit);
                 }
-                acquireBucketPermits(plans, index + 1, held, task, listener, requestContext, keepAliveUntil);
+                acquireBucketPermits(plans, index + 1, held, task, listener, requestContext);
             }
 
             @Override
             public void onFailure(Exception e) {
                 if (stepCompleted.compareAndSet(false, true) == false) {
                     // E.g. ActionListener.wrap re-delivering a downstream throw; the permits are no longer ours to release.
-                    logger.debug("Ignoring a failure after the throttle step for [" + plan.bucketKey + "] already completed", e);
+                    // No caller is expected to throw back here, so surface it rather than lose it.
+                    logger.warn("Ignoring a failure after the throttle step for [" + plan.bucketKey + "] already completed", e);
                     return;
                 }
                 keepAlive.close();
@@ -637,21 +686,29 @@ public class WorkloadGroupService extends AbstractLifecycleComponent
         if (workloadGroup == null) {
             return null;
         }
-        MutableWorkloadGroupFragment fragment = workloadGroup.getMutableWorkloadGroupFragment();
-        WorkloadGroupThrottleSettings.Rule rule = fragment.getThrottleRule(plan.attribute);
+        WorkloadGroupThrottleSettings.Rule rule = workloadGroup.getMutableWorkloadGroupFragment().getThrottleRule(plan.attribute);
         if (rule == null) {
             return null;
         }
+        return planFor(workloadGroup, rule, plan.value);
+    }
+
+    // The single place a bucket's plan is built from its group's live config, for the first step and every later one.
+    private static ThrottlePlan planFor(WorkloadGroup workloadGroup, WorkloadGroupThrottleSettings.Rule rule, @Nullable String value) {
         return new ThrottlePlan(
-            plan.workloadGroupId,
-            plan.bucketKey,
+            workloadGroup.get_id(),
+            WorkloadGroupThrottleSettings.bucketKey(workloadGroup.get_id(), rule.attribute(), value),
             rule.nodeLimit(),
             rule.sharedLimit(),
             workloadGroup.getName(),
-            plan.attribute,
-            plan.value,
+            rule.attribute().key(),
+            value,
+            // MONITOR observes only: the limit is still evaluated so a breach can be logged, but the request is never
+            // rejected and no stat is updated (consistent with how MONITOR is dormant on the resource cancellation path).
             workloadGroup.getResiliencyMode() == MutableWorkloadGroupFragment.ResiliencyMode.MONITOR,
-            WorkloadGroupQueueSettings.SIZE_PER_BUCKET.get(fragment.getQueue())
+            // Absent queue config => 0 => no queueing (reject immediately). size_per_bucket is the only queue knob (the
+            // per-group total is the fixed MAX_GROUP_QUEUE_DEPTH ceiling); a parked request has no wall-clock deadline.
+            WorkloadGroupQueueSettings.SIZE_PER_BUCKET.get(workloadGroup.getMutableWorkloadGroupFragment().getQueue())
         );
     }
 
@@ -662,29 +719,18 @@ public class WorkloadGroupService extends AbstractLifecycleComponent
         if (held.size() == 1) {
             return held.get(0);
         }
-        final List<Releasable> releaseOrder = reversed(held);
-        final AtomicBoolean closed = new AtomicBoolean(false);
-        return () -> {
-            if (closed.compareAndSet(false, true)) {
-                Releasables.close(releaseOrder);
-            }
-        };
+        // Release in reverse acquisition order, at most once.
+        return Releasables.releaseOnce(Releasables.wrap(List.copyOf(held.reversed())));
     }
 
     // Releases held permits (reverse order) and fails the caller, which is completed even if a release throws.
     private static void releaseAndFail(List<Releasable> held, ActionListener<Releasable> listener, Exception e) {
         try {
-            Releasables.close(reversed(held));
+            Releasables.close(held.reversed());
         } catch (Exception releaseFailure) {
             e.addSuppressed(releaseFailure);
         }
         listener.onFailure(e);
-    }
-
-    private static List<Releasable> reversed(List<Releasable> permits) {
-        List<Releasable> copy = new ArrayList<>(permits);
-        Collections.reverse(copy);
-        return copy;
     }
 
     // Two-tier admission for one bucket: node-local first, overflow to the shared pool, then queue/monitor/429 on denial.
@@ -722,12 +768,13 @@ public class WorkloadGroupService extends AbstractLifecycleComponent
                 );
                 if (pending == null) {
                     // Combined per-group retained-request ceiling reached. The queue service counted the queue rejection.
+                    // The ceiling spans every bucket in the group, so name only the group, not this request's bucket.
                     incrementThrottled(plan.workloadGroupId);
                     listener.onFailure(
                         new OpenSearchRejectedExecutionException(
-                            "Request throttled: "
-                                + plan.describeTarget()
-                                + " already has the maximum of "
+                            "Request throttled: workload group ["
+                                + plan.groupName
+                                + "] already has the maximum of "
                                 + WorkloadGroupQueueSettings.MAX_GROUP_QUEUE_DEPTH
                                 + " queued requests."
                         )
@@ -833,12 +880,7 @@ public class WorkloadGroupService extends AbstractLifecycleComponent
      * next drain.
      */
     private int currentNodeLimit(String groupId, String bucketKey) {
-        WorkloadGroup workloadGroup = getWorkloadGroupById(groupId);
-        if (workloadGroup == null) {
-            return WorkloadGroupThrottleSettings.UNSET_LIMIT;
-        }
-        WorkloadGroupThrottleSettings.Rule rule = workloadGroup.getMutableWorkloadGroupFragment()
-            .getThrottleRule(WorkloadGroupThrottleSettings.attributeOf(bucketKey));
+        WorkloadGroupThrottleSettings.Rule rule = WorkloadGroupThrottleSettings.ruleForBucket(getWorkloadGroupById(groupId), bucketKey);
         return rule == null ? WorkloadGroupThrottleSettings.UNSET_LIMIT : rule.nodeLimit();
     }
 
@@ -867,7 +909,7 @@ public class WorkloadGroupService extends AbstractLifecycleComponent
 
             // Keep the raw tracker slot occupied while selecting the queue head. At/under the current limit it is safe
             // to transfer an existing slot; above a lowered limit, release it so concurrency can converge downward.
-            if (qs.retainedDepth(groupId) > 0) {
+            if (qs.hasRetained(bucketKey)) { // this bucket's waiters only: other buckets' can't take this permit
                 final int liveNodeLimit = currentNodeLimit(groupId, bucketKey);
                 if (liveNodeLimit != WorkloadGroupThrottleSettings.UNSET_LIMIT
                     && throttleTracker.inFlight(bucketKey) <= liveNodeLimit
@@ -880,7 +922,7 @@ public class WorkloadGroupService extends AbstractLifecycleComponent
 
             // Recovery path for a concurrent enqueue or a live limit decrease. The normal steady-state queue handoff
             // returned above without exposing a free slot, so only these uncommon cases retain the old reacquire race.
-            if (qs.retainedDepth(groupId) > 0) {
+            if (qs.hasRetained(bucketKey)) { // this bucket's waiters only: other buckets' can't take this permit
                 final int liveNodeLimit = currentNodeLimit(groupId, bucketKey);
                 if (liveNodeLimit == WorkloadGroupThrottleSettings.UNSET_LIMIT) {
                     return;
@@ -938,7 +980,7 @@ public class WorkloadGroupService extends AbstractLifecycleComponent
         if (nodeLimit == WorkloadGroupThrottleSettings.UNSET_LIMIT) {
             // Group deleted, or shared-only config: the node tier can't admit; owner-push handles the shared tier. A
             // group with NO limit left is not this path's problem either — the live-config queue drain releases that
-            // backlog when the tier is removed (see requiresQueueDrain).
+            // backlog when the tier is removed (see bucketsRequiringQueueDrain).
             return;
         }
         queueService.drainNode(groupId, bucketKey, key -> wrapNodePermit(throttleTracker.tryAcquire(key, nodeLimit), groupId, key));
@@ -955,6 +997,31 @@ public class WorkloadGroupService extends AbstractLifecycleComponent
         } catch (Exception statsException) {
             logger.warn("Failed to record throttle stat for workload group [" + workloadGroupId + "]", statsException);
         }
+    }
+
+    // Whether any node runs a build that predates multi-attribute rules, cached per DiscoveryNodes instance (replaced on
+    // every membership change) so the request path doesn't scan the nodes. While true, attribute values resolve as those
+    // builds do (see ThrottleAttribute#resolve(String, boolean)). Accepted cutover transient, repeated on every change in
+    // whether such a node is present (e.g. one flapping mid-upgrade): a caller with several roles moves to the other
+    // role's bucket while its in-flight requests still hold the previous one's permits, so it can briefly run up to twice
+    // its role limit, and coordinators switch as each applies that state. Each ends as those requests finish.
+    private volatile CachedNodeSupport cachedNodeSupport;
+
+    private record CachedNodeSupport(DiscoveryNodes nodes, boolean olderBuildsPresent) {
+    }
+
+    private boolean olderBuildsInCluster() {
+        final ClusterState state = clusterService.state();
+        final DiscoveryNodes nodes = state == null ? null : state.nodes();
+        if (nodes == null) {
+            return false;
+        }
+        CachedNodeSupport cached = cachedNodeSupport;
+        if (cached == null || cached.nodes() != nodes) {
+            cached = new CachedNodeSupport(nodes, WorkloadGroupThrottleSettings.allSupportMultiAttributeThrottling(nodes) == false);
+            cachedNodeSupport = cached;
+        }
+        return cached.olderBuildsPresent();
     }
 
     /**
@@ -978,35 +1045,15 @@ public class WorkloadGroupService extends AbstractLifecycleComponent
         if (rules.isEmpty()) {
             return List.of();
         }
-        // MONITOR mode observes only: the limit is still evaluated so a breach can be logged, but the request is never
-        // rejected and no stat is updated (consistent with how MONITOR is dormant on the resource cancellation path).
-        boolean monitorMode = workloadGroup.getResiliencyMode() == MutableWorkloadGroupFragment.ResiliencyMode.MONITOR;
-        // Queue config (used only if a throttle limit is breached). Absent => 0 => no queueing (reject immediately).
-        // queue.size_per_bucket is the only queue knob (the per-group total is the fixed MAX_GROUP_QUEUE_DEPTH ceiling);
-        // there is no queue timeout — a client's own deadline comes from cancel_after_time_interval, and a parked
-        // request has no wall-clock deadline.
-        Settings queue = workloadGroup.getMutableWorkloadGroupFragment().getQueue();
-        int queueSizePerBucket = WorkloadGroupQueueSettings.SIZE_PER_BUCKET.get(queue);
         List<ThrottlePlan> plans = new ArrayList<>();
+        final boolean firstToken = olderBuildsInCluster();
         for (WorkloadGroupThrottleSettings.Rule rule : rules) {
             ThrottleAttribute attribute = rule.attribute();
-            String value = attribute.keyed() ? attribute.resolve(principal) : null;
+            String value = attribute.keyed() ? attribute.resolve(principal, firstToken) : null;
             if (attribute.keyed() && value == null) {
                 continue; // can't attribute the request to this rule: skip it, the others still apply
             }
-            plans.add(
-                new ThrottlePlan(
-                    workloadGroupId,
-                    WorkloadGroupThrottleSettings.bucketKey(workloadGroupId, attribute, value),
-                    rule.nodeLimit(),
-                    rule.sharedLimit(),
-                    workloadGroup.getName(),
-                    attribute.key(),
-                    value,
-                    monitorMode,
-                    queueSizePerBucket
-                )
-            );
+            plans.add(planFor(workloadGroup, rule, value));
         }
         return plans;
     }

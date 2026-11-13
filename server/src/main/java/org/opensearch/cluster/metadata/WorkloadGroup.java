@@ -143,7 +143,7 @@ public class WorkloadGroup extends AbstractDiffable<WorkloadGroup> implements To
     }
 
     public WorkloadGroup(StreamInput in) throws IOException {
-        this(in.readString(), in.readString(), new MutableWorkloadGroupFragment(in), in.readLong(), false);
+        this(in.readString(), in.readString(), MutableWorkloadGroupFragment.readStored(in), in.readLong(), false);
     }
 
     public static WorkloadGroup updateExistingWorkloadGroup(
@@ -158,11 +158,9 @@ public class WorkloadGroup extends AbstractDiffable<WorkloadGroup> implements To
         final ResiliencyMode mode = Optional.ofNullable(mutableWorkloadGroupFragment.getResiliencyMode())
             .orElse(existingGroup.getResiliencyMode());
         final Settings updatedSettings = mergeSettings(existingGroup.getSettings(), mutableWorkloadGroupFragment.getSettings());
-        // The update may have skipped the strict REST parser (transport), so check its keys; the constructor checks the merge.
-        if (mutableWorkloadGroupFragment.getThrottling() != null) {
-            WorkloadGroupThrottleSettings.validate(mutableWorkloadGroupFragment.getThrottling());
-        }
-        final Settings updatedThrottling = WorkloadGroupThrottleSettings.merge(
+        // The update may have skipped the strict REST parser (transport), so mergeUpdate checks its keys, and applies a
+        // flat-form update from a node on an older build with that build's semantics. The constructor checks the merge.
+        final Settings updatedThrottling = WorkloadGroupThrottleSettings.mergeUpdate(
             existingGroup.getMutableWorkloadGroupFragment().getThrottling(),
             mutableWorkloadGroupFragment.getThrottling()
         );
@@ -233,7 +231,8 @@ public class WorkloadGroup extends AbstractDiffable<WorkloadGroup> implements To
     public void writeTo(StreamOutput out) throws IOException {
         out.writeString(name);
         out.writeString(_id);
-        mutableWorkloadGroupFragment.writeTo(out);
+        // Single-rule throttling goes out in the flat form so nodes on a build that predates keyed rules can read it.
+        mutableWorkloadGroupFragment.writeStoredTo(out);
         out.writeLong(updatedAtInMillis);
     }
 
@@ -248,8 +247,13 @@ public class WorkloadGroup extends AbstractDiffable<WorkloadGroup> implements To
         builder.startObject();
         builder.field(_ID_STRING, _id);
         builder.field(NAME_STRING, name);
+        // On disk and in snapshots, single-rule throttling is kept in the flat form so a node rolled back to a build that
+        // predates keyed rules can still load its state, and such a cluster can restore the snapshot. API responses
+        // always use the keyed form.
+        final String context = params == null ? null : params.param(Metadata.CONTEXT_MODE_PARAM);
+        final boolean storedForm = Metadata.CONTEXT_MODE_GATEWAY.equals(context) || Metadata.CONTEXT_MODE_SNAPSHOT.equals(context);
         for (String fieldName : MutableWorkloadGroupFragment.acceptedFieldNames) {
-            mutableWorkloadGroupFragment.writeField(builder, fieldName);
+            mutableWorkloadGroupFragment.writeField(builder, fieldName, storedForm);
         }
         builder.field(UPDATED_AT_STRING, updatedAtInMillis);
         builder.endObject();

@@ -8,6 +8,10 @@
 
 package org.opensearch.cluster.metadata;
 
+import org.opensearch.cluster.ClusterName;
+import org.opensearch.cluster.ClusterState;
+import org.opensearch.cluster.node.DiscoveryNode;
+import org.opensearch.cluster.node.DiscoveryNodeRole;
 import org.opensearch.common.UUIDs;
 import org.opensearch.common.io.stream.BytesStreamOutput;
 import org.opensearch.common.settings.Settings;
@@ -31,6 +35,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
 
 public class WorkloadGroupTests extends AbstractSerializingTestCase<WorkloadGroup> {
 
@@ -1200,5 +1205,160 @@ public class WorkloadGroupTests extends AbstractSerializingTestCase<WorkloadGrou
         WorkloadGroup group = WorkloadGroup.fromXContent(createParser(JsonXContent.jsonXContent, stored));
         assertTrue(group.getMutableWorkloadGroupFragment().getThrottling().isEmpty());
         assertEquals("test", group.getName());
+    }
+
+    private static WorkloadGroup throttledGroup(String name, Settings throttling) {
+        return new WorkloadGroup(
+            name,
+            "_id_" + name,
+            new MutableWorkloadGroupFragment(ResiliencyMode.ENFORCED, Map.of(ResourceType.MEMORY, 0.5), Settings.EMPTY, throttling),
+            Instant.now().getMillis()
+        );
+    }
+
+    private static final Settings ONE_RULE = Settings.builder().put("username.node_limit", 5).put("username.shared_limit", 10).build();
+    private static final Settings TWO_RULES = Settings.builder().put("username.node_limit", 5).put("group.shared_limit", 10).build();
+
+    // The throttling bag exactly as it travels, read without the stored-group translation.
+    private static Settings throttlingOnTheWire(WorkloadGroup group) throws IOException {
+        try (BytesStreamOutput out = new BytesStreamOutput()) {
+            group.writeTo(out);
+            try (StreamInput in = out.bytes().streamInput()) {
+                in.readString();
+                in.readString();
+                return new MutableWorkloadGroupFragment(in).getThrottling();
+            }
+        }
+    }
+
+    public void testSingleRuleGroupTravelsInTheFlatFormOlderBuildsRead() throws IOException {
+        WorkloadGroup group = throttledGroup("one", ONE_RULE);
+        assertEquals(
+            Settings.builder().put("attribute", "username").put("node_limit", 5).put("shared_limit", 10).build(),
+            throttlingOnTheWire(group)
+        );
+        assertEquals("translated back on read", group, roundTrip(group));
+    }
+
+    public void testMultiRuleGroupTravelsKeyed() throws IOException {
+        WorkloadGroup group = throttledGroup("two", TWO_RULES);
+        assertEquals(TWO_RULES, throttlingOnTheWire(group));
+        assertEquals(group, roundTrip(group));
+    }
+
+    public void testSingleRuleGroupIsPersistedInTheFlatFormButShownKeyed() throws IOException {
+        WorkloadGroup group = throttledGroup("one", ONE_RULE);
+        ToXContent.Params gateway = new ToXContent.MapParams(Map.of(Metadata.CONTEXT_MODE_PARAM, Metadata.CONTEXT_MODE_GATEWAY));
+        XContentBuilder onDisk = JsonXContent.contentBuilder();
+        group.toXContent(onDisk, gateway);
+        String persisted = onDisk.toString();
+        assertTrue(persisted, persisted.contains("\"throttling\":{\"attribute\":\"username\""));
+        try (XContentParser parser = createParser(JsonXContent.jsonXContent, persisted)) {
+            assertEquals("translated back on load", group, WorkloadGroup.fromXContent(parser));
+        }
+
+        XContentBuilder snapshot = JsonXContent.contentBuilder();
+        group.toXContent(snapshot, new ToXContent.MapParams(Map.of(Metadata.CONTEXT_MODE_PARAM, Metadata.CONTEXT_MODE_SNAPSHOT)));
+        assertTrue("snapshots too", snapshot.toString().contains("\"throttling\":{\"attribute\":\"username\""));
+
+        XContentBuilder api = JsonXContent.contentBuilder();
+        group.toXContent(api, ToXContent.EMPTY_PARAMS);
+        assertTrue(api.toString(), api.toString().contains("\"throttling\":{\"username\":{"));
+    }
+
+    public void testMetadataPassesTheGatewayContextToItsGroups() throws IOException {
+        WorkloadGroupMetadata metadata = new WorkloadGroupMetadata(Map.of("_id_one", throttledGroup("one", ONE_RULE)));
+        XContentBuilder onDisk = JsonXContent.contentBuilder().startObject();
+        metadata.toXContent(onDisk, new ToXContent.MapParams(Map.of(Metadata.CONTEXT_MODE_PARAM, Metadata.CONTEXT_MODE_GATEWAY)));
+        onDisk.endObject();
+        assertTrue(onDisk.toString(), onDisk.toString().contains("\"attribute\":\"username\""));
+    }
+
+    private static MutableWorkloadGroupFragment overTheWire(Settings updateThrottling) throws IOException {
+        MutableWorkloadGroupFragment update = MutableWorkloadGroupFragment.ofStoredThrottling(
+            null,
+            new HashMap<>(),
+            null,
+            updateThrottling,
+            null
+        );
+        try (BytesStreamOutput out = new BytesStreamOutput()) {
+            update.writeTo(out);
+            try (StreamInput in = out.bytes().streamInput()) {
+                return new MutableWorkloadGroupFragment(in);
+            }
+        }
+    }
+
+    public void testFlatUpdateFromAnOlderBuildIsAppliedWithThatBuildsSemantics() throws IOException {
+        WorkloadGroup existing = throttledGroup("one", Settings.builder().put("group.node_limit", 5).build());
+        // As on the older build: switch the attribute and keep the limit (not "clear every rule").
+        WorkloadGroup switched = WorkloadGroup.updateExistingWorkloadGroup(
+            existing,
+            overTheWire(Settings.builder().put("attribute", "username").build())
+        );
+        assertEquals(Settings.builder().put("username.node_limit", 5).build(), switched.getMutableWorkloadGroupFragment().getThrottling());
+        // Overwrite one limit, clear another.
+        WorkloadGroup both = WorkloadGroup.updateExistingWorkloadGroup(
+            switched,
+            overTheWire(Settings.builder().put("shared_limit", 9).build())
+        );
+        WorkloadGroup cleared = WorkloadGroup.updateExistingWorkloadGroup(
+            both,
+            overTheWire(Settings.builder().putNull("node_limit").build())
+        );
+        assertEquals(Settings.builder().put("username.shared_limit", 9).build(), cleared.getMutableWorkloadGroupFragment().getThrottling());
+    }
+
+    public void testFlatUpdateCannotApplyToAMultiRuleGroupOrDropTheAttribute() throws IOException {
+        IllegalArgumentException multi = expectThrows(
+            IllegalArgumentException.class,
+            () -> WorkloadGroup.updateExistingWorkloadGroup(
+                throttledGroup("two", TWO_RULES),
+                overTheWire(Settings.builder().put("node_limit", 1).build())
+            )
+        );
+        assertTrue(multi.getMessage(), multi.getMessage().contains("several rules"));
+        IllegalArgumentException noAttribute = expectThrows(
+            IllegalArgumentException.class,
+            () -> WorkloadGroup.updateExistingWorkloadGroup(
+                throttledGroup("one", ONE_RULE),
+                overTheWire(Settings.builder().putNull("attribute").build())
+            )
+        );
+        assertTrue(noAttribute.getMessage(), noAttribute.getMessage().contains("attribute is required"));
+    }
+
+    public void testOlderBuildMayJoinOnlyWhileEveryGroupHasOneRule() {
+        DiscoveryNode olderBuild = new DiscoveryNode(
+            "old",
+            "old",
+            buildNewFakeTransportAddress(),
+            Map.of(),
+            Set.of(DiscoveryNodeRole.DATA_ROLE),
+            org.opensearch.Version.CURRENT
+        );
+        DiscoveryNode currentBuild = new DiscoveryNode(
+            "new",
+            "new",
+            buildNewFakeTransportAddress(),
+            Map.of(WorkloadGroupThrottleSettings.MULTI_ATTRIBUTE_THROTTLING_NODE_ATTRIBUTE, "true"),
+            Set.of(DiscoveryNodeRole.DATA_ROLE),
+            org.opensearch.Version.CURRENT
+        );
+        ClusterState singleRule = ClusterState.builder(new ClusterName("test"))
+            .metadata(Metadata.builder().put(throttledGroup("one", ONE_RULE)).build())
+            .build();
+        WorkloadGroupThrottleSettings.validateJoiningNode(olderBuild, singleRule);
+
+        ClusterState multiRule = ClusterState.builder(new ClusterName("test"))
+            .metadata(Metadata.builder().put(throttledGroup("two", TWO_RULES)).build())
+            .build();
+        IllegalStateException e = expectThrows(
+            IllegalStateException.class,
+            () -> WorkloadGroupThrottleSettings.validateJoiningNode(olderBuild, multiRule)
+        );
+        assertTrue(e.getMessage(), e.getMessage().contains("[two]"));
+        WorkloadGroupThrottleSettings.validateJoiningNode(currentBuild, multiRule);
     }
 }

@@ -24,6 +24,7 @@ import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Function;
+import java.util.function.Predicate;
 
 /**
  * Coordinator-local owner of the per-workload-group retained-request queues. A node-tier denial is parked directly as
@@ -337,17 +338,17 @@ public class WorkloadGroupQueueService {
         return queuesByGroup.keySet();
     }
 
-    /**
-     * Snapshot of every bucket on this coordinator that currently retains at least one PENDING_ACQUIRE or WAITING
-     * request. Used only after an owner-ring change: the shared throttle service compares each bucket's previous and
-     * current owner and re-registers demand that moved.
-     */
     /** Whether {@code bucketKey} currently has a retained (PENDING_ACQUIRE or WAITING) request. */
     public boolean hasRetained(String bucketKey) {
         WorkloadGroupQueue queue = queuesByGroup.get(groupIdOf(bucketKey));
         return queue != null && queue.bucketKeys().contains(bucketKey);
     }
 
+    /**
+     * Snapshot of every bucket on this coordinator that currently retains at least one PENDING_ACQUIRE or WAITING
+     * request. Used only after an owner-ring change: the shared throttle service compares each bucket's previous and
+     * current owner and re-registers demand that moved.
+     */
     public Set<String> retainedBucketKeys() {
         Set<String> bucketKeys = new HashSet<>();
         for (WorkloadGroupQueue queue : queuesByGroup.values()) {
@@ -364,6 +365,11 @@ public class WorkloadGroupQueueService {
      * @return the number of requests admitted
      */
     public int admitAllUntracked(String groupId) {
+        return admitAllUntracked(groupId, bucketKey -> true);
+    }
+
+    /** As {@link #admitAllUntracked(String)}, limited to the bucket keys {@code bucketKeyFilter} accepts. */
+    public int admitAllUntracked(String groupId, Predicate<String> bucketKeyFilter) {
         WorkloadGroupQueue queue = queuesByGroup.get(groupId);
         if (queue == null) {
             return 0;
@@ -371,7 +377,9 @@ public class WorkloadGroupQueueService {
         int released = 0;
         // Snapshot the bucket keys: admitAllUntracked mutates the bucket map (an emptied bucket is pruned).
         for (String bucketKey : new ArrayList<>(queue.bucketKeys())) {
-            released += admitAllUntracked(groupId, bucketKey);
+            if (bucketKeyFilter.test(bucketKey)) {
+                released += admitAllUntracked(groupId, bucketKey);
+            }
         }
         return released;
     }

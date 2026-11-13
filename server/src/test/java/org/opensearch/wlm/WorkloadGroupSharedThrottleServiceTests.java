@@ -1227,7 +1227,7 @@ public class WorkloadGroupSharedThrottleServiceTests extends OpenSearchTestCase 
 
         Releasable permit = awaitGrant(service, bucket, 1);
         assertNotNull(permit);
-        Releasable keepAlive = service.keepAlive(List.of(permit, () -> {}));
+        Releasable keepAlive = service.keepAlive(List.of(permit, () -> {}), () -> true);
         assertEquals("only the shared permit is tracked", 1, service.keptAliveCountForTest());
 
         // Renew just before the original TTL, then move past it: the permit must still occupy the bucket.
@@ -1238,23 +1238,142 @@ public class WorkloadGroupSharedThrottleServiceTests extends OpenSearchTestCase 
 
         keepAlive.close();
         assertEquals(0, service.keptAliveCountForTest());
-        service.keepAlive(List.of(permit));
+        service.keepAlive(List.of(permit), () -> true);
         permit.close();
         assertEquals("releasing a permit stops keeping it alive", 0, service.keptAliveCountForTest());
         assertEquals(0, clockedTracker.inFlight(bucket));
     }
 
-    public void testKeepAliveStopsRenewingAfterItsBound() {
-        final String bucket = "keep-alive-bound:group";
+    public void testKeepAliveRenewsForAsLongAsTheRequestWaits() {
+        final String bucket = "keep-alive-live:group";
         WorkloadGroupSharedThrottleService service = newService();
         stubGroupFor(bucket, 1);
         Releasable permit = awaitGrant(service, bucket, 1);
-        service.keepAlive(List.of(permit));
-        service.renewKeptAlivePermits(System.nanoTime());
+        AtomicBoolean waiting = new AtomicBoolean(true);
+        service.keepAlive(List.of(permit), waiting::get);
+        // No fixed bound: renewed on every round while the request still waits, however long that is.
+        for (int i = 0; i < 100; i++) {
+            service.renewKeptAlivePermits();
+        }
         assertEquals(1, service.keptAliveCountForTest());
-        service.renewKeptAlivePermits(System.nanoTime() + WorkloadGroupSharedThrottleService.MAX_KEEP_ALIVE_NANOS + 1);
-        assertEquals("a keep-alive past its bound is dropped, leaving the permit to its TTL", 0, service.keptAliveCountForTest());
+        waiting.set(false); // e.g. the request was cancelled
+        service.renewKeptAlivePermits();
+        assertEquals("a request that no longer waits stops being renewed", 0, service.keptAliveCountForTest());
         permit.close();
+    }
+
+    public void testEndOfWaitRenewsAPermitNotRefreshedRecently() {
+        final String bucket = "end-of-wait-renew:group";
+        final AtomicLong clock = new AtomicLong(0);
+        final SharedThrottleTracker clockedTracker = new SharedThrottleTracker(clock::get);
+        WorkloadGroupSharedThrottleService service = new WorkloadGroupSharedThrottleService(
+            clusterService,
+            threadPool,
+            transportService,
+            clockedTracker
+        );
+        deliverNodesChanged(service, clusterService.state().nodes());
+        stubGroupFor(bucket, 1);
+
+        Releasable permit = awaitGrant(service, bucket, 1);
+        Releasable keepAlive = service.keepAlive(List.of(permit), () -> true);
+        // The request waited: its permit was last refreshed long enough ago to be renewed when the wait ends.
+        ((WorkloadGroupSharedThrottleService.SharedPermit) permit).setRefreshedAtForTest(
+            System.nanoTime() - WorkloadGroupSharedThrottleService.END_OF_WAIT_RENEW_MIN_AGE_NANOS
+        );
+        clock.set(WorkloadGroupSharedThrottleService.PERMIT_TTL_NANOS - 1);
+        keepAlive.close();
+        service.renewStale(List.of(permit));
+        clock.set(WorkloadGroupSharedThrottleService.PERMIT_TTL_NANOS + 1);
+        assertFalse("renewed when the wait ended, so still live", clockedTracker.tryAcquire(bucket, 1, "intruder", 1));
+        permit.close();
+    }
+
+    public void testEndOfWaitSkipsAPermitRefreshedRecently() {
+        final String bucket = "end-of-wait-fresh:group";
+        final AtomicLong clock = new AtomicLong(0);
+        final SharedThrottleTracker clockedTracker = new SharedThrottleTracker(clock::get);
+        WorkloadGroupSharedThrottleService service = new WorkloadGroupSharedThrottleService(
+            clusterService,
+            threadPool,
+            transportService,
+            clockedTracker
+        );
+        deliverNodesChanged(service, clusterService.state().nodes());
+        stubGroupFor(bucket, 1);
+
+        Releasable permit = awaitGrant(service, bucket, 1);
+        clock.set(WorkloadGroupSharedThrottleService.PERMIT_TTL_NANOS - 1);
+        // Granted just now (in wall time): no renewal is sent.
+        service.renewStale(List.of(permit));
+        clock.set(WorkloadGroupSharedThrottleService.PERMIT_TTL_NANOS + 1);
+        assertTrue("not renewed, so it expired at its original TTL", clockedTracker.tryAcquire(bucket, 1, "intruder", 1));
+        permit.close();
+    }
+
+    public void testClosingAKeepAliveDoesNotRenew() {
+        final String bucket = "keep-alive-close:group";
+        final AtomicLong clock = new AtomicLong(0);
+        final SharedThrottleTracker clockedTracker = new SharedThrottleTracker(clock::get);
+        WorkloadGroupSharedThrottleService service = new WorkloadGroupSharedThrottleService(
+            clusterService,
+            threadPool,
+            transportService,
+            clockedTracker
+        );
+        deliverNodesChanged(service, clusterService.state().nodes());
+        stubGroupFor(bucket, 1);
+
+        Releasable permit = awaitGrant(service, bucket, 1);
+        ((WorkloadGroupSharedThrottleService.SharedPermit) permit).setRefreshedAtForTest(
+            System.nanoTime() - WorkloadGroupSharedThrottleService.END_OF_WAIT_RENEW_MIN_AGE_NANOS
+        );
+        clock.set(WorkloadGroupSharedThrottleService.PERMIT_TTL_NANOS - 1);
+        // A failed or cancelled step only closes the keep-alive; its permits are about to be released.
+        service.keepAlive(List.of(permit), () -> true).close();
+        clock.set(WorkloadGroupSharedThrottleService.PERMIT_TTL_NANOS + 1);
+        assertTrue("closing alone does not renew", clockedTracker.tryAcquire(bucket, 1, "intruder", 1));
+        permit.close();
+    }
+
+    public void testRenewRequestRoundTripsSeveralPermits() throws IOException {
+        WorkloadGroupSharedThrottleService.RenewPermitRequest renew = new WorkloadGroupSharedThrottleService.RenewPermitRequest(
+            List.of("g:username:alice", "g:role:reader"),
+            List.of("p1", "p2"),
+            42L
+        );
+        try (BytesStreamOutput out = new BytesStreamOutput()) {
+            renew.writeTo(out);
+            try (StreamInput in = out.bytes().streamInput()) {
+                WorkloadGroupSharedThrottleService.RenewPermitRequest read = new WorkloadGroupSharedThrottleService.RenewPermitRequest(in);
+                assertEquals(List.of("g:username:alice", "g:role:reader"), read.bucketKeys);
+                assertEquals(List.of("p1", "p2"), read.permitIds);
+                assertEquals(42L, read.ttlNanos);
+            }
+        }
+    }
+
+    public void testOwnerRenewsEveryPermitInARequest() {
+        final AtomicLong clock = new AtomicLong(0);
+        final SharedThrottleTracker clockedTracker = new SharedThrottleTracker(clock::get);
+        WorkloadGroupSharedThrottleService service = new WorkloadGroupSharedThrottleService(
+            clusterService,
+            threadPool,
+            transportService,
+            clockedTracker
+        );
+        assertTrue(clockedTracker.tryAcquire("a:group", 1, "p1", 10));
+        assertTrue(clockedTracker.tryAcquire("b:group", 1, "p2", 10));
+        service.handleRenew(
+            new WorkloadGroupSharedThrottleService.RenewPermitRequest(
+                List.of("a:group", "b:group"),
+                List.of("p1", "p2"),
+                WorkloadGroupSharedThrottleService.PERMIT_TTL_NANOS
+            )
+        );
+        clock.set(11);
+        assertFalse(clockedTracker.tryAcquire("a:group", 1, "q1", 10));
+        assertFalse(clockedTracker.tryAcquire("b:group", 1, "q2", 10));
     }
 
     public void testOwnerClampsTheRenewTtlItIsAskedFor() {
@@ -1268,7 +1387,7 @@ public class WorkloadGroupSharedThrottleServiceTests extends OpenSearchTestCase 
             clockedTracker
         );
         assertTrue(clockedTracker.tryAcquire(bucket, 1, "p", 1));
-        service.handleRenew(new WorkloadGroupSharedThrottleService.RenewPermitRequest(bucket, "p", Long.MAX_VALUE / 2));
+        service.handleRenew(new WorkloadGroupSharedThrottleService.RenewPermitRequest(List.of(bucket), List.of("p"), Long.MAX_VALUE / 2));
         clock.set(WorkloadGroupSharedThrottleService.PERMIT_TTL_NANOS + 1);
         assertTrue("renewal never exceeds the owner's own TTL", clockedTracker.tryAcquire(bucket, 1, "q", 1));
     }

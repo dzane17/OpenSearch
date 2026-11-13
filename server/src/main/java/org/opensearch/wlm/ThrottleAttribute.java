@@ -67,6 +67,17 @@ public enum ThrottleAttribute {
      */
     @Nullable
     public String resolve(@Nullable String principal) {
+        return resolve(principal, false);
+    }
+
+    /**
+     * As {@link #resolve(String)}, or with {@code firstToken} the first such token in header order: how builds that
+     * predate multi-attribute rules resolve it. Coordinators use that while any node runs such a build (see
+     * {@link WorkloadGroupThrottleSettings#MULTI_ATTRIBUTE_THROTTLING_NODE_ATTRIBUTE}), so a caller with several roles is
+     * charged to the same shared bucket whichever build coordinates its request.
+     */
+    @Nullable
+    public String resolve(@Nullable String principal, boolean firstToken) {
         if (principalSubfield == null || principal == null || principal.isEmpty()) {
             return null;
         }
@@ -76,6 +87,9 @@ public enum ThrottleAttribute {
             String trimmed = token.trim();
             if (trimmed.startsWith(prefix) && trimmed.length() > prefix.length()) {
                 String value = trimmed.substring(prefix.length());
+                if (firstToken) {
+                    return value;
+                }
                 if (smallest == null || value.compareTo(smallest) < 0) {
                     smallest = value;
                 }

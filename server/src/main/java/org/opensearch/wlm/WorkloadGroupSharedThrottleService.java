@@ -37,6 +37,7 @@ import org.opensearch.transport.TransportService;
 
 import java.io.IOException;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashSet;
@@ -47,6 +48,7 @@ import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.BooleanSupplier;
 import java.util.function.Predicate;
 import java.util.function.Supplier;
 
@@ -114,8 +116,10 @@ public class WorkloadGroupSharedThrottleService implements ClusterStateListener 
     // Renewal period for shared permits held by a request still waiting on a later bucket, so the TTL can't reclaim them.
     // Well below PERMIT_TTL_NANOS; permits of admitted requests are not renewed.
     static final TimeValue RENEW_INTERVAL = TimeValue.timeValueMinutes(1);
-    // Bound on renewing one request's permits, so a request whose admission never completes can't pin capacity forever.
-    static final long MAX_KEEP_ALIVE_NANOS = TimeValue.timeValueHours(1).nanos();
+    // When a waiting step succeeds (see renewStale), permits last refreshed longer ago than this are renewed once more,
+    // so the request continues with a full TTL rather than what is left of its last periodic renewal. A permit granted
+    // or renewed more recently already has close to a full TTL, so it is skipped to save the RPC.
+    static final long END_OF_WAIT_RENEW_MIN_AGE_NANOS = TimeValue.timeValueSeconds(1).nanos();
 
     private static final Logger logger = LogManager.getLogger(WorkloadGroupSharedThrottleService.class);
 
@@ -128,8 +132,8 @@ public class WorkloadGroupSharedThrottleService implements ClusterStateListener 
     private final AtomicReference<ThrottleOwnerSelector> ring = new AtomicReference<>();
     private volatile Scheduler.Cancellable sweepTask;
     private volatile Scheduler.Cancellable renewTask;
-    // COORDINATOR-SIDE: permits renewed every RENEW_INTERVAL (see keepAlive), mapped to the nanoTime renewal stops at.
-    private final Map<SharedPermit, Long> keptAlive = new ConcurrentHashMap<>();
+    // COORDINATOR-SIDE: permits renewed every RENEW_INTERVAL (see keepAlive), mapped to whether their request still waits.
+    private final Map<SharedPermit, BooleanSupplier> keptAlive = new ConcurrentHashMap<>();
 
     // OWNER-SIDE waiter registry for owner-push queue draining: for each bucket this node owns, the ordered SET of
     // coordinator process incarnations that have at least one retained request for the bucket. A set (not a count) makes
@@ -264,15 +268,13 @@ public class WorkloadGroupSharedThrottleService implements ClusterStateListener 
 
     /**
      * COORDINATOR-SIDE: keeps the shared permits among {@code permits} alive (renewed every {@link #RENEW_INTERVAL})
-     * until the returned handle is closed or each permit is released. Used while a request that already holds permits
-     * waits for its remaining buckets. Permits from another service instance or non-shared permits are ignored.
+     * while {@code stillWaiting} holds (the request is live) and until the returned handle is closed or each permit is
+     * released. There is no fixed bound: a queued request has no deadline, and one that goes away is failed by its queue
+     * entry, which closes the handle and releases the permits. Used while a request that already holds permits
+     * waits for its remaining buckets; see {@link #renewStale} for the renewal when the wait succeeds. Permits from
+     * another service instance or non-shared permits are ignored.
      */
-    Releasable keepAlive(List<Releasable> permits) {
-        return keepAlive(permits, System.nanoTime() + MAX_KEEP_ALIVE_NANOS);
-    }
-
-    /** As {@link #keepAlive(List)}, renewing until {@code renewUntilNanos} (a {@link System#nanoTime()} value). */
-    Releasable keepAlive(List<Releasable> permits, long renewUntilNanos) {
+    Releasable keepAlive(List<Releasable> permits, BooleanSupplier stillWaiting) {
         final List<SharedPermit> shared = new ArrayList<>();
         for (Releasable permit : permits) {
             if (permit instanceof SharedPermit sharedPermit && sharedPermit.service() == this) {
@@ -282,26 +284,74 @@ public class WorkloadGroupSharedThrottleService implements ClusterStateListener 
         if (shared.isEmpty()) {
             return () -> {};
         }
-        shared.forEach(permit -> keptAlive.put(permit, renewUntilNanos));
+        shared.forEach(permit -> keptAlive.put(permit, stillWaiting));
         return () -> shared.forEach(keptAlive::remove);
     }
 
-    void renewKeptAlivePermits() {
-        renewKeptAlivePermits(System.nanoTime());
+    /**
+     * COORDINATOR-SIDE: renews the shared permits among {@code permits} not refreshed within
+     * {@link #END_OF_WAIT_RENEW_MIN_AGE_NANOS}. Called when a waiting request's step succeeds, so it continues (and is
+     * finally admitted) with a full TTL rather than what is left of its last periodic renewal. Not called on failure:
+     * those permits are about to be released. Best effort; never throws.
+     */
+    void renewStale(List<Releasable> permits) {
+        try {
+            final long now = System.nanoTime();
+            final List<SharedPermit> stale = new ArrayList<>();
+            for (Releasable permit : permits) {
+                if (permit instanceof SharedPermit sharedPermit
+                    && sharedPermit.service() == this
+                    && now - sharedPermit.refreshedAtNanos >= END_OF_WAIT_RENEW_MIN_AGE_NANOS) {
+                    stale.add(sharedPermit);
+                }
+            }
+            renew(stale, now);
+        } catch (Exception e) {
+            // The permits keep their current TTL. Must not fail the request's admission step.
+            logger.debug("Failed to renew shared-throttle permits at the end of a wait", e);
+        }
     }
 
-    void renewKeptAlivePermits(long nowNanos) {
-        for (Map.Entry<SharedPermit, Long> entry : keptAlive.entrySet()) {
+    void renewKeptAlivePermits() {
+        final List<SharedPermit> due = new ArrayList<>();
+        for (Map.Entry<SharedPermit, BooleanSupplier> entry : keptAlive.entrySet()) {
             final SharedPermit permit = entry.getKey();
-            if (nowNanos - entry.getValue() > 0) {
+            if (entry.getValue().getAsBoolean() == false) {
                 keptAlive.remove(permit, entry.getValue());
-                logger.debug("Stopped renewing shared-throttle permit for bucket [{}] after the keep-alive bound", permit.bucketKey);
+                logger.debug("Stopped renewing shared-throttle permit for bucket [{}]: its request no longer waits", permit.bucketKey);
                 continue;
             }
+            due.add(permit);
+        }
+        renew(due, System.nanoTime());
+    }
+
+    // Renews still-held permits on their owners: this node's own directly, remote ones with one RPC per owner.
+    private void renew(Collection<SharedPermit> permits, long nowNanos) {
+        final Map<DiscoveryNode, List<SharedPermit>> byOwner = new HashMap<>();
+        for (SharedPermit permit : permits) {
+            if (permit.released.get()) {
+                continue;
+            }
+            // refreshedAtNanos moves only once the owner has extended the permit: a failed renewal must not make
+            // renewStale treat the permit as fresh.
+            if (permit.owner == null) {
+                try {
+                    if (tracker.renew(permit.bucketKey, permit.permitId, PERMIT_TTL_NANOS)) {
+                        permit.refreshedAtNanos = nowNanos;
+                    }
+                } catch (Exception e) {
+                    logger.debug("Failed to renew shared-throttle permit for bucket [" + permit.bucketKey + "]", e);
+                }
+            } else {
+                byOwner.computeIfAbsent(permit.owner, k -> new ArrayList<>()).add(permit);
+            }
+        }
+        for (Map.Entry<DiscoveryNode, List<SharedPermit>> entry : byOwner.entrySet()) {
             try {
-                permit.renew();
+                sendRenew(entry.getKey(), entry.getValue(), nowNanos);
             } catch (Exception e) {
-                logger.debug("Failed to renew shared-throttle permit for bucket [" + permit.bucketKey + "]", e);
+                logger.debug("Failed to send shared-throttle renewal to owner [" + entry.getKey().getId() + "]", e);
             }
         }
     }
@@ -311,10 +361,13 @@ public class WorkloadGroupSharedThrottleService implements ClusterStateListener 
         return keptAlive.size();
     }
 
-    // OWNER-SIDE: extend a still-recorded permit. Unknown ids (released, swept, or minted by a previous owner) no-op.
+    // OWNER-SIDE: extend still-recorded permits. Unknown ids (released, swept, or minted by a previous owner) no-op.
     void handleRenew(RenewPermitRequest request) {
         // Never extend beyond this owner's own TTL, whatever the coordinator asked for.
-        tracker.renew(request.bucketKey, request.permitId, Math.min(request.ttlNanos, PERMIT_TTL_NANOS));
+        final long ttlNanos = Math.min(request.ttlNanos, PERMIT_TTL_NANOS);
+        for (int i = 0; i < request.bucketKeys.size(); i++) {
+            tracker.renew(request.bucketKeys.get(i), request.permitIds.get(i), ttlNanos);
+        }
     }
 
     @Override
@@ -489,11 +542,19 @@ public class WorkloadGroupSharedThrottleService implements ClusterStateListener 
             if (previousGroup == null) {
                 continue;
             }
-            if (queueDrainSupersedesLimitIncrease(previousGroup, entry.getValue())) {
-                continue;
+            if (enteredMonitor(previousGroup, entry.getValue())) {
+                continue; // the whole group's queue is drained (WorkloadGroupService#bucketsRequiringQueueDrain)
             }
+            // A rule whose tier set changed has its queue drained instead; keep this hook disjoint from that.
+            final Set<String> drainedRules = WorkloadGroupThrottleSettings.rulesWithChangedTiers(
+                rules(previousGroup),
+                rules(entry.getValue())
+            );
             for (WorkloadGroupThrottleSettings.Rule rule : rules(entry.getValue())) {
                 final String attribute = rule.attribute().key();
+                if (drainedRules.contains(attribute)) {
+                    continue;
+                }
                 final int previousLimit = sharedLimit(previousGroup, attribute);
                 final int currentLimit = rule.sharedLimit();
                 // Only numeric increases; adding the tier is handled by the live-config queue drain.
@@ -530,16 +591,11 @@ public class WorkloadGroupSharedThrottleService implements ClusterStateListener 
         }
     }
 
-    // Keep this numeric-increase hook disjoint from WorkloadGroupService's run-all policy. When that policy applies,
-    // queued requests are admitted untracked and pushing shared permits at the old queue concurrently is unnecessary.
-    private static boolean queueDrainSupersedesLimitIncrease(WorkloadGroup previousGroup, WorkloadGroup currentGroup) {
-        if (previousGroup.getResiliencyMode() != MutableWorkloadGroupFragment.ResiliencyMode.MONITOR
-            && currentGroup.getResiliencyMode() == MutableWorkloadGroupFragment.ResiliencyMode.MONITOR) {
-            return true;
-        }
-        // A rule added or removed, or a rule's tier set changed, is the run-all policy (WorkloadGroupService#requiresQueueDrain).
-        return WorkloadGroupThrottleSettings.tierShape(rules(previousGroup))
-            .equals(WorkloadGroupThrottleSettings.tierShape(rules(currentGroup))) == false;
+    // Keep the numeric-increase hook disjoint from WorkloadGroupService's queue drain: where the drain applies, queued
+    // requests are admitted untracked and pushing shared permits at the old queue concurrently is unnecessary.
+    private static boolean enteredMonitor(WorkloadGroup previousGroup, WorkloadGroup currentGroup) {
+        return previousGroup.getResiliencyMode() != MutableWorkloadGroupFragment.ResiliencyMode.MONITOR
+            && currentGroup.getResiliencyMode() == MutableWorkloadGroupFragment.ResiliencyMode.MONITOR;
     }
 
     private static List<WorkloadGroupThrottleSettings.Rule> rules(WorkloadGroup workloadGroup) {
@@ -790,6 +846,8 @@ public class WorkloadGroupSharedThrottleService implements ClusterStateListener 
         private final String permitId;
         private final Runnable release;
         private final AtomicBoolean released = new AtomicBoolean(false);
+        // When the permit was granted or last renewed (System.nanoTime()); see END_OF_WAIT_RENEW_MIN_AGE_NANOS.
+        private volatile long refreshedAtNanos = System.nanoTime();
 
         private SharedPermit(@Nullable DiscoveryNode owner, String bucketKey, String permitId, Runnable release) {
             this.owner = owner;
@@ -802,15 +860,9 @@ public class WorkloadGroupSharedThrottleService implements ClusterStateListener 
             return WorkloadGroupSharedThrottleService.this;
         }
 
-        void renew() {
-            if (released.get()) {
-                return;
-            }
-            if (owner == null) {
-                tracker.renew(bucketKey, permitId, PERMIT_TTL_NANOS);
-            } else {
-                sendRenew(owner, bucketKey, permitId);
-            }
+        // Package-private for tests.
+        void setRefreshedAtForTest(long nanos) {
+            refreshedAtNanos = nanos;
         }
 
         @Override
@@ -822,13 +874,20 @@ public class WorkloadGroupSharedThrottleService implements ClusterStateListener 
         }
     }
 
-    // Fire-and-forget; a lost renewal is retried next interval, and an unknown id is a no-op on the owner.
-    private void sendRenew(DiscoveryNode owner, String bucketKey, String permitId) {
+    // Fire-and-forget, one RPC for all of an owner's permits; a lost renewal is retried next interval, and an unknown id
+    // is a no-op on the owner.
+    private void sendRenew(DiscoveryNode owner, List<SharedPermit> permits, long sentAtNanos) {
+        final List<String> bucketKeys = new ArrayList<>(permits.size());
+        final List<String> permitIds = new ArrayList<>(permits.size());
+        for (SharedPermit permit : permits) {
+            bucketKeys.add(permit.bucketKey);
+            permitIds.add(permit.permitId);
+        }
         final TransportRequestOptions options = TransportRequestOptions.builder().withTimeout(GRANT_TIMEOUT).build();
         transportService.sendRequest(
             owner,
             RENEW_ACTION_NAME,
-            new RenewPermitRequest(bucketKey, permitId, PERMIT_TTL_NANOS),
+            new RenewPermitRequest(bucketKeys, permitIds, PERMIT_TTL_NANOS),
             options,
             new TransportResponseHandler<TransportResponse.Empty>() {
                 @Override
@@ -837,11 +896,16 @@ public class WorkloadGroupSharedThrottleService implements ClusterStateListener 
                 }
 
                 @Override
-                public void handleResponse(TransportResponse.Empty response) {}
+                public void handleResponse(TransportResponse.Empty response) {
+                    // The owner extended every permit it still records; its TTL counts from about when this was sent.
+                    for (SharedPermit permit : permits) {
+                        permit.refreshedAtNanos = sentAtNanos;
+                    }
+                }
 
                 @Override
                 public void handleException(TransportException exp) {
-                    logger.debug("Shared throttle renew to owner [{}] for bucket [{}] failed", owner.getId(), bucketKey);
+                    logger.debug("Shared throttle renew of [{}] permits to owner [{}] failed", permits.size(), owner.getId());
                 }
 
                 @Override
@@ -1165,13 +1229,10 @@ public class WorkloadGroupSharedThrottleService implements ClusterStateListener 
         if (state == null || state.metadata() == null || state.metadata().workloadGroups() == null) {
             return WorkloadGroupThrottleSettings.UNSET_LIMIT;
         }
-        final String groupId = groupIdOf(bucketKey);
-        final WorkloadGroup workloadGroup = state.metadata().workloadGroups().get(groupId);
-        if (workloadGroup == null) {
-            return WorkloadGroupThrottleSettings.UNSET_LIMIT;
-        }
-        final WorkloadGroupThrottleSettings.Rule rule = workloadGroup.getMutableWorkloadGroupFragment()
-            .getThrottleRule(WorkloadGroupThrottleSettings.attributeOf(bucketKey));
+        final WorkloadGroupThrottleSettings.Rule rule = WorkloadGroupThrottleSettings.ruleForBucket(
+            state.metadata().workloadGroups().get(groupIdOf(bucketKey)),
+            bucketKey
+        );
         return rule == null ? WorkloadGroupThrottleSettings.UNSET_LIMIT : rule.sharedLimit();
     }
 
@@ -1691,6 +1752,22 @@ public class WorkloadGroupSharedThrottleService implements ClusterStateListener 
         throw new IllegalStateException("wlm shared-throttle: key [" + key + "] missing or not a Number [" + value + "]");
     }
 
+    private static List<String> requireStringList(Map<String, Object> body, String key) {
+        final Object value = body.get(key);
+        if (value instanceof List<?> list) {
+            final List<String> strings = new ArrayList<>(list.size());
+            for (Object element : list) {
+                if (element instanceof String s) {
+                    strings.add(s);
+                } else {
+                    throw new IllegalStateException("wlm shared-throttle: key [" + key + "] has a non-String element [" + element + "]");
+                }
+            }
+            return strings;
+        }
+        throw new IllegalStateException("wlm shared-throttle: key [" + key + "] missing or not a List [" + value + "]");
+    }
+
     private static boolean requireBoolean(Map<String, Object> body, String key) {
         final Object value = body.get(key);
         if (value instanceof Boolean b) {
@@ -1869,32 +1946,36 @@ public class WorkloadGroupSharedThrottleService implements ClusterStateListener 
     }
 
     /**
-     * {@code coord -> owner}. Release RPC: fire-and-forget, tells the owner to drop a previously-granted permit.
-     */
-    /**
      * {@code coord -> owner}. Renew RPC: extend the TTL of a permit held by a request that is still acquiring its other
      * buckets.
      */
     public static class RenewPermitRequest extends TransportRequest {
-        static final String KEY_BUCKET = "bucket_key";
-        static final String KEY_PERMIT_ID = "permit_id";
+        static final String KEY_BUCKETS = "bucket_keys";
+        static final String KEY_PERMIT_IDS = "permit_ids";
         static final String KEY_TTL_NANOS = "ttl_nanos";
 
-        final String bucketKey;
-        final String permitId;
+        // Parallel lists: permitIds.get(i) is a permit in bucket bucketKeys.get(i), all granted by the receiving owner.
+        final List<String> bucketKeys;
+        final List<String> permitIds;
         final long ttlNanos;
 
-        RenewPermitRequest(String bucketKey, String permitId, long ttlNanos) {
-            this.bucketKey = bucketKey;
-            this.permitId = permitId;
+        RenewPermitRequest(List<String> bucketKeys, List<String> permitIds, long ttlNanos) {
+            if (bucketKeys.size() != permitIds.size()) {
+                throw new IllegalArgumentException("bucket_keys and permit_ids must have the same length");
+            }
+            this.bucketKeys = List.copyOf(bucketKeys);
+            this.permitIds = List.copyOf(permitIds);
             this.ttlNanos = ttlNanos;
         }
 
         RenewPermitRequest(StreamInput in) throws IOException {
             super(in);
             final Map<String, Object> body = readBody(in);
-            this.bucketKey = requireString(body, KEY_BUCKET);
-            this.permitId = requireString(body, KEY_PERMIT_ID);
+            this.bucketKeys = requireStringList(body, KEY_BUCKETS);
+            this.permitIds = requireStringList(body, KEY_PERMIT_IDS);
+            if (bucketKeys.size() != permitIds.size()) {
+                throw new IllegalStateException("wlm shared-throttle: [" + KEY_BUCKETS + "] and [" + KEY_PERMIT_IDS + "] differ in length");
+            }
             this.ttlNanos = requireNumber(body, KEY_TTL_NANOS).longValue();
         }
 
@@ -1902,13 +1983,16 @@ public class WorkloadGroupSharedThrottleService implements ClusterStateListener 
         public void writeTo(StreamOutput out) throws IOException {
             super.writeTo(out);
             out.writeMap(
-                Map.of(KEY_BUCKET, bucketKey, KEY_PERMIT_ID, permitId, KEY_TTL_NANOS, ttlNanos),
+                Map.of(KEY_BUCKETS, bucketKeys, KEY_PERMIT_IDS, permitIds, KEY_TTL_NANOS, ttlNanos),
                 StreamOutput::writeString,
                 StreamOutput::writeGenericValue
             );
         }
     }
 
+    /**
+     * {@code coord -> owner}. Release RPC: fire-and-forget, tells the owner to drop a previously-granted permit.
+     */
     public static class ReleasePermitRequest extends TransportRequest {
         static final String KEY_BUCKET = "bucket_key";
         static final String KEY_PERMIT_ID = "permit_id";

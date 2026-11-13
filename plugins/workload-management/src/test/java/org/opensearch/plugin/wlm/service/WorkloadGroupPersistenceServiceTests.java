@@ -9,6 +9,7 @@
 package org.opensearch.plugin.wlm.service;
 
 import org.opensearch.ResourceNotFoundException;
+import org.opensearch.Version;
 import org.opensearch.action.support.clustermanager.AcknowledgedResponse;
 import org.opensearch.cluster.AckedClusterStateUpdateTask;
 import org.opensearch.cluster.ClusterName;
@@ -16,6 +17,9 @@ import org.opensearch.cluster.ClusterState;
 import org.opensearch.cluster.ClusterStateUpdateTask;
 import org.opensearch.cluster.metadata.Metadata;
 import org.opensearch.cluster.metadata.WorkloadGroup;
+import org.opensearch.cluster.node.DiscoveryNode;
+import org.opensearch.cluster.node.DiscoveryNodeRole;
+import org.opensearch.cluster.node.DiscoveryNodes;
 import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.collect.Tuple;
 import org.opensearch.common.settings.ClusterSettings;
@@ -555,5 +559,55 @@ public class WorkloadGroupPersistenceServiceTests extends OpenSearchTestCase {
         }).when(clusterService).submitStateUpdateTask(anyString(), any());
         workloadGroupPersistenceService.updateInClusterStateMetadata(updateWorkloadGroupRequest, listener);
         verify(listener).onFailure(any(RuntimeException.class));
+    }
+
+    private static ClusterState withAnOlderBuildNode(ClusterState state) {
+        DiscoveryNode olderBuild = new DiscoveryNode(
+            "old-node",
+            "old-node",
+            buildNewFakeTransportAddress(),
+            Map.of(),
+            Set.of(DiscoveryNodeRole.DATA_ROLE),
+            Version.CURRENT
+        );
+        return ClusterState.builder(state).nodes(DiscoveryNodes.builder(state.nodes()).add(olderBuild)).build();
+    }
+
+    public void testSeveralRulesAreRejectedWhileANodeRunsAnOlderBuild() {
+        Tuple<WorkloadGroupPersistenceService, ClusterState> setup = preparePersistenceServiceSetup(new HashMap<>());
+        ClusterState mixed = withAnOlderBuildNode(setup.v2());
+        Settings twoRules = Settings.builder().put("username.node_limit", 5).put("group.node_limit", 10).build();
+        WorkloadGroup multiRule = new WorkloadGroup(
+            "multi",
+            "_id_multi",
+            new MutableWorkloadGroupFragment(ResiliencyMode.ENFORCED, Map.of(ResourceType.MEMORY, 0.1), Settings.EMPTY, twoRules),
+            1690934400000L
+        );
+        IllegalArgumentException e = expectThrows(
+            IllegalArgumentException.class,
+            () -> setup.v1().saveWorkloadGroupInClusterState(multiRule, mixed)
+        );
+        assertTrue(e.getMessage(), e.getMessage().contains("[old-node]"));
+
+        // A single rule is fine: older nodes receive it in the flat form.
+        WorkloadGroup singleRule = new WorkloadGroup(
+            "single",
+            "_id_single",
+            new MutableWorkloadGroupFragment(
+                ResiliencyMode.ENFORCED,
+                Map.of(ResourceType.MEMORY, 0.1),
+                Settings.EMPTY,
+                Settings.builder().put("username.node_limit", 5).build()
+            ),
+            1690934400000L
+        );
+        ClusterState withSingle = setup.v1().saveWorkloadGroupInClusterState(singleRule, mixed);
+
+        // Nor can an update add a second rule while the older node is there.
+        UpdateWorkloadGroupRequest addRule = updateWorkloadGroupRequest(
+            "single",
+            new MutableWorkloadGroupFragment(null, new HashMap<>(), null, Settings.builder().put("group.node_limit", 10).build())
+        );
+        expectThrows(IllegalArgumentException.class, () -> setup.v1().updateWorkloadGroupInClusterState(addRule, withSingle));
     }
 }
