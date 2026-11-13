@@ -27,9 +27,10 @@ import java.util.Map;
  * early pushed grant cannot race ahead of local registration; that provisional state does not consume this configured
  * waiting budget. A registered owner denial attempts to transition the exact request to {@code WAITING} and reserve a
  * bucket slot; an unregistered denial or full waiting bucket rejects that exact request instead.
- * Keying the cap per bucket gives fairness for {@code attribute=username}/{@code role}: one principal's denied backlog
+ * Keying the cap per bucket gives fairness for {@code username}/{@code role} rules: one principal's denied backlog
  * cannot consume another principal's per-bucket allowance. That fairness is bounded rather than absolute — see the
- * group ceiling below. For {@code attribute=group} there is a single bucket, so this is the group's waiting depth.
+ * group ceiling below. A {@code group} rule has a single bucket, so for it this is the group's waiting depth. A request
+ * waits in at most one bucket at a time: the bucket of the first rule (in acquisition order) that denied it.
  * <p>
  * Above the per-bucket cap sits a fixed, non-configurable per-group ceiling ({@link #MAX_GROUP_QUEUE_DEPTH}) on every
  * retained request across all of a group's buckets on one coordinator:
@@ -65,7 +66,7 @@ public class WorkloadGroupQueueSettings {
     /**
      * Maximum configurable per-bucket queue depth. Pinned to {@link #MAX_GROUP_QUEUE_DEPTH}: the group ceiling caps the
      * total across all of a group's buckets, so a larger per-bucket value could never be honoured and accepting one
-     * would silently mislead. A single-bucket group ({@code attribute=group}) can therefore still queue the entire group
+     * would silently mislead. A group throttled only by a {@code group} rule (one bucket) can therefore still queue the entire group
      * budget in its one bucket.
      */
     public static final int MAX_SIZE_PER_BUCKET = MAX_GROUP_QUEUE_DEPTH;

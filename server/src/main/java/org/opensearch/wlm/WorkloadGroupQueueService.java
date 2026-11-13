@@ -24,6 +24,7 @@ import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Function;
+import java.util.function.Predicate;
 
 /**
  * Coordinator-local owner of the per-workload-group retained-request queues. A node-tier denial is parked directly as
@@ -94,18 +95,29 @@ public class WorkloadGroupQueueService {
         int sizePerBucket,
         ActionListener<Releasable> listener
     ) {
+        return tryEnqueueRequest(groupId, bucketKey, task, sizePerBucket, listener) != null;
+    }
+
+    /** As {@link #tryEnqueue}, returning the retained entry (or {@code null}) so the caller can target it later. */
+    public WorkloadGroupQueue.QueuedRequest tryEnqueueRequest(
+        String groupId,
+        String bucketKey,
+        WorkloadGroupTask task,
+        int sizePerBucket,
+        ActionListener<Releasable> listener
+    ) {
         if (sizePerBucket <= 0) {
-            return false; // queueing disabled: not a queue rejection, the caller rejects with the normal throttle 429
+            return null; // queueing disabled: not a queue rejection, the caller rejects with the normal throttle 429
         }
         final long waitStartNanos = threadPool.relativeTimeInNanos();
         WorkloadGroupQueue.QueuedRequest req = new WorkloadGroupQueue.QueuedRequest(listener, bucketKey, task, waitStartNanos);
         if (enqueueWaiting(groupId, req, sizePerBucket) == false) {
             incrementQueueRejection(groupId); // bucket or group queue full
-            return false;
+            return null;
         }
         // Count the completed wait when this entry is selected for admission, not here, so total_queued and the wait sum
         // describe the same completed WAITING intervals.
-        return true;
+        return req;
     }
 
     /**
@@ -326,6 +338,12 @@ public class WorkloadGroupQueueService {
         return queuesByGroup.keySet();
     }
 
+    /** Whether {@code bucketKey} currently has a retained (PENDING_ACQUIRE or WAITING) request. */
+    public boolean hasRetained(String bucketKey) {
+        WorkloadGroupQueue queue = queuesByGroup.get(groupIdOf(bucketKey));
+        return queue != null && queue.bucketKeys().contains(bucketKey);
+    }
+
     /**
      * Snapshot of every bucket on this coordinator that currently retains at least one PENDING_ACQUIRE or WAITING
      * request. Used only after an owner-ring change: the shared throttle service compares each bucket's previous and
@@ -347,6 +365,11 @@ public class WorkloadGroupQueueService {
      * @return the number of requests admitted
      */
     public int admitAllUntracked(String groupId) {
+        return admitAllUntracked(groupId, bucketKey -> true);
+    }
+
+    /** As {@link #admitAllUntracked(String)}, limited to the bucket keys {@code bucketKeyFilter} accepts. */
+    public int admitAllUntracked(String groupId, Predicate<String> bucketKeyFilter) {
         WorkloadGroupQueue queue = queuesByGroup.get(groupId);
         if (queue == null) {
             return 0;
@@ -354,7 +377,9 @@ public class WorkloadGroupQueueService {
         int released = 0;
         // Snapshot the bucket keys: admitAllUntracked mutates the bucket map (an emptied bucket is pruned).
         for (String bucketKey : new ArrayList<>(queue.bucketKeys())) {
-            released += admitAllUntracked(groupId, bucketKey);
+            if (bucketKeyFilter.test(bucketKey)) {
+                released += admitAllUntracked(groupId, bucketKey);
+            }
         }
         return released;
     }
@@ -390,7 +415,7 @@ public class WorkloadGroupQueueService {
     }
 
     // The group id is the bucketKey prefix before the first ':' ("<groupId>:group" or "<groupId>:<attr>:<value>", see
-    // WorkloadGroupService.buildBucketKey). Group ids are base64 UUIDs with no ':', so the first ':' is unambiguous.
+    // WorkloadGroupThrottleSettings#bucketKey). Group ids are base64 UUIDs with no ':', so the first ':' is unambiguous.
     private static String groupIdOf(String bucketKey) {
         int idx = bucketKey.indexOf(':');
         return idx < 0 ? bucketKey : bucketKey.substring(0, idx);

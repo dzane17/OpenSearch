@@ -29,6 +29,9 @@ import org.opensearch.threadpool.ThreadPool;
 import org.opensearch.transport.ConnectTransportException;
 
 import java.io.IOException;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.CountDownLatch;
@@ -107,7 +110,7 @@ public class WorkloadGroupSharedThrottleServiceTransportTests extends OpenSearch
         // Find a bucket key that the coordinator's ring maps to the REMOTE owner node, so acquireAsync takes the
         // transport path rather than the local short-circuit. Guard the whole harness against a mis-built ring.
         for (int i = 0; i < 10000 && remoteKey == null; i++) {
-            String candidate = "bucket-" + i;
+            String candidate = "bucket-" + i + ":group";
             DiscoveryNode owner = coordinatorService.ring().ownerFor(candidate).orElse(null);
             if (owner != null && owner.getId().equals(ownerNode.getId())) {
                 remoteKey = candidate;
@@ -213,8 +216,9 @@ public class WorkloadGroupSharedThrottleServiceTransportTests extends OpenSearch
      * owner-push. The no-waiter callback must NOT fire.
      */
     public void testDeniedRegistersWaiterWhenCoordinatorReachableFromOwner() throws Exception {
-        // The owner must both SEE the coordinator in its applied state and hold a connection to it.
-        ownerSees(coordinatorNode);
+        // The owner must both SEE the coordinator in its applied state and hold a connection to it (and the bucket's
+        // shared tier must exist, or there is nothing to wait for).
+        ownerSeesWithGroup(coordinatorNode);
         ownerTransport.connectToNode(coordinatorNode);
 
         fillOwnerToLimit();
@@ -469,7 +473,7 @@ public class WorkloadGroupSharedThrottleServiceTransportTests extends OpenSearch
             final ThrottleOwnerSelector threeNodeRing = ThrottleOwnerSelector.fromDiscoveryNodes(ownerNodes);
             String redistributionKey = null;
             for (int i = 0; i < 10_000 && redistributionKey == null; i++) {
-                final String candidate = "redistribution-bucket-" + i;
+                final String candidate = "redistribution-bucket-" + i + ":group";
                 if (threeNodeRing.ownerFor(candidate).filter(ownerNode::equals).isPresent()) {
                     redistributionKey = candidate;
                 }
@@ -777,6 +781,92 @@ public class WorkloadGroupSharedThrottleServiceTransportTests extends OpenSearch
         ownerTransport.clearAllRules();
     }
 
+    public void testCoordinatorReRegistersWhenARequestArrivesWhileReturningAnUnusedGrant() throws Exception {
+        ownerSeesWithGroup(coordinatorNode);
+        ownerTransport.connectToNode(coordinatorNode);
+        fillOwnerToLimit();
+        CapturingListener denial = new CapturingListener();
+        coordinatorService.acquireAsync(remoteKey, 1, denial, () -> fail("the reachable coordinator must be registered"));
+        denial.await();
+        assertEquals(1, ownerService.waiterCountForTest(remoteKey));
+
+        // The pushed grant finds the queue empty, but a new request for the bucket arrives before the owner processes
+        // the unused-grant release (which deregisters this coordinator).
+        AtomicInteger grants = new AtomicInteger();
+        AtomicBoolean demandArrived = new AtomicBoolean(true);
+        coordinatorService.setRetainedBucketCheck(bucketKey -> demandArrived.getAndSet(false));
+        coordinatorService.setGrantConsumer((bucketKey, permit) -> {
+            grants.incrementAndGet();
+            return false;
+        });
+
+        ownerService.handleRelease(new WorkloadGroupSharedThrottleService.ReleasePermitRequest(remoteKey, "pre"));
+        // The coordinator re-registers after its release is acknowledged, so the owner offers the slot to it again.
+        assertBusy(() -> assertEquals("the re-registered coordinator receives the next grant", 2, grants.get()));
+        assertBusy(() -> {
+            assertEquals(0, ownerService.tracker().inFlight(remoteKey));
+            assertEquals(0, ownerService.waiterCountForTest(remoteKey));
+        });
+    }
+
+    public void testCoordinatorReRegistersEvenIfTheUnusedGrantReleaseReplyIsLost() throws Exception {
+        ownerSeesWithGroup(coordinatorNode);
+        ownerTransport.connectToNode(coordinatorNode);
+        fillOwnerToLimit();
+        CapturingListener denial = new CapturingListener();
+        coordinatorService.acquireAsync(remoteKey, 1, denial, () -> fail("the reachable coordinator must be registered"));
+        denial.await();
+
+        // The owner processes the unused-grant release (deregistering the coordinator) but its reply never arrives.
+        ownerTransport.addRequestHandlingBehavior(
+            WorkloadGroupSharedThrottleService.RELEASE_ACTION_NAME,
+            (handler, request, channel, task) -> {
+                ownerService.handleRelease((WorkloadGroupSharedThrottleService.ReleasePermitRequest) request);
+                channel.sendResponse(new IllegalStateException("reply lost"));
+            }
+        );
+        AtomicInteger grants = new AtomicInteger();
+        AtomicBoolean demandArrived = new AtomicBoolean(true);
+        coordinatorService.setRetainedBucketCheck(bucketKey -> demandArrived.getAndSet(false));
+        coordinatorService.setGrantConsumer((bucketKey, permit) -> {
+            grants.incrementAndGet();
+            return false;
+        });
+
+        ownerService.handleRelease(new WorkloadGroupSharedThrottleService.ReleasePermitRequest(remoteKey, "pre"));
+        assertBusy(() -> assertEquals("the coordinator re-registered despite the failed reply", 2, grants.get()));
+        ownerTransport.clearAllRules();
+    }
+
+    public void testUnusedPushedGrantIsReturnedToTheNodeThatGrantedIt() throws Exception {
+        ownerSeesWithGroup(coordinatorNode);
+        ownerTransport.connectToNode(coordinatorNode);
+        fillOwnerToLimit();
+        CapturingListener denial = new CapturingListener();
+        coordinatorService.acquireAsync(remoteKey, 1, denial, () -> fail("the reachable coordinator must be registered"));
+        denial.await();
+        assertEquals(1, ownerService.waiterCountForTest(remoteKey));
+
+        // The coordinator's ring moves the bucket to itself before the grant arrives, and it has nothing queued.
+        DiscoveryNodes bothNodes = DiscoveryNodes.builder()
+            .add(coordinatorNode)
+            .add(ownerNode)
+            .localNodeId(coordinatorNode.getId())
+            .build();
+        ClusterState coordinatorState = stateWithGroup(bothNodes);
+        when(coordinatorClusterService.state()).thenReturn(coordinatorState);
+        deliverNodes(coordinatorService, DiscoveryNodes.builder().add(coordinatorNode).localNodeId(coordinatorNode.getId()).build());
+        coordinatorService.setGrantConsumer((bucketKey, permit) -> false);
+
+        ownerService.handleRelease(new WorkloadGroupSharedThrottleService.ReleasePermitRequest(remoteKey, "pre"));
+        // The unused grant must go back to the owner that minted it (not the coordinator's new ring owner), so the
+        // owner reclaims the reserved slot and deregisters the coordinator right away instead of waiting for the TTL.
+        assertBusy(() -> {
+            assertEquals(0, ownerService.tracker().inFlight(remoteKey));
+            assertEquals(0, ownerService.waiterCountForTest(remoteKey));
+        });
+    }
+
     public void testRemoteOwnerChangeReRegistrationRoundTripsAndImmediatelyDrives() throws Exception {
         ownerSeesWithGroup(coordinatorNode);
         ownerTransport.connectToNode(coordinatorNode);
@@ -912,7 +1002,7 @@ public class WorkloadGroupSharedThrottleServiceTransportTests extends OpenSearch
                 MutableWorkloadGroupFragment.ResiliencyMode.ENFORCED,
                 Map.of(ResourceType.MEMORY, 0.5),
                 Settings.EMPTY,
-                Settings.builder().put("attribute", "group").put("shared_limit", sharedLimit).build()
+                Settings.builder().put("group.shared_limit", sharedLimit).build()
             ),
             1L
         );
@@ -925,6 +1015,58 @@ public class WorkloadGroupSharedThrottleServiceTransportTests extends OpenSearch
     }
 
     /** Captures the outcome of an async acquire, distinguishing onResponse(null) from an unfired listener via a latch. */
+    private Releasable acquireRemote(int sharedLimit) throws Exception {
+        CapturingListener listener = new CapturingListener();
+        coordinatorService.acquireAsync(remoteKey, sharedLimit, listener);
+        listener.await();
+        assertNotNull("the remote owner must grant", listener.response.get());
+        return listener.response.get();
+    }
+
+    public void testRenewalSendsOneRpcPerOwner() throws Exception {
+        Releasable first = acquireRemote(2);
+        Releasable second = acquireRemote(2);
+        List<Integer> batchSizes = Collections.synchronizedList(new ArrayList<>());
+        ownerTransport.addRequestHandlingBehavior(
+            WorkloadGroupSharedThrottleService.RENEW_ACTION_NAME,
+            (handler, request, channel, task) -> {
+                batchSizes.add(((WorkloadGroupSharedThrottleService.RenewPermitRequest) request).permitIds.size());
+                handler.messageReceived(request, channel, task);
+            }
+        );
+        Releasable keepAlive = coordinatorService.keepAlive(List.of(first, second), () -> true);
+        coordinatorService.renewKeptAlivePermits();
+        assertBusy(() -> assertEquals("both permits renewed in one request", List.of(2), batchSizes));
+        keepAlive.close();
+        first.close();
+        second.close();
+        ownerTransport.clearAllRules();
+    }
+
+    public void testAFailedRenewalDoesNotMarkThePermitFresh() throws Exception {
+        Releasable permit = acquireRemote(1);
+        AtomicInteger renewals = new AtomicInteger();
+        ownerTransport.addRequestHandlingBehavior(
+            WorkloadGroupSharedThrottleService.RENEW_ACTION_NAME,
+            (handler, request, channel, task) -> {
+                renewals.incrementAndGet();
+                channel.sendResponse(new IllegalStateException("owner briefly unavailable"));
+            }
+        );
+        ((WorkloadGroupSharedThrottleService.SharedPermit) permit).setRefreshedAtForTest(
+            System.nanoTime() - WorkloadGroupSharedThrottleService.END_OF_WAIT_RENEW_MIN_AGE_NANOS
+        );
+        Releasable keepAlive = coordinatorService.keepAlive(List.of(permit), () -> true);
+        coordinatorService.renewKeptAlivePermits();
+        assertBusy(() -> assertEquals(1, renewals.get()));
+        // The periodic renewal failed, so the end-of-wait renewal must still be sent rather than skipped as fresh.
+        keepAlive.close();
+        coordinatorService.renewStale(List.of(permit));
+        assertBusy(() -> assertEquals(2, renewals.get()));
+        permit.close();
+        ownerTransport.clearAllRules();
+    }
+
     private static final class CapturingListener implements ActionListener<Releasable> {
         final CountDownLatch latch = new CountDownLatch(1);
         final AtomicReference<Releasable> response = new AtomicReference<>();

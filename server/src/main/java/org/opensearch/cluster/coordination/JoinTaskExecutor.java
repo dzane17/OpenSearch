@@ -53,6 +53,7 @@ import org.opensearch.core.action.ActionListener;
 import org.opensearch.node.remotestore.RemoteStoreNodeAttribute;
 import org.opensearch.node.remotestore.RemoteStoreNodeService;
 import org.opensearch.persistent.PersistentTasksCustomMetadata;
+import org.opensearch.wlm.WorkloadGroupThrottleSettings;
 
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -226,6 +227,9 @@ public class JoinTaskExecutor implements ClusterStateTaskExecutor<JoinTaskExecut
                     // we do this validation quite late to prevent race conditions between nodes joining and importing dangling indices
                     // we have to reject nodes that don't support all indices we have in this cluster
                     ensureIndexCompatibility(node.getVersion(), currentState.getMetadata());
+                    // Late for the same reason: a node on a build that can't read a workload group's throttling config
+                    // would fail to apply every cluster state. Re-checked here, in the same task queue as the group writes.
+                    WorkloadGroupThrottleSettings.validateJoiningNode(node, currentState);
                     // we have added the same check in handleJoinRequest method and adding it here as this method
                     // would guarantee that a decommissioned node would never be able to join the cluster and ensures correctness
                     ensureNodeCommissioned(node, currentState.metadata());
@@ -648,6 +652,7 @@ public class JoinTaskExecutor implements ClusterStateTaskExecutor<JoinTaskExecut
         validators.add((node, state) -> {
             ensureNodesCompatibility(node, state.getNodes(), state.metadata());
             ensureIndexCompatibility(node.getVersion(), state.getMetadata());
+            WorkloadGroupThrottleSettings.validateJoiningNode(node, state);
             ensureNodeCommissioned(node, state.getMetadata());
         });
         validators.addAll(onJoinValidators);

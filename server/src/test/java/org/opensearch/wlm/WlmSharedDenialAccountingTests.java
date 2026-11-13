@@ -85,7 +85,7 @@ public class WlmSharedDenialAccountingTests extends OpenSearchTestCase {
         );
 
         // shared_limit only (no node tier) so every request goes straight to the shared/queueing path.
-        Settings throttling = Settings.builder().put("attribute", "group").put("shared_limit", 1).build();
+        Settings throttling = Settings.builder().put("group.shared_limit", 1).build();
         Settings queue = Settings.builder().put("size_per_bucket", 1).build();
         WorkloadGroup wg = new WorkloadGroup(
             GROUP + "-name",

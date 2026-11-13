@@ -43,6 +43,7 @@ import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.metadata.Metadata;
 import org.opensearch.cluster.metadata.RepositoriesMetadata;
 import org.opensearch.cluster.metadata.RepositoryMetadata;
+import org.opensearch.cluster.metadata.WorkloadGroup;
 import org.opensearch.cluster.node.DiscoveryNode;
 import org.opensearch.cluster.node.DiscoveryNodeRole;
 import org.opensearch.cluster.node.DiscoveryNodes;
@@ -57,6 +58,9 @@ import org.opensearch.repositories.RepositoryMissingException;
 import org.opensearch.repositories.blobstore.BlobStoreRepository;
 import org.opensearch.test.OpenSearchTestCase;
 import org.opensearch.test.VersionUtils;
+import org.opensearch.wlm.MutableWorkloadGroupFragment;
+import org.opensearch.wlm.ResourceType;
+import org.opensearch.wlm.WorkloadGroupThrottleSettings;
 
 import java.util.ArrayList;
 import java.util.Collections;
@@ -65,6 +69,7 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.function.BiConsumer;
 import java.util.stream.Collectors;
 
 import static org.opensearch.common.util.FeatureFlags.REMOTE_STORE_MIGRATION_EXPERIMENTAL;
@@ -350,6 +355,66 @@ public class JoinTaskExecutorTests extends OpenSearchTestCase {
         assertFalse(taskResult.isSuccess());
         assertTrue(taskResult.getFailure() instanceof NodeDecommissionedException);
         assertFalse(result.resultingState.getNodes().nodeExists(decommissionedNodeID));
+    }
+
+    public void testNodeThatCannotReadAWorkloadGroupsThrottlingIsRejectedWhenTheJoinRuns() throws Exception {
+        final AllocationService allocationService = mock(AllocationService.class);
+        when(allocationService.adaptAutoExpandReplicas(any())).then(invocationOnMock -> invocationOnMock.getArguments()[0]);
+        final JoinTaskExecutor joinTaskExecutor = new JoinTaskExecutor(
+            Settings.EMPTY,
+            allocationService,
+            logger,
+            (reason, priority, listener) -> listener.onResponse(null),
+            mock(RemoteStoreNodeService.class)
+        );
+        final DiscoveryNode clusterManagerNode = new DiscoveryNode(
+            UUIDs.base64UUID(),
+            buildNewFakeTransportAddress(),
+            Map.of(WorkloadGroupThrottleSettings.MULTI_ATTRIBUTE_THROTTLING_NODE_ATTRIBUTE, "true"),
+            DiscoveryNodeRole.BUILT_IN_ROLES,
+            Version.CURRENT
+        );
+        // A group with two rules, written after this node's join request was validated against a state without it.
+        WorkloadGroup multiRule = new WorkloadGroup(
+            "multi",
+            "_id_multi",
+            new MutableWorkloadGroupFragment(
+                MutableWorkloadGroupFragment.ResiliencyMode.ENFORCED,
+                Map.of(ResourceType.MEMORY, 0.5),
+                Settings.EMPTY,
+                Settings.builder().put("username.node_limit", 5).put("group.node_limit", 10).build()
+            ),
+            1690934400000L
+        );
+        final ClusterState state = ClusterState.builder(ClusterName.DEFAULT)
+            .nodes(
+                DiscoveryNodes.builder()
+                    .add(clusterManagerNode)
+                    .localNodeId(clusterManagerNode.getId())
+                    .clusterManagerNodeId(clusterManagerNode.getId())
+            )
+            .metadata(Metadata.builder().put(multiRule))
+            .build();
+        final DiscoveryNode olderBuild = new DiscoveryNode(UUIDs.base64UUID(), buildNewFakeTransportAddress(), Version.CURRENT);
+
+        final ClusterStateTaskExecutor.ClusterTasksResult<JoinTaskExecutor.Task> result = joinTaskExecutor.execute(
+            state,
+            List.of(new JoinTaskExecutor.Task(olderBuild, "test"))
+        );
+        final ClusterStateTaskExecutor.TaskResult taskResult = result.executionResults.values().iterator().next();
+        assertFalse(taskResult.isSuccess());
+        assertTrue(taskResult.getFailure() instanceof IllegalStateException);
+        assertFalse(result.resultingState.getNodes().nodeExists(olderBuild.getId()));
+
+        // The same check is a built-in join validator, so the join request is refused up front too.
+        for (BiConsumer<DiscoveryNode, ClusterState> validator : JoinTaskExecutor.addBuiltInJoinValidators(List.of())) {
+            try {
+                validator.accept(olderBuild, state);
+            } catch (IllegalStateException e) {
+                return;
+            }
+        }
+        fail("expected a built-in join validator to refuse the node");
     }
 
     public void testJoinClusterWithDecommissionFailed() {

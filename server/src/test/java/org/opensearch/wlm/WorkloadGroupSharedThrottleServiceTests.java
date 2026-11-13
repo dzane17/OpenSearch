@@ -36,6 +36,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -91,7 +92,7 @@ public class WorkloadGroupSharedThrottleServiceTests extends OpenSearchTestCase 
     }
 
     private WorkloadGroup workloadGroup(String groupId, int sharedLimit) {
-        Settings throttling = Settings.builder().put("attribute", "group").put("shared_limit", sharedLimit).build();
+        Settings throttling = Settings.builder().put("group.shared_limit", sharedLimit).build();
         return workloadGroup(groupId, throttling);
     }
 
@@ -167,7 +168,7 @@ public class WorkloadGroupSharedThrottleServiceTests extends OpenSearchTestCase 
         deliverNodesChanged(service, clusterService.state().nodes());
 
         // The sweep resolves shared_limit from cluster state (an expiry carries no limit, unlike a release).
-        Settings throttling = Settings.builder().put("attribute", "group").put("shared_limit", sharedLimit).build();
+        Settings throttling = Settings.builder().put("group.shared_limit", sharedLimit).build();
         WorkloadGroup group = new WorkloadGroup(
             "g1-name",
             groupId,
@@ -384,7 +385,7 @@ public class WorkloadGroupSharedThrottleServiceTests extends OpenSearchTestCase 
 
         DiscoveryNodes nodes = clusterService.state().nodes();
         ClusterState previousState = stateWithGroups(nodes, Map.of(groupId, workloadGroup(groupId, sharedLimit)));
-        Settings nodeOnlyThrottling = Settings.builder().put("attribute", "group").put("node_limit", 1).build();
+        Settings nodeOnlyThrottling = Settings.builder().put("group.node_limit", 1).build();
         ClusterState currentState = stateWithGroups(nodes, Map.of(groupId, workloadGroup(groupId, nodeOnlyThrottling)));
         when(clusterService.state()).thenReturn(currentState);
 
@@ -457,8 +458,8 @@ public class WorkloadGroupSharedThrottleServiceTests extends OpenSearchTestCase 
         service.clusterChanged(event);
 
         // shared_limit=1 must now actually enforce (grant then reject), not fail open.
-        assertNotNull(awaitGrant(service, "b", 1));
-        expectThrows(OpenSearchRejectedExecutionException.class, () -> awaitGrant(service, "b", 1));
+        assertNotNull(awaitGrant(service, "b:group", 1));
+        expectThrows(OpenSearchRejectedExecutionException.class, () -> awaitGrant(service, "b:group", 1));
     }
 
     public void testSameIdRestartRebuildsRingWithFreshNode() {
@@ -507,7 +508,7 @@ public class WorkloadGroupSharedThrottleServiceTests extends OpenSearchTestCase 
         final ThrottleOwnerSelector twoNodeRing = ThrottleOwnerSelector.fromDiscoveryNodes(bothNodes);
         String movedBucket = null;
         for (int i = 0; i < 10_000 && movedBucket == null; i++) {
-            String candidate = "moved-" + i;
+            String candidate = "moved-" + i + ":group";
             if (twoNodeRing.ownerFor(candidate).filter(remote::equals).isPresent()) {
                 movedBucket = candidate;
             }
@@ -571,7 +572,7 @@ public class WorkloadGroupSharedThrottleServiceTests extends OpenSearchTestCase 
         final ThrottleOwnerSelector twoNodeRing = ThrottleOwnerSelector.fromDiscoveryNodes(bothNodes);
         String movedBucket = null;
         for (int i = 0; i < 10_000 && movedBucket == null; i++) {
-            String candidate = "reservation-race-" + i;
+            String candidate = "reservation-race-" + i + ":group";
             if (twoNodeRing.ownerFor(candidate).filter(remote::equals).isPresent()) {
                 movedBucket = candidate;
             }
@@ -695,12 +696,12 @@ public class WorkloadGroupSharedThrottleServiceTests extends OpenSearchTestCase 
 
     public void testLocalOwnerGrantsThenDeniesAtLimit() {
         WorkloadGroupSharedThrottleService service = newService();
-        Releasable p1 = awaitGrant(service, "b", 1);
+        Releasable p1 = awaitGrant(service, "b:group", 1);
         assertNotNull(p1);
-        expectThrows(OpenSearchRejectedExecutionException.class, () -> awaitGrant(service, "b", 1));
+        expectThrows(OpenSearchRejectedExecutionException.class, () -> awaitGrant(service, "b:group", 1));
         // release frees the shared slot
         p1.close();
-        assertNotNull(awaitGrant(service, "b", 1));
+        assertNotNull(awaitGrant(service, "b:group", 1));
     }
 
     public void testOwnerPushDrainsEveryParkedRequestOnOneCoordinator() {
@@ -709,7 +710,7 @@ public class WorkloadGroupSharedThrottleServiceTests extends OpenSearchTestCase 
         // successful admit — it may still have more queued requests — so each successive freed slot drains the next
         // parked request. The bug drained only the first and stranded the rest indefinitely despite free capacity.
         final int sharedLimit = 1;
-        final String bucket = "b";
+        final String bucket = "b:group";
         WorkloadGroupSharedThrottleService service = newService();
         stubGroupFor(bucket, sharedLimit);
 
@@ -768,13 +769,13 @@ public class WorkloadGroupSharedThrottleServiceTests extends OpenSearchTestCase 
 
     public void testDoubleCloseReleasesOnce() {
         WorkloadGroupSharedThrottleService service = newService();
-        Releasable p = awaitGrant(service, "b", 2);
-        assertNotNull(awaitGrant(service, "b", 2)); // second slot
+        Releasable p = awaitGrant(service, "b:group", 2);
+        assertNotNull(awaitGrant(service, "b:group", 2)); // second slot
         p.close();
         p.close(); // must not double-release
         // one slot still held, so only one more grant is available
-        assertNotNull(awaitGrant(service, "b", 2));
-        expectThrows(OpenSearchRejectedExecutionException.class, () -> awaitGrant(service, "b", 2));
+        assertNotNull(awaitGrant(service, "b:group", 2));
+        expectThrows(OpenSearchRejectedExecutionException.class, () -> awaitGrant(service, "b:group", 2));
     }
 
     public void testEmptyRingFailsOpen() {
@@ -1116,4 +1117,321 @@ public class WorkloadGroupSharedThrottleServiceTests extends OpenSearchTestCase 
         assertEquals("now a local waiter is registered", 1, service.waiterCountForTest(bucket));
     }
 
+    // Parks `count` denied wantsQueue acquires on a full bucket, registering this (local) coordinator as its waiter.
+    private static void parkDeniedAcquires(WorkloadGroupSharedThrottleService service, String bucket, int sharedLimit, int count) {
+        for (int i = 0; i < count; i++) {
+            AtomicReference<Exception> denial = new AtomicReference<>();
+            service.acquireAsync(
+                bucket,
+                sharedLimit,
+                ActionListener.wrap(p -> fail("the shared limit is full"), denial::set),
+                () -> fail("the local owner must register itself")
+            );
+            assertTrue(denial.get() instanceof OpenSearchRejectedExecutionException);
+        }
+    }
+
+    public void testSharedLimitIncreaseOnlyDrivesThatRulesBuckets() {
+        // Two rules on one group: raising the username rule's shared_limit must offer slots only to username buckets,
+        // never to the group rule's bucket whose own limit is unchanged.
+        final String groupId = "multi-rule-increase";
+        final String userBucket = groupId + ":username:alice";
+        final String groupBucket = groupId + ":group";
+        WorkloadGroupSharedThrottleService service = newService();
+        when(threadPool.executor(ThreadPool.Names.GENERIC)).thenReturn(OpenSearchExecutors.newDirectExecutorService());
+        Settings before = Settings.builder().put("username.shared_limit", 1).put("group.shared_limit", 1).build();
+        Settings after = Settings.builder().put("username.shared_limit", 3).put("group.shared_limit", 1).build();
+        final DiscoveryNodes nodes = clusterService.state().nodes();
+        final ClusterState previousState = stateWithGroups(nodes, Map.of(groupId, workloadGroup(groupId, before)));
+        final ClusterState currentState = stateWithGroups(nodes, Map.of(groupId, workloadGroup(groupId, after)));
+        when(clusterService.state()).thenReturn(previousState);
+
+        final Map<String, AtomicInteger> parkedByBucket = Map.of(userBucket, new AtomicInteger(3), groupBucket, new AtomicInteger(3));
+        final Map<String, AtomicInteger> admitsByBucket = new ConcurrentHashMap<>();
+        final List<Releasable> grantedPermits = new ArrayList<>();
+        service.setGrantConsumer((bucketKey, permit) -> {
+            if (parkedByBucket.get(bucketKey).getAndDecrement() <= 0) {
+                return false;
+            }
+            admitsByBucket.computeIfAbsent(bucketKey, k -> new AtomicInteger()).incrementAndGet();
+            grantedPermits.add(permit);
+            return true;
+        });
+
+        final Releasable userHolder = awaitGrant(service, userBucket, 1);
+        final Releasable groupHolder = awaitGrant(service, groupBucket, 1);
+        parkDeniedAcquires(service, userBucket, 1, 3);
+        parkDeniedAcquires(service, groupBucket, 1, 3);
+
+        when(clusterService.state()).thenReturn(currentState);
+        service.clusterChanged(new ClusterChangedEvent("username shared limit increased", currentState, previousState));
+
+        assertEquals("the username rule gains exactly 3 - 1 slots", 2, admitsByBucket.get(userBucket).get());
+        assertNull("the group rule's limit did not change, so its bucket gets nothing", admitsByBucket.get(groupBucket));
+        assertEquals(3, service.tracker().inFlight(userBucket));
+        assertEquals(1, service.tracker().inFlight(groupBucket));
+
+        // Settle every permit; the group bucket's release will push its freed slot to its own waiter.
+        userHolder.close();
+        groupHolder.close();
+        while (grantedPermits.isEmpty() == false) {
+            grantedPermits.remove(0).close();
+        }
+    }
+
+    public void testRemovingOneRulesSharedTierPrunesOnlyItsWaiters() {
+        final String groupId = "multi-rule-prune";
+        final String userBucket = groupId + ":username:alice";
+        final String groupBucket = groupId + ":group";
+        WorkloadGroupSharedThrottleService service = newService();
+        when(threadPool.executor(ThreadPool.Names.GENERIC)).thenReturn(OpenSearchExecutors.newDirectExecutorService());
+        Settings before = Settings.builder().put("username.shared_limit", 1).put("group.shared_limit", 1).build();
+        Settings after = Settings.builder().put("username.node_limit", 1).put("group.shared_limit", 1).build();
+        final DiscoveryNodes nodes = clusterService.state().nodes();
+        final ClusterState previousState = stateWithGroups(nodes, Map.of(groupId, workloadGroup(groupId, before)));
+        final ClusterState currentState = stateWithGroups(nodes, Map.of(groupId, workloadGroup(groupId, after)));
+        when(clusterService.state()).thenReturn(previousState);
+
+        final Releasable userHolder = awaitGrant(service, userBucket, 1);
+        final Releasable groupHolder = awaitGrant(service, groupBucket, 1);
+        parkDeniedAcquires(service, userBucket, 1, 1);
+        parkDeniedAcquires(service, groupBucket, 1, 1);
+        assertEquals(1, service.waiterCountForTest(userBucket));
+        assertEquals(1, service.waiterCountForTest(groupBucket));
+
+        when(clusterService.state()).thenReturn(currentState);
+        service.clusterChanged(new ClusterChangedEvent("username shared tier removed", currentState, previousState));
+
+        assertEquals("the username rule lost its shared tier", 0, service.waiterCountForTest(userBucket));
+        assertEquals("the group rule kept its shared tier", 1, service.waiterCountForTest(groupBucket));
+        // Nothing is actually parked behind the remaining waiter, so the freed group slot comes back as an unused grant.
+        service.setGrantConsumer((bucketKey, permit) -> false);
+        userHolder.close();
+        groupHolder.close();
+        assertEquals(0, service.tracker().inFlight(userBucket));
+        assertEquals(0, service.tracker().inFlight(groupBucket));
+    }
+
+    public void testKeptAlivePermitIsRenewedUntilReleased() {
+        final String bucket = "keep-alive:username:alice";
+        final AtomicLong clock = new AtomicLong(0);
+        final SharedThrottleTracker clockedTracker = new SharedThrottleTracker(clock::get);
+        WorkloadGroupSharedThrottleService service = new WorkloadGroupSharedThrottleService(
+            clusterService,
+            threadPool,
+            transportService,
+            clockedTracker
+        );
+        deliverNodesChanged(service, clusterService.state().nodes());
+        stubGroupFor(bucket, 1);
+
+        Releasable permit = awaitGrant(service, bucket, 1);
+        assertNotNull(permit);
+        Releasable keepAlive = service.keepAlive(List.of(permit, () -> {}), () -> true);
+        assertEquals("only the shared permit is tracked", 1, service.keptAliveCountForTest());
+
+        // Renew just before the original TTL, then move past it: the permit must still occupy the bucket.
+        clock.set(WorkloadGroupSharedThrottleService.PERMIT_TTL_NANOS - 1);
+        service.renewKeptAlivePermits();
+        clock.set(WorkloadGroupSharedThrottleService.PERMIT_TTL_NANOS + 1);
+        assertFalse("the renewed permit is still live", clockedTracker.tryAcquire(bucket, 1, "intruder", 1));
+
+        keepAlive.close();
+        assertEquals(0, service.keptAliveCountForTest());
+        service.keepAlive(List.of(permit), () -> true);
+        permit.close();
+        assertEquals("releasing a permit stops keeping it alive", 0, service.keptAliveCountForTest());
+        assertEquals(0, clockedTracker.inFlight(bucket));
+    }
+
+    public void testKeepAliveRenewsForAsLongAsTheRequestWaits() {
+        final String bucket = "keep-alive-live:group";
+        WorkloadGroupSharedThrottleService service = newService();
+        stubGroupFor(bucket, 1);
+        Releasable permit = awaitGrant(service, bucket, 1);
+        AtomicBoolean waiting = new AtomicBoolean(true);
+        service.keepAlive(List.of(permit), waiting::get);
+        // No fixed bound: renewed on every round while the request still waits, however long that is.
+        for (int i = 0; i < 100; i++) {
+            service.renewKeptAlivePermits();
+        }
+        assertEquals(1, service.keptAliveCountForTest());
+        waiting.set(false); // e.g. the request was cancelled
+        service.renewKeptAlivePermits();
+        assertEquals("a request that no longer waits stops being renewed", 0, service.keptAliveCountForTest());
+        permit.close();
+    }
+
+    public void testEndOfWaitRenewsAPermitNotRefreshedRecently() {
+        final String bucket = "end-of-wait-renew:group";
+        final AtomicLong clock = new AtomicLong(0);
+        final SharedThrottleTracker clockedTracker = new SharedThrottleTracker(clock::get);
+        WorkloadGroupSharedThrottleService service = new WorkloadGroupSharedThrottleService(
+            clusterService,
+            threadPool,
+            transportService,
+            clockedTracker
+        );
+        deliverNodesChanged(service, clusterService.state().nodes());
+        stubGroupFor(bucket, 1);
+
+        Releasable permit = awaitGrant(service, bucket, 1);
+        Releasable keepAlive = service.keepAlive(List.of(permit), () -> true);
+        // The request waited: its permit was last refreshed long enough ago to be renewed when the wait ends.
+        ((WorkloadGroupSharedThrottleService.SharedPermit) permit).setRefreshedAtForTest(
+            System.nanoTime() - WorkloadGroupSharedThrottleService.END_OF_WAIT_RENEW_MIN_AGE_NANOS
+        );
+        clock.set(WorkloadGroupSharedThrottleService.PERMIT_TTL_NANOS - 1);
+        keepAlive.close();
+        service.renewStale(List.of(permit));
+        clock.set(WorkloadGroupSharedThrottleService.PERMIT_TTL_NANOS + 1);
+        assertFalse("renewed when the wait ended, so still live", clockedTracker.tryAcquire(bucket, 1, "intruder", 1));
+        permit.close();
+    }
+
+    public void testEndOfWaitSkipsAPermitRefreshedRecently() {
+        final String bucket = "end-of-wait-fresh:group";
+        final AtomicLong clock = new AtomicLong(0);
+        final SharedThrottleTracker clockedTracker = new SharedThrottleTracker(clock::get);
+        WorkloadGroupSharedThrottleService service = new WorkloadGroupSharedThrottleService(
+            clusterService,
+            threadPool,
+            transportService,
+            clockedTracker
+        );
+        deliverNodesChanged(service, clusterService.state().nodes());
+        stubGroupFor(bucket, 1);
+
+        Releasable permit = awaitGrant(service, bucket, 1);
+        clock.set(WorkloadGroupSharedThrottleService.PERMIT_TTL_NANOS - 1);
+        // Granted just now (in wall time): no renewal is sent.
+        service.renewStale(List.of(permit));
+        clock.set(WorkloadGroupSharedThrottleService.PERMIT_TTL_NANOS + 1);
+        assertTrue("not renewed, so it expired at its original TTL", clockedTracker.tryAcquire(bucket, 1, "intruder", 1));
+        permit.close();
+    }
+
+    public void testClosingAKeepAliveDoesNotRenew() {
+        final String bucket = "keep-alive-close:group";
+        final AtomicLong clock = new AtomicLong(0);
+        final SharedThrottleTracker clockedTracker = new SharedThrottleTracker(clock::get);
+        WorkloadGroupSharedThrottleService service = new WorkloadGroupSharedThrottleService(
+            clusterService,
+            threadPool,
+            transportService,
+            clockedTracker
+        );
+        deliverNodesChanged(service, clusterService.state().nodes());
+        stubGroupFor(bucket, 1);
+
+        Releasable permit = awaitGrant(service, bucket, 1);
+        ((WorkloadGroupSharedThrottleService.SharedPermit) permit).setRefreshedAtForTest(
+            System.nanoTime() - WorkloadGroupSharedThrottleService.END_OF_WAIT_RENEW_MIN_AGE_NANOS
+        );
+        clock.set(WorkloadGroupSharedThrottleService.PERMIT_TTL_NANOS - 1);
+        // A failed or cancelled step only closes the keep-alive; its permits are about to be released.
+        service.keepAlive(List.of(permit), () -> true).close();
+        clock.set(WorkloadGroupSharedThrottleService.PERMIT_TTL_NANOS + 1);
+        assertTrue("closing alone does not renew", clockedTracker.tryAcquire(bucket, 1, "intruder", 1));
+        permit.close();
+    }
+
+    public void testRenewRequestRoundTripsSeveralPermits() throws IOException {
+        WorkloadGroupSharedThrottleService.RenewPermitRequest renew = new WorkloadGroupSharedThrottleService.RenewPermitRequest(
+            List.of("g:username:alice", "g:role:reader"),
+            List.of("p1", "p2"),
+            42L
+        );
+        try (BytesStreamOutput out = new BytesStreamOutput()) {
+            renew.writeTo(out);
+            try (StreamInput in = out.bytes().streamInput()) {
+                WorkloadGroupSharedThrottleService.RenewPermitRequest read = new WorkloadGroupSharedThrottleService.RenewPermitRequest(in);
+                assertEquals(List.of("g:username:alice", "g:role:reader"), read.bucketKeys);
+                assertEquals(List.of("p1", "p2"), read.permitIds);
+                assertEquals(42L, read.ttlNanos);
+            }
+        }
+    }
+
+    public void testOwnerRenewsEveryPermitInARequest() {
+        final AtomicLong clock = new AtomicLong(0);
+        final SharedThrottleTracker clockedTracker = new SharedThrottleTracker(clock::get);
+        WorkloadGroupSharedThrottleService service = new WorkloadGroupSharedThrottleService(
+            clusterService,
+            threadPool,
+            transportService,
+            clockedTracker
+        );
+        assertTrue(clockedTracker.tryAcquire("a:group", 1, "p1", 10));
+        assertTrue(clockedTracker.tryAcquire("b:group", 1, "p2", 10));
+        service.handleRenew(
+            new WorkloadGroupSharedThrottleService.RenewPermitRequest(
+                List.of("a:group", "b:group"),
+                List.of("p1", "p2"),
+                WorkloadGroupSharedThrottleService.PERMIT_TTL_NANOS
+            )
+        );
+        clock.set(11);
+        assertFalse(clockedTracker.tryAcquire("a:group", 1, "q1", 10));
+        assertFalse(clockedTracker.tryAcquire("b:group", 1, "q2", 10));
+    }
+
+    public void testOwnerClampsTheRenewTtlItIsAskedFor() {
+        final String bucket = "renew-clamp:group";
+        final AtomicLong clock = new AtomicLong(0);
+        final SharedThrottleTracker clockedTracker = new SharedThrottleTracker(clock::get);
+        WorkloadGroupSharedThrottleService service = new WorkloadGroupSharedThrottleService(
+            clusterService,
+            threadPool,
+            transportService,
+            clockedTracker
+        );
+        assertTrue(clockedTracker.tryAcquire(bucket, 1, "p", 1));
+        service.handleRenew(new WorkloadGroupSharedThrottleService.RenewPermitRequest(List.of(bucket), List.of("p"), Long.MAX_VALUE / 2));
+        clock.set(WorkloadGroupSharedThrottleService.PERMIT_TTL_NANOS + 1);
+        assertTrue("renewal never exceeds the owner's own TTL", clockedTracker.tryAcquire(bucket, 1, "q", 1));
+    }
+
+    public void testGrantRequestCarriesTheGrantingNodeAndToleratesItsAbsence() throws IOException {
+        WorkloadGroupSharedThrottleService.GrantPermitRequest grant = new WorkloadGroupSharedThrottleService.GrantPermitRequest(
+            "g:group",
+            3,
+            "permit-1",
+            "owner-node"
+        );
+        try (BytesStreamOutput out = new BytesStreamOutput()) {
+            grant.writeTo(out);
+            try (StreamInput in = out.bytes().streamInput()) {
+                WorkloadGroupSharedThrottleService.GrantPermitRequest read = new WorkloadGroupSharedThrottleService.GrantPermitRequest(in);
+                assertEquals("owner-node", read.grantedByNodeId);
+                assertEquals("permit-1", read.permitId);
+            }
+        }
+        Map<String, Object> legacy = new HashMap<>();
+        legacy.put(WorkloadGroupSharedThrottleService.GrantPermitRequest.KEY_BUCKET, "g:group");
+        legacy.put(WorkloadGroupSharedThrottleService.GrantPermitRequest.KEY_SHARED_LIMIT, 3);
+        legacy.put(WorkloadGroupSharedThrottleService.GrantPermitRequest.KEY_PERMIT_ID, "permit-1");
+        assertEquals("", new WorkloadGroupSharedThrottleService.GrantPermitRequest(bodyBytes(legacy, true)).grantedByNodeId);
+    }
+
+    public void testOwnerRefusesWaitersForABucketWhoseSharedTierIsGone() {
+        final String groupId = "tier-gone";
+        final String bucket = groupId + ":group";
+        WorkloadGroupSharedThrottleService service = newService();
+        // The coordinator's plan still carries shared_limit=1, but the owner's live state only has a node tier.
+        when(metadata.workloadGroups()).thenReturn(
+            Map.of(groupId, workloadGroup(groupId, Settings.builder().put("group.node_limit", 1).build()))
+        );
+        assertTrue(service.tracker().tryAcquire(bucket, 1, "holder", WorkloadGroupSharedThrottleService.PERMIT_TTL_NANOS));
+
+        AtomicBoolean notRegistered = new AtomicBoolean();
+        service.acquireAsync(
+            bucket,
+            1,
+            ActionListener.wrap(p -> fail("the bucket is full"), e -> fail("must not register")),
+            () -> notRegistered.set(true)
+        );
+        assertTrue("no waiter is registered for a tier nothing will offer", notRegistered.get());
+        assertEquals(0, service.waiterCountForTest(bucket));
+    }
 }

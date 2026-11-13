@@ -311,6 +311,7 @@ import org.opensearch.watcher.ResourceWatcherService;
 import org.opensearch.wlm.WorkloadGroupQueueService;
 import org.opensearch.wlm.WorkloadGroupService;
 import org.opensearch.wlm.WorkloadGroupSharedThrottleService;
+import org.opensearch.wlm.WorkloadGroupThrottleSettings;
 import org.opensearch.wlm.WorkloadGroupsStateAccessor;
 import org.opensearch.wlm.WorkloadManagementSettings;
 import org.opensearch.wlm.WorkloadManagementTransportInterceptor;
@@ -514,6 +515,8 @@ public class Node implements Closeable {
                 .put(Client.CLIENT_TYPE_SETTING_S.getKey(), CLIENT_TYPE)
                 // Enabling shard indexing backpressure node-attribute
                 .put(NODE_ATTRIBUTES.getKey() + SHARD_INDEXING_PRESSURE_ENABLED_ATTRIBUTE_KEY, "true")
+                // Advertises that this build reads keyed (multi-rule) WLM throttling, for mixed-build compatibility
+                .put(NODE_ATTRIBUTES.getKey() + WorkloadGroupThrottleSettings.MULTI_ATTRIBUTE_THROTTLING_NODE_ATTRIBUTE, "true")
                 .build();
 
             final JvmInfo jvmInfo = JvmInfo.jvmInfo();
@@ -1447,6 +1450,7 @@ public class Node implements Closeable {
             workloadGroupSharedThrottleService.setGrantConsumer(workloadGroupQueueService::admitWithPermit);
             // Owner-ring change -> inspect only this coordinator's retained buckets and re-register those that moved.
             workloadGroupSharedThrottleService.setRetainedBucketKeysSupplier(workloadGroupQueueService::retainedBucketKeys);
+            workloadGroupSharedThrottleService.setRetainedBucketCheck(workloadGroupQueueService::hasRetained);
 
             TopNSearchTasksLogger taskConsumer = new TopNSearchTasksLogger(settings, settingsModule.getClusterSettings());
             transportService.getTaskManager().registerTaskResourceConsumer(taskConsumer);

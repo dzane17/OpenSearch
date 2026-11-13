@@ -164,6 +164,9 @@ public class WorkloadGroupState {
      * The fields are independent atomics rather than a transactional snapshot, so a concurrent stats read can briefly
      * straddle one update. Splitting the count out to the throttle-denial signal instead looks equivalent but is not —
      * see the note on {@link #totalQueued}.
+     * <p>
+     * The unit is one queue wait, not one request: a request throttled by several rules can wait at more than one of its
+     * buckets in turn, and each wait is recorded separately.
      *
      * @param waitMillis how long the request was parked, in millis (negative values are clamped to 0 for clock skew)
      */

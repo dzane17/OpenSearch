@@ -18,8 +18,10 @@ import org.opensearch.common.inject.Inject;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.common.io.stream.StreamInput;
 import org.opensearch.plugin.wlm.service.WorkloadGroupPersistenceService;
+import org.opensearch.tasks.Task;
 import org.opensearch.threadpool.ThreadPool;
 import org.opensearch.transport.TransportService;
+import org.opensearch.wlm.WorkloadGroupThrottleSettings;
 
 import java.io.IOException;
 
@@ -63,6 +65,22 @@ public class TransportCreateWorkloadGroupAction extends TransportClusterManagerN
             indexNameExpressionResolver
         );
         this.workloadGroupPersistenceService = workloadGroupPersistenceService;
+    }
+
+    @Override
+    protected void doExecute(Task task, CreateWorkloadGroupRequest request, ActionListener<CreateWorkloadGroupResponse> listener) {
+        // On the coordinating node, before forwarding: give a clear error during an upgrade instead of an older cluster
+        // manager's cryptic rejection, or its silent no-op.
+        try {
+            WorkloadGroupThrottleSettings.validateSupportedByCluster(
+                request.getWorkloadGroup().getMutableWorkloadGroupFragment().getThrottling(),
+                clusterService.state().nodes()
+            );
+        } catch (IllegalArgumentException e) {
+            listener.onFailure(e);
+            return;
+        }
+        super.doExecute(task, request, listener);
     }
 
     @Override

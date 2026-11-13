@@ -84,7 +84,9 @@ public class WorkloadGroupMetadata implements Metadata.Custom {
     @Override
     public XContentBuilder toXContent(XContentBuilder builder, Params params) throws IOException {
         for (Map.Entry<String, WorkloadGroup> entry : workloadGroups.entrySet()) {
-            builder.field(entry.getKey(), entry.getValue());
+            // Pass params through (builder.field(String, ToXContent) would drop them): groups write differently on disk.
+            builder.field(entry.getKey());
+            entry.getValue().toXContent(builder, params);
         }
         return builder;
     }

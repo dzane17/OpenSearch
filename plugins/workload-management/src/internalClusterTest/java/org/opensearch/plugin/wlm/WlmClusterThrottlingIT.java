@@ -306,18 +306,150 @@ public class WlmClusterThrottlingIT extends OpenSearchIntegTestCase {
         );
     }
 
+    /**
+     * Two independent shared (cluster-wide) rules on one group, driven from different coordinators: each user may have 1
+     * search in flight cluster-wide, and the whole group 2. A request must get a permit from both owners. (At most two
+     * searches are ever blocked at once: more would exhaust the single shard's search threads.)
+     */
+    public void testIndependentSharedRulesAreEnforcedAcrossCoordinators() throws Exception {
+        String workloadGroupId = "wlm_multi_rule_shared_group";
+        String indexName = "multi_rule_shared_index";
+
+        setWlmMode("enabled");
+        Settings throttling = Settings.builder()
+            .put("username." + WorkloadGroupThrottleSettings.SHARED_LIMIT.getKey(), 1)
+            .put("group." + WorkloadGroupThrottleSettings.SHARED_LIMIT.getKey(), 2)
+            .build();
+        updateWorkloadGroupInClusterState(
+            PUT,
+            new WorkloadGroup(
+                "multi_rule_shared_test_group",
+                workloadGroupId,
+                new MutableWorkloadGroupFragment(
+                    MutableWorkloadGroupFragment.ResiliencyMode.SOFT,
+                    Map.of(ResourceType.CPU, 0.9, ResourceType.MEMORY, 0.9),
+                    Settings.EMPTY,
+                    throttling
+                ),
+                Instant.now().getMillis()
+            )
+        );
+        assertBusy(
+            () -> assertTrue(
+                "workload group not yet applied in cluster state",
+                client().admin().cluster().prepareState().get().getState().metadata().workloadGroups().containsKey(workloadGroupId)
+            ),
+            30,
+            TimeUnit.SECONDS
+        );
+        createRule(
+            "wlm_multi_rule_shared_rule",
+            "multi rule shared",
+            indexName,
+            AutoTaggingRegistry.getFeatureType(WorkloadGroupFeatureType.NAME),
+            workloadGroupId
+        );
+        indexDocument(indexName);
+
+        List<String> coordinators = new ArrayList<>(List.of(internalCluster().getNodeNames()));
+        for (String node : coordinators) {
+            assertBusy(() -> {
+                long before = getCompletions(workloadGroupId);
+                try {
+                    searchAs(node, "probe-" + node, indexName).setQuery(QueryBuilders.matchAllQuery()).get();
+                } catch (Exception e) {
+                    assertFalse("transient throttle during propagation probe — retry: " + e, hasRejectedExecutionCause(e));
+                    throw e;
+                }
+                assertTrue("search via [" + node + "] not yet tagged", getCompletions(workloadGroupId) > before);
+            }, 30, TimeUnit.SECONDS);
+        }
+        // Probe permits are released remotely (fire-and-forget); let the group pool drain before filling it.
+        assertBusy(() -> {
+            try {
+                searchAs(coordinators.get(0), "drain-check", indexName).setQuery(QueryBuilders.matchAllQuery()).get();
+            } catch (Exception e) {
+                assertFalse("still draining — retry", hasRejectedExecutionCause(e));
+                throw e;
+            }
+        }, 30, TimeUnit.SECONDS);
+
+        List<ClusterScriptedBlockPlugin> plugins = initBlockFactory();
+        String c0 = coordinators.get(0);
+        String c1 = coordinators.get(1 % coordinators.size());
+        String c2 = coordinators.get(2 % coordinators.size());
+
+        ActionFuture<SearchResponse> alice = blockingSearchAs(c0, "alice", indexName).execute();
+        awaitBlockedCount(plugins, 1);
+
+        // alice from another coordinator: her cluster-wide username slot is taken.
+        Throwable aliceAgain = expectThrows(Throwable.class, () -> blockingSearchAs(c1, "alice", indexName).get());
+        OpenSearchRejectedExecutionException userRejection = rejectedExecutionCause(aliceAgain);
+        assertNotNull("expected a 429 but was: " + aliceAgain, userRejection);
+        assertTrue(
+            userRejection.getMessage(),
+            userRejection.getMessage().contains("for username [alice] reached its cluster-wide limit of 1")
+        );
+
+        // bob fills the group's cluster-wide pool of 2.
+        ActionFuture<SearchResponse> bob = blockingSearchAs(c1, "bob", indexName).execute();
+        awaitBlockedCount(plugins, 2);
+
+        // dave has his own username slot, but the group pool is full.
+        Throwable dave = expectThrows(Throwable.class, () -> blockingSearchAs(c2, "dave", indexName).get());
+        OpenSearchRejectedExecutionException groupRejection = rejectedExecutionCause(dave);
+        assertNotNull("expected a 429 but was: " + dave, groupRejection);
+        assertTrue(
+            groupRejection.getMessage(),
+            groupRejection.getMessage().contains("workload group [multi_rule_shared_test_group] reached its cluster-wide limit of 2")
+        );
+
+        disableBlocks(plugins);
+        assertNotNull(alice.actionGet(TIMEOUT));
+        assertNotNull(bob.actionGet(TIMEOUT));
+        // Every permit — including the username permit dave took before the group pool rejected him — drains, so both
+        // alice and dave are admitted again (polling: remote releases are fire-and-forget).
+        for (String user : List.of("alice", "dave")) {
+            assertBusy(() -> {
+                try {
+                    searchAs(c2, user, indexName).setQuery(QueryBuilders.matchAllQuery()).get();
+                } catch (Exception e) {
+                    assertFalse("still draining — retry", hasRejectedExecutionCause(e));
+                    throw e;
+                }
+            }, 30, TimeUnit.SECONDS);
+        }
+    }
+
     // Helpers
 
     private static boolean hasRejectedExecutionCause(Throwable t) {
+        return rejectedExecutionCause(t) != null;
+    }
+
+    private static OpenSearchRejectedExecutionException rejectedExecutionCause(Throwable t) {
         for (Throwable cur = t; cur != null; cur = cur.getCause()) {
             if (cur instanceof OpenSearchRejectedExecutionException) {
-                return true;
+                return (OpenSearchRejectedExecutionException) cur;
             }
             if (cur.getCause() == cur) {
                 break;
             }
         }
-        return false;
+        return null;
+    }
+
+    // Stands in for the security plugin's principal extractor by setting the principal header directly.
+    private SearchRequestBuilder searchAs(String nodeName, String username, String indexName) {
+        return client(nodeName).filterWithHeader(
+            Map.of(org.opensearch.wlm.WorkloadGroupTask.WORKLOAD_GROUP_PRINCIPAL_HEADER, "username|" + username)
+        ).prepareSearch(indexName);
+    }
+
+    private SearchRequestBuilder blockingSearchAs(String nodeName, String username, String indexName) {
+        return searchAs(nodeName, username, indexName).setQuery(
+            scriptQuery(new Script(ScriptType.INLINE, "mockscript", ClusterScriptedBlockPlugin.SCRIPT_NAME, Collections.emptyMap()))
+        );
     }
 
     private long getCompletions(String groupId) throws Exception {
@@ -405,10 +537,7 @@ public class WlmClusterThrottlingIT extends OpenSearchIntegTestCase {
     }
 
     private WorkloadGroup createSharedThrottledGroup(String name, String id, int sharedLimit) {
-        Settings throttling = Settings.builder()
-            .put(WorkloadGroupThrottleSettings.ATTRIBUTE.getKey(), "group")
-            .put(WorkloadGroupThrottleSettings.SHARED_LIMIT.getKey(), sharedLimit)
-            .build();
+        Settings throttling = Settings.builder().put("group." + WorkloadGroupThrottleSettings.SHARED_LIMIT.getKey(), sharedLimit).build();
         return new WorkloadGroup(
             name,
             id,
@@ -424,10 +553,7 @@ public class WlmClusterThrottlingIT extends OpenSearchIntegTestCase {
 
     // Shared-only throttling (no node_limit) WITH queueing enabled, so a denied request parks and drains via owner-push.
     private WorkloadGroup createSharedThrottledQueueingGroup(String name, String id, int sharedLimit, int queueSizePerBucket) {
-        Settings throttling = Settings.builder()
-            .put(WorkloadGroupThrottleSettings.ATTRIBUTE.getKey(), "group")
-            .put(WorkloadGroupThrottleSettings.SHARED_LIMIT.getKey(), sharedLimit)
-            .build();
+        Settings throttling = Settings.builder().put("group." + WorkloadGroupThrottleSettings.SHARED_LIMIT.getKey(), sharedLimit).build();
         Settings queue = Settings.builder().put(WorkloadGroupQueueSettings.SIZE_PER_BUCKET.getKey(), queueSizePerBucket).build();
         return new WorkloadGroup(
             name,
