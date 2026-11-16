@@ -369,6 +369,21 @@ public class MutableWorkloadGroupFragment extends AbstractDiffable<MutableWorklo
     }
 
     /**
+     * A copy of this update fragment with {@code throttling} in place of its throttling, every other field exactly as
+     * it is. Unlike the constructors, a null field stays null: in an update fragment null means "keep the existing
+     * value" and empty means "clear it", so turning one into the other would change what the update does.
+     */
+    public MutableWorkloadGroupFragment withThrottling(@Nullable Settings throttling) {
+        MutableWorkloadGroupFragment copy = new MutableWorkloadGroupFragment();
+        copy.resiliencyMode = resiliencyMode;
+        copy.resourceLimits = resourceLimits;
+        copy.settings = settings;
+        copy.throttling = throttling;
+        copy.queue = queue;
+        return copy;
+    }
+
+    /**
      * Throttling as written for a stored group: a single-rule config in the flat form that builds predating keyed rules
      * read (see {@link WorkloadGroupThrottleSettings#MULTI_ATTRIBUTE_THROTTLING_NODE_ATTRIBUTE}), otherwise unchanged. Readers of a
      * stored group translate it back ({@link WorkloadGroupThrottleSettings#normalizeStored}). Cached: stored groups are

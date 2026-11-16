@@ -92,7 +92,7 @@ public class TransportUpdateWorkloadGroupAction extends TransportClusterManagerN
 
     // While the elected cluster manager runs a build that predates multi-attribute throttling, send it a throttling change
     // in the flat form it applies (see WorkloadGroupThrottleSettings#toFlatUpdate); otherwise send the request as is.
-    private static UpdateWorkloadGroupRequest forElectedClusterManager(UpdateWorkloadGroupRequest request, ClusterState state) {
+    static UpdateWorkloadGroupRequest forElectedClusterManager(UpdateWorkloadGroupRequest request, ClusterState state) {
         final MutableWorkloadGroupFragment fragment = request.getmMutableWorkloadGroupFragment();
         if (fragment.getThrottling() == null
             || WorkloadGroupThrottleSettings.clusterManagerPredatesMultiAttributeThrottling(state.nodes()) == false) {
@@ -107,16 +107,9 @@ public class TransportUpdateWorkloadGroupAction extends TransportClusterManagerN
             .map(group -> group.getMutableWorkloadGroupFragment().getThrottling())
             .orElse(null);
         final Settings flat = WorkloadGroupThrottleSettings.toFlatUpdate(fragment.getThrottling(), existing);
-        return new UpdateWorkloadGroupRequest(
-            request.getName(),
-            MutableWorkloadGroupFragment.ofStoredThrottling(
-                fragment.getResiliencyMode(),
-                fragment.getResourceLimits(),
-                fragment.getSettings(),
-                flat,
-                fragment.getQueue()
-            )
-        );
+        // Copy with only throttling replaced: every other field (and a null "keep" throttling) must reach the cluster
+        // manager unchanged, or it would read null-turned-empty as "clear".
+        return new UpdateWorkloadGroupRequest(request.getName(), fragment.withThrottling(flat));
     }
 
     @Override

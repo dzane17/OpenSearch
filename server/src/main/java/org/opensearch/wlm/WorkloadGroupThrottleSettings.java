@@ -34,6 +34,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.TreeSet;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.stream.Collectors;
 
 /**
@@ -92,6 +93,9 @@ public class WorkloadGroupThrottleSettings {
      * and {@code role} resolves to the caller's first role as on those builds (see {@link ThrottleAttribute#resolve}).
      */
     public static final String MULTI_ATTRIBUTE_THROTTLING_NODE_ATTRIBUTE = "wlm_multi_attribute_throttling";
+
+    // Bad stored rules already warned about (see rule); bounded so it can't grow without limit.
+    private static final Set<String> UNREADABLE_RULES_WARNED = ConcurrentHashMap.newKeySet();
 
     private WorkloadGroupThrottleSettings() {
         throw new UnsupportedOperationException("Utility class");
@@ -369,8 +373,17 @@ public class WorkloadGroupThrottleSettings {
             sharedLimit = SHARED_LIMIT.get(ruleSettings);
         } catch (IllegalArgumentException e) {
             // Only stored config that bypassed validation gets here; make the rule inert rather than throw on every use.
-            // WARN: the rule stops being enforced. Rules are resolved once per stored config (cached), so this is rare.
-            logger.warn("Ignoring throttling." + attributeName + " with an unreadable limit, so it is not enforced: " + ruleSettings, e);
+            // WARN once per distinct bad rule: the rule stops being enforced. Fragments (and their cached rules) are
+            // rebuilt whenever a group is deserialized, so an unguarded warning would repeat on every cluster-state apply.
+            final String warnKey = attributeName + "=" + ruleSettings;
+            if (UNREADABLE_RULES_WARNED.size() < 1000 && UNREADABLE_RULES_WARNED.add(warnKey)) {
+                logger.warn(
+                    "Ignoring throttling." + attributeName + " with an unreadable limit, so it is not enforced: " + ruleSettings,
+                    e
+                );
+            } else {
+                logger.debug("Ignoring throttling." + attributeName + " with an unreadable limit: " + ruleSettings, e);
+            }
             return null;
         }
         if (nodeLimit == UNSET_LIMIT && sharedLimit == UNSET_LIMIT) {
